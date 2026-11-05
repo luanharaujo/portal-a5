@@ -195,3 +195,35 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     b.close()
   }
 }
+
+// A pairing prepared by a house agent: the screen opens the one-use link, the ticket leaves the
+// address bar, the owner's approval page shows the request, and after the approval the screen
+// lands on `next`.
+export async function agentPairChecks({ base, check, owner, prepare, approve }) {
+  if (!existsSync(CHROME)) { console.log('skip agent pairing browser checks: Chrome not found (set CHROME)'); return }
+  const b = await launch()
+  try {
+    const req = await prepare()
+    const sp = await page(b, base, null)
+    await sp.go(new URL(req.screen_url).pathname + new URL(req.screen_url).hash)
+    check('browser: agent link shows the screen name and waits', await sp.waitFor(`document.querySelector('.pair h2')?.textContent === ${JSON.stringify(req.name)}`))
+    check('browser: ticket leaves the address bar', await sp.evaluate(`!location.href.includes('screen_ticket')`))
+    const o = await page(b, base, owner)
+    await o.go(new URL(req.approve_url).pathname + new URL(req.approve_url).search)
+    check('browser: approval page shows the request with an enabled Face ID button',
+      await o.waitFor(`(() => { const h = document.querySelector('main h2'); const btn = [...document.querySelectorAll('main button')].find((x) => x.textContent === A5_TEXT.agentReq.approve); return h && h.textContent === A5_TEXT.agentReq.pairTitle(${JSON.stringify(req.name)}) && btn && !btn.disabled })()`),
+      [await o.evaluate(`document.querySelector('main')?.textContent`), o.log])
+    check('browser: approval page has no error', !o.log.some((t) => /Content Security Policy|exception/i.test(t)), o.log)
+    await approve(req.id)
+    // G6: "Bloquear" asks twice; the first tap only changes the label
+    await o.go('/conta/')
+    await o.waitFor(`[...document.querySelectorAll('nav button')].some((x) => x.textContent === A5_TEXT.nav.admin)`)
+    await o.evaluate(`[...document.querySelectorAll('nav button')].find((x) => x.textContent === A5_TEXT.nav.admin).click()`)
+    const armed = await o.waitFor(`(() => { const b = [...document.querySelectorAll('main button')].find((x) => x.textContent === A5_TEXT.block); if (!b) return false; b.click(); return b.textContent === A5_TEXT.confirmBlock })()`)
+    await new Promise((r) => setTimeout(r, 500))
+    check('browser: first tap on Bloquear only asks again', armed && await o.evaluate(`!document.querySelector('main').textContent.includes(A5_TEXT.unblock)`), o.log)
+    check('browser: screen paired by the agent lands on next', await sp.waitFor(`location.pathname + location.search === '/tab-a/?view=landscape'`, 8000), [await sp.evaluate('location.href'), sp.log])
+  } finally {
+    b.close()
+  }
+}

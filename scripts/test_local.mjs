@@ -3,7 +3,7 @@
 import { webcrypto as wc } from 'node:crypto'
 import http from 'node:http'
 import { execFileSync } from 'node:child_process'
-import { browserChecks } from './test_browser.mjs'
+import { agentPairChecks, browserChecks } from './test_browser.mjs'
 
 const BASE = process.env.BASE
 const ROBO_KEY = process.env.ROBO_KEY
@@ -722,6 +722,219 @@ await tv3.req('POST', '/api/pair/status', { secret: ps3.data.secret })
 check('screen for the browser test paired', !!tv3.cookie)
 await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie,
   approve: async (code) => check('browser pairing approved', (await owner.req('POST', '/api/admin/pair', { code, name: 'TV deep link' })).status === 200) })
+
+// ------------------------------------------------------------------ house agents (pa5_adm_, D11/D12)
+{ // own scope: these names must not clash with the rest of the battery
+const agentCall = (method, path, body, key, headers = {}) => fetch(BASE + path, {
+  method,
+  headers: { ...(key ? { Authorization: `Bearer ${key}` } : {}), ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...headers },
+  body: body === undefined ? undefined : JSON.stringify(body),
+}).then(async (r) => ({ status: r.status, data: await r.json().catch(() => null) }))
+const ownerFaceId = async (purpose) => {
+  const op = await owner.req('POST', '/api/passkey/get/options', purpose ? { purpose } : {})
+  if (op.status !== 200) return op
+  return owner.req('POST', '/api/passkey/get/verify', await auth.get(op.data))
+}
+await ownerFaceId()
+check('resident cannot create an agent key', (await resident.req('POST', '/api/admin/agents', { label: 'x' })).status === 403)
+const ak = await owner.req('POST', '/api/admin/agents', { label: 'House Mac' })
+check('agent key created once', ak.status === 200 && /^pa5_adm_[A-Za-z0-9_-]{43}$/.test(ak.data.key), ak.data)
+const AK = ak.data.key
+const akList = (await owner.req('GET', '/api/admin/agents')).data
+check('agent key list has no key or hash', akList.length >= 1 && !JSON.stringify(akList).includes('pa5_adm_') && !('key_hash' in akList[0]), akList)
+check('agent: no key = 401', (await agentCall('GET', '/_agent/me')).status === 401)
+check('agent: other prefix = 401', (await agentCall('GET', '/_agent/me', undefined, mk.data.key)).status === 401)
+check('agent: unknown key = 401', (await agentCall('GET', '/_agent/me', undefined, 'pa5_adm_' + 'A'.repeat(43))).status === 401)
+check('agent: key works', (await agentCall('GET', '/_agent/me', undefined, AK)).data?.label === 'House Mac')
+check('agent: key does not open /api/admin', [401, 403].includes((await agentCall('GET', '/api/admin/people', undefined, AK)).status))
+check('agent: key does not open a tab', [302, 401].includes((await agentCall('GET', '/tab-a/echo', undefined, AK)).status))
+check('agent: no route to create keys or change people', (await agentCall('POST', '/_agent/machines', { tab: 'tab-a', label: 'x' }, AK)).status === 404 &&
+  (await agentCall('POST', '/_agent/people', { name: 'x' }, AK)).status === 404 && (await agentCall('POST', '/_agent/groups/residents', { tabs: ['*'] }, AK)).status === 404)
+const agScreens = await agentCall('GET', '/_agent/screens', undefined, AK)
+check('agent lists screens with groups and sessions', agScreens.status === 200 && agScreens.data.some((s) => s.id === ap1.data.screen && Array.isArray(s.sessions) && s.groups.includes('residents')), agScreens.data)
+const agDevices = (await agentCall('GET', '/_agent/devices', undefined, AK)).data
+const ownerSid = (await owner.req('GET', '/api/me')).data.session_id
+check('agent lists devices, admin flagged, no phones', agDevices.some((d) => d.id === ownerSid && d.admin === true) && !JSON.stringify(agDevices).includes(OWNER), agDevices)
+check('agent lists machine keys and groups', (await agentCall('GET', '/_agent/machines', undefined, AK)).status === 200 &&
+  (await agentCall('GET', '/_agent/groups', undefined, AK)).data.some((g) => g.id === 'owner-screens' && g.is_admin === 0))
+const agAudit = await agentCall('GET', '/_agent/audit', undefined, AK)
+check('agent reads the audit with numbers masked', agAudit.status === 200 && agAudit.data.length > 0 && !JSON.stringify(agAudit.data).includes(OWNER) && !JSON.stringify(agAudit.data).includes(RESIDENT), agAudit.data.slice(0, 3))
+check('agent cannot disconnect an admin device', (await agentCall('DELETE', `/_agent/devices/${ownerSid}`, undefined, AK)).status === 403)
+check('agent cannot rename an admin device', (await agentCall('POST', `/_agent/devices/${ownerSid}`, { name: 'x' }, AK)).status === 403)
+check('owner still signed in', (await owner.req('GET', '/api/me')).status === 200)
+const resPhoneSid = (await resident.req("GET", "/api/me")).data.session_id
+check('agent cannot disconnect a resident phone used this month', (await agentCall('DELETE', `/_agent/devices/${resPhoneSid}`, undefined, AK)).data?.error === 'device_in_use')
+check('agent sees no place on people devices', agDevices.filter((d) => d.kind !== 'screen').every((d) => d.place === null))
+check('agent audit: no address on people rows', agAudit.data.filter((a) => ['weak', 'strong'].includes(a.strength)).every((a) => a.ip === null && a.place === null && !/"ip":"/.test(a.detail || '')))
+
+// pairing prepared by the agent, approved with one Face ID
+// G1: "home" is where a live machine key last connected from; no live bridge = no home
+check('agent: no live bridge = not at home', (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'residents' }, AK)).data?.error === 'not_at_home')
+await ownerFaceId()
+const homeKey = await owner.req('POST', '/api/admin/machines', { tab: 'tab-a', label: 'Home bridge' })
+const hb = await openWs('/_bridge/tab-a', { 'X-A5-Machine-Key': homeKey.data.key })
+check('home bridge connects', hb.ok, hb)
+check('agent: pair needs a group', (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X' }, AK)).data?.error === 'group_required')
+const away = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'residents' }, AK, { 'CF-Connecting-IP': '203.0.113.50' })
+if (away.status !== 201) check('agent: a request from outside home = 409 not_at_home', away.status === 409 && away.data.error === 'not_at_home', away)
+else console.log('skip not-at-home by address: CF-Connecting-IP not settable locally')
+// IPv6 compares by /64
+const v6Key = await owner.req('POST', '/api/admin/machines', { tab: 'tab-a', label: 'v6 bridge' })
+const v6b = await openWs('/_bridge/tab-a', { 'X-A5-Machine-Key': v6Key.data.key, 'CF-Connecting-IP': '2001:db8:a:b::5' })
+if (v6b.ok) {
+  const in64 = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'V6 same', group: 'residents' }, AK, { 'CF-Connecting-IP': '2001:0db8:a:b:1:2:3:4' })
+  check('agent: same IPv6 /64 as a bridge = home', in64.status === 201, in64)
+  const out64 = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'V6 other', group: 'residents' }, AK, { 'CF-Connecting-IP': '2001:db8:a:c::5' })
+  check('agent: other IPv6 /64 = not home', out64.status === 409 && out64.data.error === 'not_at_home', out64)
+  check('agent: an IPv4 never matches an IPv6 home', (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'residents' }, AK, { 'CF-Connecting-IP': '32.1.13.184' })).status === 409)
+  await agentCall('DELETE', `/_agent/requests/${in64.data.id}`, undefined, AK)
+}
+check('agent: screen never in an admin group', (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'owner' }, AK)).status === 409)
+check('agent: next must be a portal path', (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'residents', next: '//evil.example/' }, AK)).status === 400 &&
+  (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'residents', next: 'https://evil.example/' }, AK)).status === 400)
+await ownerFaceId()
+await owner.req('POST', '/api/admin/groups/owner-screens', { tabs: ['tab-a'] })
+const pr = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'Bedroom <b>monitor</b>', group: 'owner-screens', next: '/tab-a/?view=landscape' }, AK)
+check('agent prepares a pairing', pr.status === 201 && /\/#screen_ticket=[A-Za-z0-9_-]{32}$/.test(pr.data.screen_url) && /\/conta\/\?agent_request=\d+$/.test(pr.data.approve_url) && !/[<>]/.test(pr.data.name), pr.data)
+const ticket = new URL(pr.data.screen_url).hash.slice(1).replace(/^screen_ticket=/, '')
+check('nothing was created before approval', !(await agentCall('GET', '/_agent/screens', undefined, AK)).data.some((s) => s.name.startsWith('Bedroom')))
+check('typed-code lookup never finds an agent pairing', (await owner.req('GET', `/api/admin/pair?code=${ticket.slice(0, 6)}`)).status === 404)
+const early = await owner.req('POST', '/api/passkey/get/options', { purpose: `agent:${pr.data.id}` })
+check('approval waits until the screen opened the link', early.status === 409 && early.data.error === 'pair_not_claimed', early)
+const mon = client()
+const spoofClaim = await mon.req('POST', '/api/pair/claim', { ticket }, { 'CF-Connecting-IP': '203.0.113.9' })
+if (spoofClaim.status === 409) {
+  check('screen on another internet cannot open the link', spoofClaim.data.error === 'claim_other_network', spoofClaim)
+} else console.log('skip other-IP claim case: CF-Connecting-IP not settable locally', spoofClaim.status)
+check('claim without Origin = 403', (await mon.req('POST', '/api/pair/claim', { ticket }, { Origin: undefined })).status === 403)
+const cl = await mon.req('POST', '/api/pair/claim', { ticket })
+check('screen opens the link', cl.status === 200 && cl.data.secret.length >= 30 && cl.data.next === '/tab-a/?view=landscape', cl)
+check('link is single use', (await client().req('POST', '/api/pair/claim', { ticket })).status === 404)
+check('screen waits', (await mon.req('POST', '/api/pair/status', { secret: cl.data.secret })).data.status === 'waiting')
+check('resident cannot see agent requests', (await resident.req('GET', '/api/admin/agent-requests')).status === 403)
+check('resident cannot approve', (await resident.req('POST', '/api/passkey/get/options', { purpose: `agent:${pr.data.id}` })).status === 403)
+check('agent cannot approve its own request', (await agentCall('POST', '/api/passkey/get/options', { purpose: `agent:${pr.data.id}` }, AK)).status === 403)
+const agPend = (await owner.req("GET", "/api/admin/agent-requests")).data
+const one = agPend.find((x) => x.id === pr.data.id)
+check('owner sees the request with the screen and the agent', one && one.claimed === true && one.same_ip === true && one.agent === 'House Mac' && one.group === 'owner-screens' && !JSON.stringify(one).includes(ticket), one)
+const apr = await ownerFaceId(`agent:${pr.data.id}`)
+check('one Face ID approves', apr.status === 200 && apr.data.ok === true && apr.data.name === one.name, apr)
+const monSt = await mon.req('POST', '/api/pair/status', { secret: cl.data.secret })
+check('screen signs in', monSt.data.status === 'ok' && /Max-Age=31536000/.test(monSt.setCookie || ''), monSt)
+const monMe = (await mon.req('GET', '/api/me')).data
+check('screen in owner-screens, never admin', monMe.credential === 'screen' && monMe.admin === false && monMe.groups.map((g) => g.id).join() === 'owner-screens' && monMe.tabs.join() === 'tab-a', monMe)
+check('owner-screens screen does not see the Face ID tab', !(await mon.req('GET', '/api/tabs')).data.tabs.some((t) => t.id === 'tab-b'))
+check('approved request cannot be approved again', (await owner.req('POST', '/api/passkey/get/options', { purpose: `agent:${pr.data.id}` })).status === 404)
+rows = (await owner.req('GET', '/api/admin/audit')).data
+check('audit: prepared, claimed, paired via agent', rows.some((a) => a.action === 'agent_pair_prepared' && a.strength === 'agent') &&
+  rows.some((a) => a.action === 'agent_pair_claimed') && rows.some((a) => a.action === 'screen_paired' && /"via":"agent"/.test(a.detail || '')))
+const monId = monMe.person.id
+
+// rename and disconnect: the agent does it alone
+check('agent renames a screen', (await agentCall('POST', `/_agent/screens/${monId}`, { name: 'Bedroom monitor' }, AK)).status === 200)
+const monSid = (await mon.req('GET', '/api/me')).data.session_id
+check('agent renames a screen device', (await agentCall('POST', `/_agent/devices/${monSid}`, { name: 'Pi kiosk' }, AK)).status === 200)
+check('agent renames a machine key', (await agentCall('POST', `/_agent/machines/${mk.data.id}`, { name: 'Pi' }, AK)).status === 200)
+check('agent: rename of a person = 404', (await agentCall('POST', `/_agent/screens/${ownerId}`, { name: 'x' }, AK)).status === 404)
+check('agent disconnects the screen', (await agentCall('DELETE', `/_agent/devices/${monSid}`, undefined, AK)).status === 200)
+check('disconnected screen = 401', (await mon.req('GET', '/api/me')).status === 401)
+
+// a blocked screen comes back only with the owner's Face ID
+await ownerFaceId()
+check('owner blocks the screen', (await owner.req('POST', `/api/admin/people/${monId}`, { status: 'blocked' })).status === 200)
+check('agent: change of a blocked screen must say unblock', (await agentCall('POST', '/_agent/requests', { kind: 'screen', screen: monId, group: 'residents' }, AK)).status === 409)
+const ch = await agentCall('POST', '/_agent/requests', { kind: 'screen', screen: monId, group: 'residents', unblock: true }, AK)
+check('agent prepares unblock + group change', ch.status === 201 && ch.data.unblock === true && !ch.data.screen_url, ch.data)
+check('still blocked before approval', (await agentCall('GET', '/_agent/screens', undefined, AK)).data.find((s) => s.id === monId).status === 'blocked')
+check('Face ID approves the change', (await ownerFaceId(`agent:${ch.data.id}`)).data?.ok === true)
+const monRow = (await agentCall('GET', '/_agent/screens', undefined, AK)).data.find((s) => s.id === monId)
+check('screen unblocked and moved', monRow.status === 'active' && monRow.groups.join() === 'residents', monRow)
+check('tabs told to recheck the screen', (await tabRevoked()).some((r) => r.person === monId))
+if (v6b.ok) {
+  const v6req = await agentCall('POST', '/_agent/requests', { kind: 'screen', screen: monId, group: 'owner-screens' }, AK, { 'CF-Connecting-IP': '2001:db8:a:b::77' })
+  check('agent asks from the IPv6 home', v6req.status === 201 && v6req.data && !v6req.data.screen_url, v6req)
+  await ownerFaceId()
+  await owner.req('DELETE', `/api/admin/machines/${v6Key.data.id}`)
+  const late = await ownerFaceId(`agent:${v6req.data.id}`)
+  check('approval refused once that home bridge is revoked', late.status === 409 && late.data.error === 'not_at_home', late)
+  await agentCall('DELETE', `/_agent/requests/${v6req.data.id}`, undefined, AK)
+}
+check('agent: nothing to change = 400', (await agentCall('POST', '/_agent/requests', { kind: 'screen', screen: monId }, AK)).status === 400)
+
+// re-pairing an existing (blocked) account: the approval says it unblocks
+await ownerFaceId()
+await owner.req('POST', `/api/admin/people/${monId}`, { status: 'blocked' })
+const rp = await agentCall('POST', '/_agent/requests', { kind: 'pair', screen: monId, group: 'owner-screens' }, AK)
+check('pairing a blocked account asks to unblock', rp.status === 201 && rp.data.unblock === true && rp.data.name === 'Bedroom monitor', rp.data)
+const mon2 = client()
+const cl2 = await mon2.req('POST', '/api/pair/claim', { ticket: new URL(rp.data.screen_url).hash.slice(1).replace(/^screen_ticket=/, '') })
+const rpView = (await owner.req('GET', `/api/admin/agent-requests/${rp.data.id}`)).data
+check('approval page shows existing, blocked, current group', rpView.existing === true && rpView.blocked === true && rpView.current_groups.join() === 'residents', rpView)
+await ownerFaceId(`agent:${rp.data.id}`)
+check('re-paired screen signs in, unblocked', (await mon2.req('POST', '/api/pair/status', { secret: cl2.data.secret })).data.status === 'ok' &&
+  (await mon2.req('GET', '/api/me')).data.groups.map((g) => g.id).join() === 'owner-screens')
+
+// refuse and cancel
+const rf = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'Hall TV', group: 'residents' }, AK)
+check('owner refuses (no Face ID needed)', (await owner.req('POST', `/api/admin/agent-requests/${rf.data.id}/refuse`, {})).status === 200)
+check('refused link is dead', (await client().req('POST', '/api/pair/claim', { ticket: new URL(rf.data.screen_url).hash.slice(1).replace(/^screen_ticket=/, '') })).status === 404)
+const cc = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'Hall TV', group: 'residents' }, AK)
+check('agent cancels its own request', (await agentCall('DELETE', `/_agent/requests/${cc.data.id}`, undefined, AK)).status === 200)
+check('cancel twice = 404', (await agentCall('DELETE', `/_agent/requests/${cc.data.id}`, undefined, AK)).status === 404)
+const myReqs = (await agentCall('GET', '/_agent/requests', undefined, AK)).data
+check('agent sees its requests and their state', ['approved', 'refused', 'cancelled'].every((s) => myReqs.some((r) => r.state === s)), myReqs)
+let lastPend
+for (let i = 0; i < 6; i++) lastPend = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: `Screen ${i}`, group: 'residents' }, AK)
+check('at most 5 open requests per agent', lastPend.status === 429 && lastPend.data.error === 'too_many_pending', lastPend)
+
+// the key used from somewhere new warns the admins
+const moved2 = await agentCall('GET', '/_agent/me', undefined, AK, { 'CF-Connecting-IP': '203.0.113.8' })
+if (moved2.status === 200 && (await owner.req('GET', '/api/me')).data.alerts.some((a) => a.kind === 'agent_ip')) check('agent key on a new address warns the admins', true)
+else console.log('skip agent new-IP alert: CF-Connecting-IP not settable locally')
+
+// cancel the open ones (at most 5 per agent)
+for (const r of (await agentCall('GET', '/_agent/requests', undefined, AK)).data.filter((x) => x.state === 'waiting'))
+  await agentCall('DELETE', `/_agent/requests/${r.id}`, undefined, AK)
+
+// scripts/agent.sh against this portal (key from a throwaway file, never the Keychain here)
+{
+  const { execFileSync } = await import('node:child_process')
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const dir = mkdtempSync(tmpdir() + '/a5-agent-')
+  writeFileSync(dir + '/key', AK, { mode: 0o600 })
+  const sh = (...a) => { try { return { ok: true, out: execFileSync('bash', ['scripts/agent.sh', ...a], { env: { ...process.env, PORTAL_A5_URL: BASE, PORTAL_A5_KEY_FILE: dir + '/key' }, encoding: 'utf8', stdio: 'pipe' }) } } catch (e) { return { ok: false, out: String(e.stdout) + String(e.stderr) } } }
+  try {
+    check('agent.sh get me', /House Mac/.test(sh('get', 'me').out))
+    check('agent.sh get screens', sh('get', 'screens').out.includes('Bedroom monitor'))
+    const r = sh('pair', 'Shell "screen"', 'owner-screens', '/tab-a/?view=landscape')
+    check('agent.sh pair prints both links', r.ok && /screen_ticket=/.test(r.out) && /agent_request=/.test(r.out), r.out)
+    check('agent.sh cancel', r.ok && sh('cancel', String(JSON.parse(r.out).id)).ok)
+    check('agent.sh error exits non-zero', !sh('revoke', 'devices', String(ownerSid)).ok)
+    check('agent.sh rejects a bad command', !sh('get', 'people').ok)
+    check('agent.sh refuses a bad URL', !execFileSync('bash', ['-c', 'PORTAL_A5_URL=http://evil.example bash scripts/agent.sh get me 2>&1 || true'], { encoding: 'utf8' }).includes('House Mac'))
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
+
+// the same flow in a real browser
+await agentPairChecks({ base: BASE, check, owner: owner.cookie,
+  prepare: async () => (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'Desk monitor', group: 'owner-screens', next: '/tab-a/?view=landscape' }, AK)).data,
+  approve: async (id) => check('browser: agent pairing approved', (await ownerFaceId(`agent:${id}`)).data?.ok === true) })
+
+// revoking the key ends it and what it left waiting
+const leftover = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'Left behind', group: 'residents' }, AK)
+await ownerFaceId()
+const mk2 = await owner.req('POST', '/api/admin/machines', { tab: 'tab-a', label: 'Spare Pi' })
+check('agent revokes a machine key', (await agentCall('DELETE', `/_agent/machines/${mk2.data.id}`, undefined, AK)).status === 200 &&
+  (await owner.req('GET', '/api/admin/machines')).data.find((m) => m.id === mk2.data.id).revoked_at)
+check('owner revokes the agent key', (await owner.req('DELETE', `/api/admin/agents/${ak.data.id}`)).status === 200)
+check('revoked agent key = 401', (await agentCall('GET', '/_agent/me', undefined, AK)).status === 401)
+check('its open requests are gone', !(await owner.req('GET', '/api/admin/agent-requests')).data.length)
+check('and their screen links are dead', (await client().req('POST', '/api/pair/claim', { ticket: new URL(leftover.data.screen_url).hash.slice(1).replace(/^screen_ticket=/, '') })).status === 404)
+rows = (await owner.req('GET', '/api/admin/audit')).data
+check('audit: agent refusals and key lifecycle', ['agent_refused', 'agent_key_created', 'agent_key_revoked', 'agent_renamed_screen', 'screen_changed'].every((x) => rows.some((a) => a.action === x)))
+
+}
 
 // pairing start is capped per IP (last: it uses up the bucket)
 let pl

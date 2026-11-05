@@ -107,6 +107,21 @@ async function passkeyCheck(purpose) {
   })
 }
 
+// A red button that asks twice: the first tap only arms it for a few seconds.
+function confirmButton(label, confirmLabel, fn) {
+  let armed = null
+  const b = el('button', { class: 'danger', onclick: () => {
+    if (!armed) {
+      b.textContent = confirmLabel
+      armed = setTimeout(() => { armed = null; b.textContent = label }, 5000)
+      return
+    }
+    clearTimeout(armed); armed = null; b.textContent = label
+    guarded(fn)
+  } }, label)
+  return b
+}
+
 // ------------------------------------------------------------------ login
 function nextPath() {
   const n = new URLSearchParams(location.search).get('next') || ''
@@ -197,6 +212,60 @@ async function pairScreenView() {
   pollTimer = setTimeout(poll, 3000)
 }
 
+// ------------------------------------------------------------------ pairing prepared by a house agent (screen side)
+// The agent opened "/#screen_ticket=…" on this screen. The ticket works once, so it leaves the
+// address bar at once; the screen then waits for the owner's Face ID.
+async function screenTicketView(ticket) {
+  clearTimeout(pollTimer)
+  history.replaceState(null, '', '/')
+  let r
+  try { r = await rawApi('POST', '/api/pair/claim', { ticket }) } catch (e) {
+    show(el('div', { class: 'card pair' }, el('h2', {}, T.pair.title), el('p', {}, e.message)))
+    return
+  }
+  const next = /^\/[a-z][a-z0-9-]*(\/|$)/.test(r.next || '') ? r.next : '/'
+  const status = el('p', { class: 'muted' }, T.agentReq.screenWaiting)
+  show(el('div', { class: 'card pair' }, el('h2', {}, r.name), el('p', {}, T.agentReq.screenHowTo), status))
+  const poll = async () => {
+    let s
+    try { s = await rawApi('POST', '/api/pair/status', { secret: r.secret }) } catch (e) {
+      if (e instanceof ApiError && e.status === 404) { status.textContent = T.agentReq.screenStatus.refused; return }
+      status.textContent = T.offline
+      pollTimer = setTimeout(poll, 5000)
+      return
+    }
+    if (s.status === 'ok') { location.replace(next); return }
+    if (s.status === 'waiting') { pollTimer = setTimeout(poll, 3000); return }
+    status.textContent = T.agentReq.screenStatus[s.status] || T.agentReq.screenStatus.refused
+  }
+  pollTimer = setTimeout(poll, 3000)
+}
+
+// ------------------------------------------------------------------ what an agent asked (admin side, 1 tap + Face ID)
+async function agentRequestView(id) {
+  const r = await rawApi('GET', `/api/admin/agent-requests/${id}`)
+  const leave = () => history.replaceState(null, '', ACCOUNT)
+  const groupLabel = (g) => (T.groupNames && T.groupNames[g]) || g
+  show(nav(), el('section', { class: 'card' },
+    el('h2', {}, r.kind === 'pair' ? T.agentReq.pairTitle(r.name) : T.agentReq.changeTitle(r.name)),
+    el('p', { class: 'muted' }, T.agentReq.asked(r.agent || T.agentReq.anAgent, when(r.created_at))),
+    r.kind === 'pair' ? el('p', {}, r.existing ? T.agentReq.existing(r.name) : T.agentReq.newScreen(r.name)) : null,
+    r.group ? el('p', {}, T.agentReq.group(groupLabel(r.group), r.current_groups.map(groupLabel).join(', '))) : null,
+    r.at_home ? null : el('p', { class: 'danger-box' }, T.agentReq.notHome),
+    r.unblock ? el('p', { class: 'danger-box' }, T.agentReq.unblock) : null,
+    r.kind === 'pair' && !r.claimed ? el('p', { class: 'danger-box' }, T.agentReq.notOpened) : null,
+    r.kind === 'pair' && r.claimed ? el('p', { class: 'muted' }, T.agentReq.screen(r.screen_label || T.device, r.screen_place, r.screen_ip)) : null,
+    r.kind === 'pair' && r.claimed && r.same_ip === false ? el('p', { class: 'danger-box' }, T.agentReq.otherIp(r.screen_ip, r.agent_ip)) : null,
+    el('button', { disabled: r.kind === 'pair' && !r.claimed, onclick: () => guarded(async () => {
+      await passkeyCheck(`agent:${r.id}`)
+      leave(); toast(r.kind === 'pair' ? T.agentReq.paired(r.name) : T.agentReq.changed(r.name)); adminView()
+    }) }, T.agentReq.approve),
+    r.kind === 'pair' && !r.claimed ? el('button', { class: 'link', onclick: () => guarded(() => agentRequestView(id)) }, T.agentReq.reload) : null,
+    el('button', { class: 'danger', onclick: () => guarded(async () => {
+      await rawApi('POST', `/api/admin/agent-requests/${r.id}/refuse`, {}); leave(); toast(T.agentReq.refused); adminView()
+    }) }, T.refuse)))
+}
+
 // ------------------------------------------------------------------ Face ID before entering a tab (D9)
 function stepUpView(tab) {
   const next = nextPath() || `/${tab}/`
@@ -241,7 +310,7 @@ function nav() {
 function renderAlerts() {
   const list = ME.alerts || []
   $alerts.replaceChildren(...list.map((a) => el('div', { class: 'alert' },
-    el('strong', {}, a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : T.newDevice(ME.person.name)),
+    el('strong', {}, a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : a.kind === 'agent_ip' ? T.agentIpAlert : T.newDevice(ME.person.name)),
     `${a.label || T.device}, ${when(a.created_at)}${a.place ? ', ' + a.place : ''}${a.current ? T.thisDevice : ''}. `,
     el('button', { onclick: () => guarded(async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await start() }) }, T.itWasMe),
     a.current || !a.live || a.kind !== 'device' ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await start() }) }, T.revoke))))
@@ -259,10 +328,11 @@ async function devicesView() {
 
 // ------------------------------------------------------------------ admin
 async function adminView() {
-  const [allPeople, groups, requests, devices, machines, shortcuts] = await Promise.all([
+  const [allPeople, groups, requests, devices, machines, shortcuts, agents, agentReqs] = await Promise.all([
     rawApi('GET', '/api/admin/people'), rawApi('GET', '/api/admin/groups'),
     rawApi('GET', '/api/admin/requests'), rawApi('GET', '/api/admin/devices'),
     rawApi('GET', '/api/admin/machines'), rawApi('GET', '/api/me/shortcuts'),
+    rawApi('GET', '/api/admin/agents'), rawApi('GET', '/api/admin/agent-requests'),
   ])
   const people = allPeople.filter((p) => p.kind !== 'screen')
   const screens = allPeople.filter((p) => p.kind === 'screen')
@@ -309,9 +379,9 @@ async function adminView() {
         name,
         groupBoxes(p.groups, `pg${p.id}`),
         el('button', { onclick: () => guarded(async () => { await api('POST', `/api/admin/people/${p.id}`, { name: name.value, groups: checked(f, `pg${p.id}`) }); toast(T.saved); await start(); adminView() }) }, T.save),
-        el('button', { class: p.status === 'blocked' ? '' : 'danger', onclick: () => guarded(async () => {
-          await api('POST', `/api/admin/people/${p.id}`, { status: p.status === 'blocked' ? 'active' : 'blocked' }); adminView()
-        }) }, p.status === 'blocked' ? T.unblock : T.block),
+        p.status === 'blocked'
+          ? el('button', { onclick: () => guarded(async () => { await api('POST', `/api/admin/people/${p.id}`, { status: 'active' }); adminView() }) }, T.unblock)
+          : confirmButton(T.block, T.confirmBlock, async () => { await api('POST', `/api/admin/people/${p.id}`, { status: 'blocked' }); adminView() }),
         p.groups.includes('owner') && p.id !== ME.person.id
           ? el('button', { class: 'link', onclick: () => guarded(async () => { await api('POST', `/api/admin/people/${p.id}/passkey-invite`, {}); toast(T.inviteSent) }) }, T.invitePasskey)
           : null)
@@ -367,9 +437,9 @@ async function adminView() {
   const screensCard = el('section', { class: 'card' }, el('h2', {}, T.pair.screens),
     screens.length ? el('ul', { class: 'rows' }, screens.map((s) => el('li', {},
       el('strong', {}, s.name), T.devicesCount(s.devices), s.status === 'blocked' ? T.blocked : '',
-      el('button', { class: s.status === 'blocked' ? '' : 'danger', onclick: () => guarded(async () => {
-        await api('POST', `/api/admin/people/${s.id}`, { status: s.status === 'blocked' ? 'active' : 'blocked' }); adminView()
-      }) }, s.status === 'blocked' ? T.unblock : T.block)))) : el('p', { class: 'muted' }, T.pair.noScreens),
+      s.status === 'blocked'
+        ? el('button', { onclick: () => guarded(async () => { await api('POST', `/api/admin/people/${s.id}`, { status: 'active' }); adminView() }) }, T.unblock)
+        : confirmButton(T.block, T.confirmBlock, async () => { await api('POST', `/api/admin/people/${s.id}`, { status: 'blocked' }); adminView() })))) : el('p', { class: 'muted' }, T.pair.noScreens),
     el('h3', {}, T.pair.pairTitle),
     pairCode, pairInfo, screenSel, screenName,
     el('button', { onclick: () => guarded(async () => {
@@ -419,12 +489,35 @@ async function adminView() {
           el('button', { onclick: () => navigator.clipboard.writeText(r.key).then(() => toast(T.bridges.copied)) }, T.bridges.copy))
       }) }, T.shortcuts.create), kNew] : el('p', { class: 'muted' }, T.shortcuts.noActions))
 
-  show(nav(), passkeyCard, reqCard, screensCard, peopleCard, groupsCard, devicesCard, brakeCard, shortcutsCard, bridgesCard, auditCard)
+
+  // house agents: one key per agent, shown once; what they ask waits here for a Face ID
+  const aLabel = el('input', { placeholder: T.agents.label, maxlength: 40 })
+  const newAgentKey = el('div')
+  const agentsCard = el('section', { class: 'card' }, el('h2', {}, T.agents.title),
+    agentReqs.length ? el('ul', { class: 'rows' }, agentReqs.map((r) => el('li', {},
+      el('strong', {}, r.kind === 'pair' ? T.agentReq.pairTitle(r.name) : T.agentReq.changeTitle(r.name)),
+      el('span', { class: 'muted' }, ` · ${r.agent || T.agentReq.anAgent} · ${when(r.created_at)}`),
+      el('button', { onclick: () => guarded(() => agentRequestView(r.id)) }, T.agents.see)))) : null,
+    agents.length ? el('ul', { class: 'rows' }, agents.map((a) => el('li', {},
+      el('div', {}, el('strong', {}, a.label), a.revoked_at ? T.bridges.revoked : ''),
+      el('div', { class: 'muted' }, T.bridges.line(when(a.created_at), when(a.last_used_at), a.last_ip)),
+      a.revoked_at ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/admin/agents/${a.id}`); adminView() }) }, T.revoke)))) : el('p', { class: 'muted' }, T.agents.none),
+    el('p', { class: 'muted' }, T.agents.what),
+    el('h3', {}, T.agents.add), aLabel,
+    el('button', { onclick: () => guarded(async () => {
+      const r = await api('POST', '/api/admin/agents', { label: aLabel.value })
+      newAgentKey.replaceChildren(el('p', {}, T.agents.copyOnce), el('p', { class: 'code' }, r.key),
+        el('button', { onclick: () => navigator.clipboard.writeText(r.key).then(() => toast(T.bridges.copied)) }, T.bridges.copy))
+    }) }, T.bridges.create), newAgentKey)
+
+  show(nav(), passkeyCard, reqCard, agentsCard, screensCard, peopleCard, groupsCard, devicesCard, brakeCard, shortcutsCard, bridgesCard, auditCard)
 }
 
 // ------------------------------------------------------------------ boot
 async function start() {
   clearTimeout(pollTimer)
+  const ticket = new URLSearchParams(location.hash.slice(1)).get('screen_ticket')
+  if (ticket) return guarded(() => screenTicketView(ticket.slice(0, 64)))
   try {
     ME = await rawApi('GET', '/api/me')
   } catch (e) {
@@ -441,6 +534,12 @@ async function start() {
   const q = new URLSearchParams(location.search)
   const stepUp = q.get('step_up')
   if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return stepUpView(stepUp)
+  const agentReq = q.get('agent_request')
+  if (agentReq && /^\d{1,12}$/.test(agentReq) && ME.admin) {
+    if (!onAccount()) { location.replace(`${ACCOUNT}?agent_request=${agentReq}`); return }
+    accountTitle()
+    return guarded(() => agentRequestView(Number(agentReq)))
+  }
   const n = nextPath()
   if (n && ME.credential === 'screen') { location.href = n; return }
   if (!onAccount()) {

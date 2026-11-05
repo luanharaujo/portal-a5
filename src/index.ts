@@ -30,6 +30,12 @@ export interface Env {
   // how recent this session's passkey check must be for an 'admin' command from a browser:
   // '<n>m' or '<n>h', or 'session'; wrangler.toml sets '12h'. Missing or malformed = 5 minutes.
   ADMIN_COMMAND_PASSKEY?: string
+  // 'refuse' (default): a screen opening an agent's pairing link from another IP than the agent
+  // called from is turned away; 'warn': only shown on the approval page.
+  AGENT_PAIR_OTHER_IP?: string
+  // 'refuse' (default): an agent request (and its approval) only counts when the agent calls from
+  // home, the last address of a live machine key; 'warn': allowed, flagged in red to the admin.
+  AGENT_HOME?: string
   [binding: string]: unknown
 }
 
@@ -43,6 +49,9 @@ const BADGE_TIMEOUT_MS = 300
 const BADGE_CACHE_MS = 60e3
 const ACCOUNT_PATH = '/conta/'
 const MACHINE_KEY_PREFIX = 'pa5_maq_'
+const AGENT_KEY_PREFIX = 'pa5_adm_'
+const AGENT_PAIR_MINUTES = 15
+const AGENT_PENDING_MAX = 5
 const BRIDGE_ALERT_PER_HOUR = 3 // more reconnections than this in an hour warns the admins
 const BRIDGE_MAX_PER_HOUR = 120
 const SESSION_TOUCH_MS = 5 * 60e3
@@ -55,6 +64,7 @@ const LIMITS = {
   startPerIp: 20, startPerNumber: 5, statusPerIp: 900,
   robotPerSender: 3, robotTotal: 30, // per hour
   pairPerIp: 10, bridgeFailPerIp: 30,
+  agentFailPerIp: 30, agentPerHour: 600, agentPairPerHour: 20, claimPerIp: 30,
 }
 const COOKIE = '__Host-a5s'
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O/1/I/L
@@ -384,7 +394,7 @@ const refuseOtherIp = (env: Env) => env.PAIR_OTHER_IP !== 'warn'
 // network as the admin's phone (the "device code" scam sends a code made somewhere else).
 async function pairLookup(req: Request, env: Env, url: URL) {
   const code = normPairCode(url.searchParams.get('code'))
-  const p = await env.DB.prepare(`SELECT label, place, ip, created_at, expires_at FROM screen_pairings WHERE code_hash = ? AND expires_at > ? AND state = 'waiting'`)
+  const p = await env.DB.prepare(`SELECT label, place, ip, created_at, expires_at FROM screen_pairings WHERE code_hash = ? AND expires_at > ? AND state = 'waiting' AND request_id IS NULL`)
     .bind(await sha256(code), now()).first<Row>()
   if (!p) throw new HttpError(404, 'pair_code_not_found')
   return { ...p, same_ip: p.ip === clientIp(req), admin_ip: clientIp(req), other_ip_refused: refuseOtherIp(env) }
@@ -393,7 +403,7 @@ async function pairLookup(req: Request, env: Env, url: URL) {
 async function pairApprove(env: Env, req: Request, who: Who) {
   const b = await body(req)
   const code = normPairCode(b.code)
-  const p = await env.DB.prepare(`SELECT * FROM screen_pairings WHERE code_hash = ? AND expires_at > ? AND state = 'waiting'`)
+  const p = await env.DB.prepare(`SELECT * FROM screen_pairings WHERE code_hash = ? AND expires_at > ? AND state = 'waiting' AND request_id IS NULL`)
     .bind(await sha256(code), now()).first<Row>()
   if (!p) throw new HttpError(404, 'pair_code_not_found')
   const sameIp = p.ip === clientIp(req)
@@ -633,7 +643,18 @@ async function takeChallenge(env: Env, who: Who, kind: 'create' | 'get'): Promis
   return c
 }
 
-// 'entry:<tab>' for a tab this session can open whose policy asks a passkey on entry.
+// 'entry:<tab>' for a tab this session can open whose policy asks a passkey on entry;
+// 'agent:<id>' for an admin approving what an agent prepared (the Face ID is the approval).
+async function checkPurpose(env: Env, who: Who, raw: unknown): Promise<string | null> {
+  const pm = /^agent:(\d{1,12})$/.exec(String(raw ?? ''))
+  if (pm) {
+    if (!who.admin) throw new HttpError(403, 'admin_only')
+    await pendingAgentRequest(env, Number(pm[1]), true)
+    return `agent:${Number(pm[1])}`
+  }
+  return entryPurpose(env, who, raw)
+}
+
 function entryPurpose(env: Env, who: Who, raw: unknown): string | null {
   if (raw == null) return null
   const m = /^entry:([a-z][a-z0-9-]{0,30})$/.exec(String(raw))
@@ -705,7 +726,7 @@ async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
 }
 
 async function passkeyGetOptions(req: Request, env: Env, url: URL, who: Who) {
-  const purpose = entryPurpose(env, who, (await body(req)).purpose)
+  const purpose = await checkPurpose(env, who, (await body(req)).purpose)
   const creds = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE person_id = ?').bind(who.person.id).all<{ credential_id: string }>()
   if (!creds.results.length) throw new HttpError(409, 'no_passkey', { no_passkey: true })
   return {
@@ -742,6 +763,7 @@ async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
     env.DB.prepare('UPDATE passkeys SET sign_count = ?, last_used_at = ? WHERE id = ?').bind(count, now(), key.id),
     env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId),
   ])
+  if (purpose?.startsWith('agent:')) return approveAgentRequest(env, req, who, Number(purpose.slice(6)))
   if (purpose?.startsWith('entry:')) {
     const tab = purpose.slice(6)
     await env.DB.batch([
@@ -1404,6 +1426,395 @@ async function allowDeviceCommands(env: Env, req: Request, who: Who, id: number)
   await audit(env, req, { who, action: 'device_commands_allowed', target: `${s.person_id}:${s.label ?? ''}` })
 }
 
+// ------------------------------------------------------------------ house agents (pa5_adm_)
+// An agent key reads screens, devices, machine keys, groups and the audit log; renames screens,
+// devices and machine keys; disconnects non-admin devices and revokes machine keys. Anything
+// that gives access (pairing a screen, moving it to another group, unblocking it) is only
+// PREPARED by the agent: it waits in agent_requests until an admin approves it with Face ID.
+// The key never approves, never creates keys, never touches people, groups or admin sessions.
+interface Agent { id: number; label: string }
+
+const agentPairOtherIpRefused = (env: Env) => env.AGENT_PAIR_OTHER_IP !== 'warn'
+const agentHomeRequired = (env: Env) => env.AGENT_HOME !== 'warn'
+
+// One network: the same IPv4 address, or the same IPv6 /64.
+function ipv6Prefix64(ip: string): string | null {
+  if (!ip.includes(':') || ip.includes('.')) return null
+  const [head, tail = ''] = ip.toLowerCase().split('::')
+  const h = head ? head.split(':') : []
+  const t = ip.includes('::') ? (tail ? tail.split(':') : []) : []
+  const parts = [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t]
+  if (parts.length !== 8 || parts.some((p) => !/^[0-9a-f]{1,4}$/.test(p))) return null
+  return parts.slice(0, 4).map((p) => p.replace(/^0+(?=.)/, '')).join(':')
+}
+export function sameNetwork(a: unknown, b: unknown): boolean {
+  if (!a || !b) return false
+  const x = String(a), y = String(b)
+  const px = ipv6Prefix64(x), py = ipv6Prefix64(y)
+  return px || py ? px !== null && px === py : x === y
+}
+
+// "Home" is wherever a live house bridge (a machine key nobody revoked) last connected from.
+async function atHome(env: Env, ip: unknown): Promise<boolean> {
+  const r = await env.DB.prepare('SELECT last_ip FROM machine_keys WHERE revoked_at IS NULL AND last_ip IS NOT NULL LIMIT 50').all<{ last_ip: string }>()
+  return r.results.some((m) => sameNetwork(m.last_ip, ip))
+}
+
+async function agentOf(req: Request, env: Env): Promise<Agent> {
+  const h = req.headers.get('Authorization') ?? ''
+  const key = h.startsWith('Bearer ') ? h.slice(7).trim() : ''
+  const refuse = async (reason: string): Promise<never> => {
+    if (!(await underLimit(env, `agent-fail-ip:${clientIp(req)}`, LIMITS.agentFailPerIp))) throw new HttpError(429, 'too_many_attempts')
+    await audit(env, req, { strength: 'agent', action: 'agent_refused', detail: { reason } })
+    throw new HttpError(401, 'bad_key')
+  }
+  if (!key.startsWith(AGENT_KEY_PREFIX) || key.length < 40 || key.length > 80) return refuse('format')
+  const a = await env.DB.prepare('SELECT id, label, revoked_at, last_ip, last_used_at FROM agent_keys WHERE key_hash = ?').bind(await sha256(key)).first<Row>()
+  if (!a) return refuse('unknown')
+  if (a.revoked_at) return refuse('revoked')
+  const id = Number(a.id)
+  if (!(await underLimit(env, `agent:${id}`, LIMITS.agentPerHour))) throw new HttpError(429, 'too_many_attempts')
+  const ip = clientIp(req)
+  if (a.last_ip !== ip || !a.last_used_at || Date.now() - Date.parse(String(a.last_used_at)) > SESSION_TOUCH_MS)
+    await env.DB.prepare('UPDATE agent_keys SET last_used_at = ?, last_ip = ? WHERE id = ?').bind(now(), ip, id).run()
+  if (a.last_ip && a.last_ip !== ip) {
+    // the key turned up somewhere new: every admin sees it on the account page
+    await audit(env, req, { strength: 'agent', action: 'agent_new_ip', target: String(a.label), detail: { agent: id, previous_ip: a.last_ip } })
+    await alertAdmins(env, req, String(a.label), 'agent_ip')
+  }
+  return { id, label: String(a.label) }
+}
+
+const agentAudit = (env: Env, req: Request, agent: Agent, action: string, target: string | null, detail: Row = {}) =>
+  audit(env, req, { strength: 'agent', action, target, detail: { agent: agent.id, agent_label: agent.label, ...detail } })
+
+// a same-origin path into a tab, query allowed: what a screen opens once paired
+function safeNext(v: unknown): string | null {
+  if (v == null || v === '') return null
+  const s = String(v)
+  if (s.length > 200 || s.includes('//') || s.includes('\\') || !/^\/[a-z][a-z0-9-]{0,30}(\/[A-Za-z0-9._~\/?=&%-]*)?$/.test(s)) throw new HttpError(400, 'bad_next')
+  return s
+}
+
+async function nonAdminGroup(env: Env, v: unknown): Promise<string | null> {
+  if (v == null || v === '') return null
+  const g = await env.DB.prepare('SELECT id, is_admin FROM groups WHERE id = ?').bind(String(v)).first<Row>()
+  if (!g) throw new HttpError(404, 'group_not_found')
+  if (g.is_admin) throw new HttpError(409, 'screen_not_admin')
+  return String(g.id)
+}
+
+const screenById = (env: Env, id: unknown) =>
+  env.DB.prepare(`SELECT * FROM people WHERE id = ? AND kind = 'screen'`).bind(Number(id)).first<Person>()
+
+async function agentRequestCreate(env: Env, req: Request, url: URL, agent: Agent) {
+  const b = await body(req)
+  const kind = String(b.kind ?? '')
+  if (kind !== 'pair' && kind !== 'screen') throw new HttpError(400, 'bad_kind')
+  const open = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_requests WHERE agent_id = ? AND state = 'waiting' AND expires_at > ?`)
+    .bind(agent.id, now()).first<{ n: number }>()
+  if ((open?.n ?? 0) >= AGENT_PENDING_MAX) throw new HttpError(429, 'too_many_pending')
+
+  const group = await nonAdminGroup(env, b.group)
+  // a new or re-paired screen always says which group it lands in (never a silent default)
+  if (kind === 'pair' && !group) throw new HttpError(400, 'group_required')
+  const home = await atHome(env, clientIp(req))
+  if (!home) {
+    await agentAudit(env, req, agent, 'agent_request_not_home', null, { kind })
+    if (agentHomeRequired(env)) throw new HttpError(409, 'not_at_home')
+  }
+  let screen: Person | null = null
+  let name: string | null = null
+  if (b.screen != null) {
+    screen = await screenById(env, b.screen)
+    if (!screen) throw new HttpError(404, 'screen_not_found')
+  } else if (kind === 'pair') {
+    name = text(b.name, 40)
+    if (!name) throw new HttpError(400, 'name_required')
+  } else throw new HttpError(400, 'screen_required')
+  // a blocked screen comes back only through an approval that says so
+  const unblock = screen?.status === 'blocked' ? 1 : 0
+  if (kind === 'screen' && !unblock && !group) throw new HttpError(400, 'nothing_to_change')
+  if (kind === 'screen' && b.unblock !== true && unblock) throw new HttpError(409, 'screen_blocked')
+  const next = kind === 'pair' ? safeNext(b.next) : null
+
+  // counts requests actually created (refusals are already capped by the key's hourly limit)
+  if (!(await underLimit(env, `agent-req:${agent.id}`, LIMITS.agentPairPerHour))) throw new HttpError(429, 'too_many_attempts')
+  const t = now()
+  const expires = inMs((kind === 'pair' ? AGENT_PAIR_MINUTES : 12 * 60) * 60e3)
+  const r = await env.DB.prepare(
+    `INSERT INTO agent_requests (agent_id, kind, screen_id, screen_name, group_id, unblock, next_path, agent_ip, at_home, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+  ).bind(agent.id, kind, screen?.id ?? null, name, group, unblock, next, clientIp(req), home ? 1 : 0, t, expires).first<{ id: number }>()
+  const out: Row = {
+    id: r!.id, kind, screen: screen?.id ?? null, name: screen?.name ?? name, group, unblock: !!unblock, expires_at: expires,
+    approve_url: `${url.origin}${ACCOUNT_PATH}?agent_request=${r!.id}`,
+  }
+  if (kind === 'pair') {
+    // no typed code: code and poll secret are random until the screen opens the link
+    const ticket = randomToken(24)
+    const p = await env.DB.prepare(
+      `INSERT INTO screen_pairings (code_hash, secret_hash, created_at, expires_at, request_id, ticket_hash) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
+    ).bind(await sha256(randomToken(24)), await sha256(randomToken(24)), t, expires, r!.id, await sha256(ticket)).first<{ id: number }>()
+    await env.DB.prepare('UPDATE agent_requests SET pairing_id = ? WHERE id = ?').bind(p!.id, r!.id).run()
+    // in the fragment: never sent to the server, so never in an edge log
+    out.screen_url = `${url.origin}/#screen_ticket=${ticket}`
+  }
+  await agentAudit(env, req, agent, `agent_${kind}_prepared`, String(out.name), { request: r!.id, screen: out.screen, group, unblock: !!unblock, at_home: home })
+  return out
+}
+
+// A request still open; for approval a pairing must already have been opened on the screen,
+// so the admin sees which browser is asking.
+async function pendingAgentRequest(env: Env, id: number, forApproval = false): Promise<Row> {
+  const r = await env.DB.prepare(
+    `SELECT r.*, k.label AS agent_label, p.claimed_at, p.label AS screen_label, p.ip AS screen_ip, p.place AS screen_place,
+            s.name AS screen_current_name, s.status AS screen_status, g.name AS group_name
+       FROM agent_requests r LEFT JOIN agent_keys k ON k.id = r.agent_id LEFT JOIN screen_pairings p ON p.id = r.pairing_id
+       LEFT JOIN people s ON s.id = r.screen_id LEFT JOIN groups g ON g.id = r.group_id
+      WHERE r.id = ? AND r.state = 'waiting' AND r.expires_at > ?`,
+  ).bind(id, now()).first<Row>()
+  if (!r) throw new HttpError(404, 'request_not_found')
+  if (forApproval && r.kind === 'pair' && !r.claimed_at) throw new HttpError(409, 'pair_not_claimed')
+  return r
+}
+
+// What the approval page shows. No key material, no ticket.
+function agentRequestView(r: Row) {
+  const screenGroups = r.screen_groups as string[] | undefined
+  return {
+    id: r.id, kind: r.kind, agent: r.agent_label ?? null, agent_ip: r.agent_ip, created_at: r.created_at, expires_at: r.expires_at,
+    name: r.screen_current_name ?? r.screen_name, existing: r.screen_id != null, blocked: r.screen_status === 'blocked',
+    unblock: !!r.unblock, group: r.group_id ?? null, current_groups: screenGroups ?? [], at_home: !!r.at_home,
+    claimed: !!r.claimed_at, screen_label: r.screen_label ?? null, screen_ip: r.screen_ip ?? null, screen_place: r.screen_place ?? null,
+    same_ip: r.claimed_at ? sameNetwork(r.screen_ip, r.agent_ip) : null,
+  }
+}
+
+async function adminAgentRequest(env: Env, id: number) {
+  const r = await pendingAgentRequest(env, id)
+  if (r.screen_id) r.screen_groups = (await groupsOf(env, Number(r.screen_id))).map((g) => g.id)
+  return agentRequestView(r)
+}
+
+async function adminAgentRequests(env: Env) {
+  const r = await env.DB.prepare(`SELECT id FROM agent_requests WHERE state = 'waiting' AND expires_at > ? ORDER BY id LIMIT 20`).bind(now()).all<{ id: number }>()
+  return Promise.all(r.results.map((x) => adminAgentRequest(env, x.id)))
+}
+
+// The Face ID that called this IS the approval (passkey purpose 'agent:<id>').
+async function approveAgentRequest(env: Env, req: Request, who: Who, id: number) {
+  if (!who.admin) throw new HttpError(403, 'admin_only')
+  const r = await pendingAgentRequest(env, id, true)
+  // the group is checked again: it may have become an admin group since
+  const group = await nonAdminGroup(env, r.group_id)
+  if (r.kind === 'pair' && !group) throw new HttpError(400, 'group_required')
+  // home again: the bridge may have moved or been revoked since the request
+  if (!(await atHome(env, r.agent_ip))) {
+    await audit(env, req, { who, action: 'agent_request_not_home', target: String(id) })
+    if (agentHomeRequired(env)) throw new HttpError(409, 'not_at_home')
+  }
+  let screen: Person | null
+  if (r.screen_id) {
+    screen = await screenById(env, r.screen_id)
+    if (!screen) throw new HttpError(404, 'screen_not_found')
+    if (screen.status === 'blocked' && !r.unblock) throw new HttpError(409, 'screen_blocked')
+  } else screen = null
+  const done = await env.DB.prepare(`UPDATE agent_requests SET state = 'approved', decided_by = ?, decided_at = ? WHERE id = ? AND state = 'waiting'`)
+    .bind(who.person.id, now(), id).run()
+  if (!done.meta.changes) throw new HttpError(404, 'request_not_found')
+  if (!screen) {
+    screen = await env.DB.prepare(`INSERT INTO people (name, phone, status, kind, created_by) VALUES (?, ?, 'active', 'screen', ?) RETURNING *`)
+      .bind(String(r.screen_name), `screen:${randomToken(9)}`, who.person.id).first<Person>()
+  }
+  if (r.unblock) await env.DB.prepare(`UPDATE people SET status = 'active' WHERE id = ? AND kind = 'screen'`).bind(screen!.id).run()
+  if (group) {
+    await setGroups(env, screen!.id, [group])
+    await notifyTabs(env, { person: screen!.id })
+  }
+  if (r.kind === 'pair') {
+    await env.DB.prepare(`UPDATE screen_pairings SET state = 'approved', person_id = ?, approved_by = ?, approved_at = ? WHERE id = ? AND state = 'waiting'`)
+      .bind(screen!.id, who.person.id, now(), r.pairing_id).run()
+  }
+  await audit(env, req, {
+    who, strength: 'strong', action: r.kind === 'pair' ? 'screen_paired' : 'screen_changed', target: screen!.name,
+    detail: { via: 'agent', request: id, agent: r.agent_id, screen: screen!.id, group, unblock: !!r.unblock,
+      ...(r.kind === 'pair' ? { label: r.screen_label, place: r.screen_place, ip: r.screen_ip, agent_ip: r.agent_ip } : {}) },
+  })
+  return { ok: true, screen: screen!.id, name: screen!.name }
+}
+
+async function refuseAgentRequest(env: Env, req: Request, who: Who | null, id: number, agent: Agent | null = null) {
+  const r = await env.DB.prepare(`UPDATE agent_requests SET state = ?, decided_by = ?, decided_at = ? WHERE id = ? AND state = 'waiting'${agent ? ' AND agent_id = ?' : ''} RETURNING pairing_id, screen_name, screen_id`)
+    .bind(...[agent ? 'cancelled' : 'refused', who?.person.id ?? null, now(), id, ...(agent ? [agent.id] : [])]).first<Row>()
+  if (!r) throw new HttpError(404, 'request_not_found')
+  if (r.pairing_id) await env.DB.prepare(`UPDATE screen_pairings SET state = 'refused' WHERE id = ? AND state = 'waiting'`).bind(r.pairing_id).run()
+  if (agent) await agentAudit(env, req, agent, 'agent_request_cancelled', String(id))
+  else await audit(env, req, { who, action: 'agent_request_refused', target: String(id) })
+}
+
+// POST /api/pair/claim from the screen: the one-use ticket from the agent's link becomes the poll
+// secret. Only from the address the agent called from (the house), and only once.
+async function pairClaim(req: Request, env: Env) {
+  if (!(await underLimit(env, `claim-ip:${clientIp(req)}`, LIMITS.claimPerIp))) throw new HttpError(429, 'too_many_attempts')
+  const ticket = String((await body(req)).ticket ?? '')
+  if (ticket.length < 30 || ticket.length > 64) throw new HttpError(400, 'missing_secret')
+  const p = await env.DB.prepare(
+    `SELECT p.id, p.claimed_at, p.state, p.expires_at, r.id AS rid, r.agent_ip, r.next_path, r.screen_name, s.name AS screen_current_name
+       FROM screen_pairings p JOIN agent_requests r ON r.id = p.request_id LEFT JOIN people s ON s.id = r.screen_id
+      WHERE p.ticket_hash = ?`,
+  ).bind(await sha256(ticket)).first<Row>()
+  if (!p || p.claimed_at || p.state !== 'waiting') throw new HttpError(404, 'ticket_used')
+  if (String(p.expires_at) < now()) throw new HttpError(410, 'pair_expired')
+  if (!sameNetwork(p.agent_ip, clientIp(req)) && !(await atHome(env, clientIp(req)))) {
+    await audit(env, req, { strength: 'screen', action: 'agent_pair_claim_other_ip', detail: { request: p.rid, agent_ip: p.agent_ip } })
+    if (agentPairOtherIpRefused(env)) throw new HttpError(409, 'claim_other_network')
+  }
+  const secret = randomToken(24)
+  const r = await env.DB.prepare(`UPDATE screen_pairings SET secret_hash = ?, claimed_at = ?, label = ?, ip = ?, place = ? WHERE id = ? AND claimed_at IS NULL AND state = 'waiting'`)
+    .bind(await sha256(secret), now(), deviceLabel(req.headers.get('User-Agent'), null), clientIp(req), place(req), p.id).run()
+  if (!r.meta.changes) throw new HttpError(404, 'ticket_used')
+  await audit(env, req, { strength: 'screen', action: 'agent_pair_claimed', target: String(p.screen_current_name ?? p.screen_name), detail: { request: p.rid } })
+  return json({ secret, name: p.screen_current_name ?? p.screen_name, expires_at: p.expires_at, next: p.next_path ?? null })
+}
+
+// --- agent reads
+async function agentScreens(env: Env) {
+  const people = await env.DB.prepare(`SELECT id, name, status, created_at FROM people WHERE kind = 'screen' ORDER BY id`).all<Row>()
+  const sessions = await env.DB.prepare(
+    `SELECT s.id, s.person_id, s.label, s.place, s.created_at, s.last_used_at FROM sessions s JOIN people p ON p.id = s.person_id
+      WHERE p.kind = 'screen' AND s.expires_at > ?`,
+  ).bind(now()).all<Row>()
+  const links = await env.DB.prepare(`SELECT pg.person_id, pg.group_id FROM person_groups pg JOIN people p ON p.id = pg.person_id WHERE p.kind = 'screen'`).all<Row>()
+  return people.results.map((p) => ({
+    ...p,
+    groups: links.results.filter((l) => l.person_id === p.id).map((l) => l.group_id),
+    sessions: sessions.results.filter((s) => s.person_id === p.id).map(({ person_id: _, ...s }) => s),
+  }))
+}
+
+async function adminPeopleIds(env: Env): Promise<Set<number>> {
+  const r = await env.DB.prepare(`SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1`).all<{ person_id: number }>()
+  return new Set(r.results.map((x) => Number(x.person_id)))
+}
+
+// where a person's phone has been is not the agent's business: place only on screen rows
+async function agentDevices(env: Env) {
+  const admins = await adminPeopleIds(env)
+  return (await listAllDevices(env)).map((d) => ({ ...d, place: d.kind === 'screen' ? d.place : null, admin: admins.has(Number(d.person_id)) }))
+}
+
+// audit rows for an agent: address and place only where the actor is an agent, a screen or a machine
+const AGENT_AUDIT_PLACES = new Set(['agent', 'screen', 'machine'])
+
+async function agentRequestsOf(env: Env, agent: Agent) {
+  const r = await env.DB.prepare(
+    `SELECT r.id, r.kind, r.screen_id, r.screen_name, r.group_id, r.unblock, r.state, r.created_at, r.expires_at, r.decided_at, p.claimed_at
+       FROM agent_requests r LEFT JOIN screen_pairings p ON p.id = r.pairing_id WHERE r.agent_id = ? ORDER BY r.id DESC LIMIT 20`,
+  ).bind(agent.id).all<Row>()
+  return r.results.map((x) => ({ ...x, unblock: !!x.unblock, state: x.state === 'waiting' && String(x.expires_at) < now() ? 'expired' : x.state }))
+}
+
+// an admin's own devices stay theirs: the agent cannot sign the owner out or rename their phone
+async function nonAdminSession(env: Env, id: number): Promise<Row> {
+  const s = await env.DB.prepare('SELECT s.id, s.person_id, s.label, s.kind, s.last_used_at FROM sessions s WHERE s.id = ?').bind(id).first<Row>()
+  if (!s) throw new HttpError(404, 'device_not_found')
+  if ((await adminPeopleIds(env)).has(Number(s.person_id))) throw new HttpError(403, 'admin_device')
+  return s
+}
+const RESIDENT_IDLE_DAYS = 30
+
+async function handleAgent(req: Request, env: Env, url: URL): Promise<Response> {
+  const agent = await agentOf(req, env)
+  const path = url.pathname
+  const m = req.method
+  let mm: RegExpMatchArray | null
+  if (m === 'GET') {
+    if (path === '/_agent/me') return json({ id: agent.id, label: agent.label })
+    if (path === '/_agent/screens') return json(await agentScreens(env))
+    if (path === '/_agent/devices') return json(await agentDevices(env))
+    if (path === '/_agent/machines') return json(await listMachines(env))
+    if (path === '/_agent/groups') return json(await listGroups(env))
+    if (path === '/_agent/requests') return json(await agentRequestsOf(env, agent))
+    // phones and anything that looks like one stay masked for an agent, always
+    if (path === '/_agent/audit') return json((await listAudit(env, url)).map((a) => {
+      const keep = AGENT_AUDIT_PLACES.has(String(a.strength))
+      const detail = a.detail == null ? null : keep ? String(a.detail) : String(a.detail).replace(/"(ip|previous_ip|agent_ip|place)":"[^"]*"/g, '"$1":null')
+      return { ...a, ip: keep ? a.ip : null, place: keep ? a.place : null, target: a.target == null ? null : mask(a.target), detail: detail == null ? null : mask(detail) }
+    }))
+    throw new HttpError(404, 'not_found')
+  }
+  if (path === '/_agent/requests' && m === 'POST') return json(await agentRequestCreate(env, req, url, agent), 201)
+  if ((mm = path.match(/^\/_agent\/requests\/(\d+)$/)) && m === 'DELETE') {
+    await refuseAgentRequest(env, req, null, Number(mm[1]), agent)
+    return json({ ok: true })
+  }
+  if ((mm = path.match(/^\/_agent\/(screens|devices|machines)\/(\d+)$/)) && m === 'POST') {
+    const id = Number(mm[2])
+    const name = text((await body(req)).name, 40)
+    if (!name) throw new HttpError(400, 'name_required')
+    let before: Row | null
+    if (mm[1] === 'screens') {
+      before = await env.DB.prepare(`SELECT name FROM people WHERE id = ? AND kind = 'screen'`).bind(id).first<Row>()
+      if (!before) throw new HttpError(404, 'screen_not_found')
+      await env.DB.prepare(`UPDATE people SET name = ? WHERE id = ? AND kind = 'screen'`).bind(name, id).run()
+    } else if (mm[1] === 'devices') {
+      before = await nonAdminSession(env, id)
+      await env.DB.prepare('UPDATE sessions SET label = ? WHERE id = ?').bind(name, id).run()
+    } else {
+      before = await env.DB.prepare('SELECT label FROM machine_keys WHERE id = ?').bind(id).first<Row>()
+      if (!before) throw new HttpError(404, 'machine_not_found')
+      await env.DB.prepare('UPDATE machine_keys SET label = ? WHERE id = ?').bind(name, id).run()
+    }
+    await agentAudit(env, req, agent, `agent_renamed_${mm[1].slice(0, -1)}`, name, { id, before: before.name ?? before.label ?? null })
+    return json({ ok: true })
+  }
+  if ((mm = path.match(/^\/_agent\/devices\/(\d+)$/)) && m === 'DELETE') {
+    const s = await nonAdminSession(env, Number(mm[1]))
+    // screens: any time; a resident's phone: only one left unused for a month (the old phone case)
+    if (s.kind !== 'screen' && Date.now() - Date.parse(String(s.last_used_at)) < RESIDENT_IDLE_DAYS * 864e5) throw new HttpError(403, 'device_in_use')
+    await dropSessions(env, [Number(s.id)])
+    await agentAudit(env, req, agent, 'device_revoked', `${s.person_id}:${s.label ?? ''}`)
+    return json({ ok: true })
+  }
+  if ((mm = path.match(/^\/_agent\/machines\/(\d+)$/)) && m === 'DELETE') {
+    const k = await env.DB.prepare('UPDATE machine_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING tab, label').bind(now(), Number(mm[1])).first<Row>()
+    if (!k) throw new HttpError(404, 'machine_not_found')
+    await notifyTabs(env, { machine: Number(mm[1]) }, String(k.tab))
+    await agentAudit(env, req, agent, 'machine_key_revoked', `${k.tab}:${k.label}`)
+    return json({ ok: true })
+  }
+  throw new HttpError(404, 'not_found')
+}
+
+// --- agent keys, managed by a strong admin from the account page
+async function listAgentKeys(env: Env) {
+  const r = await env.DB.prepare('SELECT id, label, created_at, last_used_at, last_ip, revoked_at FROM agent_keys ORDER BY id DESC LIMIT 50').all<Row>()
+  return r.results
+}
+
+async function addAgentKey(env: Env, req: Request, who: Who) {
+  const label = text((await body(req)).label, 40)
+  if (!label) throw new HttpError(400, 'name_required')
+  const key = AGENT_KEY_PREFIX + randomToken(32)
+  const r = await env.DB.prepare('INSERT INTO agent_keys (label, key_hash, created_at, created_by) VALUES (?, ?, ?, ?) RETURNING id')
+    .bind(label, await sha256(key), now(), who.person.id).first<{ id: number }>()
+  await audit(env, req, { who, action: 'agent_key_created', target: label, detail: { id: r!.id } })
+  // shown once; only the hash stays
+  return { id: r!.id, label, key }
+}
+
+async function revokeAgentKey(env: Env, req: Request, who: Who, id: number) {
+  const k = await env.DB.prepare('UPDATE agent_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING label').bind(now(), id).first<Row>()
+  if (!k) throw new HttpError(404, 'agent_not_found')
+  // what it left waiting dies with it, links included
+  const open = await env.DB.prepare(`UPDATE agent_requests SET state = 'cancelled', decided_at = ? WHERE agent_id = ? AND state = 'waiting' RETURNING pairing_id`)
+    .bind(now(), id).all<{ pairing_id: number | null }>()
+  for (const r of open.results)
+    if (r.pairing_id) await env.DB.prepare(`UPDATE screen_pairings SET state = 'refused' WHERE id = ? AND state = 'waiting'`).bind(r.pairing_id).run()
+  await audit(env, req, { who, action: 'agent_key_revoked', target: String(k.label) })
+}
+
 // ------------------------------------------------------------------ router
 async function handle(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url)
@@ -1417,6 +1828,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
   if (path.startsWith('/_bridge')) throw new HttpError(404, 'not_found')
   if ((mb = path.match(/^\/_cmd\/([a-z][a-z0-9-]{0,30})\/([a-z][a-z0-9_]{0,39})$/))) return shortcutCommand(req, env, mb[1], mb[2])
   if (path.startsWith('/_cmd')) throw new HttpError(404, 'not_found')
+  if (path.startsWith('/_agent/')) return handleAgent(req, env, url)
 
   if (path.startsWith('/api/')) {
     requireSameOrigin(req, url)
@@ -1424,6 +1836,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
     if (path === '/api/login/status' && m === 'POST') return loginStatus(req, env)
     if (path === '/api/pair/start' && m === 'POST') return pairStart(req, env, url)
     if (path === '/api/pair/status' && m === 'POST') return pairStatus(req, env)
+    if (path === '/api/pair/claim' && m === 'POST') return pairClaim(req, env)
     if (path === '/api/logout' && m === 'POST') {
       const who = await currentSession(req, env)
       if (who) {
@@ -1473,10 +1886,18 @@ async function handle(req: Request, env: Env): Promise<Response> {
         if (path === '/api/admin/audit') return out(masked(await listAudit(env, url), who, ['detail']))
         if (path === '/api/admin/pair') return out(await pairLookup(req, env, url))
         if (path === '/api/admin/machines') return out(await listMachines(env))
+        if (path === '/api/admin/agents') return out(await listAgentKeys(env))
+        if (path === '/api/admin/agent-requests') return out(await adminAgentRequests(env))
+        if ((mm = path.match(/^\/api\/admin\/agent-requests\/(\d+)$/))) return out(await adminAgentRequest(env, Number(mm[1])))
         throw new HttpError(404, 'not_found')
       }
       // the brake: stopping commands takes any admin session (setBrake asks a passkey to restart)
       if (path === '/api/admin/commands' && m === 'POST') return out(await setBrake(env, req, who))
+      // refusing what an agent asked gives nobody access: any admin session
+      if ((mm = path.match(/^\/api\/admin\/agent-requests\/(\d+)\/refuse$/)) && m === 'POST') {
+        await refuseAgentRequest(env, req, who, Number(mm[1]))
+        return out({ ok: true })
+      }
       // writes: passkey in the last 5 minutes
       requireStrongAdmin(who)
       if (path === '/api/admin/people' && m === 'POST') return out(await addPerson(env, req, who))
@@ -1504,6 +1925,11 @@ async function handle(req: Request, env: Env): Promise<Response> {
       }
       if (path === '/api/admin/pair' && m === 'POST') return out(await pairApprove(env, req, who))
       if (path === '/api/admin/machines' && m === 'POST') return out(await addMachine(env, req, who))
+      if (path === '/api/admin/agents' && m === 'POST') return out(await addAgentKey(env, req, who))
+      if ((mm = path.match(/^\/api\/admin\/agents\/(\d+)$/)) && m === 'DELETE') {
+        await revokeAgentKey(env, req, who, Number(mm[1]))
+        return out({ ok: true })
+      }
       if ((mm = path.match(/^\/api\/admin\/machines\/(\d+)$/)) && m === 'DELETE') {
         await revokeMachine(env, req, who, Number(mm[1]))
         return out({ ok: true })

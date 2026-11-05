@@ -101,7 +101,18 @@ for q in \
   "DELETE FROM tab_entries WHERE granted_at < 'x'" \
   "SELECT id, tab, label, revoked_at FROM machine_keys WHERE key_hash = 'x'" \
   "SELECT n FROM rate_limits WHERE bucket = 'b' AND hour = 'h'" \
-  "SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1"; do
+  "SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1" \
+  "SELECT id, label, revoked_at FROM agent_keys WHERE key_hash = 'x'" \
+  "SELECT COUNT(*) AS n FROM agent_requests WHERE agent_id = 1 AND state = 'waiting' AND expires_at > 'x'" \
+  "SELECT id FROM agent_requests WHERE state = 'waiting' AND expires_at > 'x' ORDER BY id LIMIT 20" \
+  "SELECT r.* FROM agent_requests r LEFT JOIN agent_keys k ON k.id = r.agent_id LEFT JOIN screen_pairings p ON p.id = r.pairing_id LEFT JOIN people s ON s.id = r.screen_id LEFT JOIN groups g ON g.id = r.group_id WHERE r.id = 1 AND r.state = 'waiting' AND r.expires_at > 'x'" \
+  "SELECT r.id FROM agent_requests r LEFT JOIN screen_pairings p ON p.id = r.pairing_id WHERE r.agent_id = 1 ORDER BY r.id DESC LIMIT 20" \
+  "SELECT p.id FROM screen_pairings p JOIN agent_requests r ON r.id = p.request_id LEFT JOIN people s ON s.id = r.screen_id WHERE p.ticket_hash = 'x'" \
+  "SELECT id, name FROM people WHERE kind = 'screen' ORDER BY id" \
+  "SELECT s.id FROM sessions s JOIN people p ON p.id = s.person_id WHERE p.kind = 'screen' AND s.expires_at > 'x'" \
+  "SELECT pg.person_id, pg.group_id FROM person_groups pg JOIN people p ON p.id = pg.person_id WHERE p.kind = 'screen'" \
+  "UPDATE agent_requests SET state = 'cancelled' WHERE agent_id = 1 AND state = 'waiting'" \
+  "SELECT last_ip FROM machine_keys WHERE revoked_at IS NULL AND last_ip IS NOT NULL LIMIT 50"; do
   plan="$(npx wrangler d1 execute portal_a5 --local --persist-to "$STATE" --json --command "EXPLAIN QUERY PLAN $q" 2>/dev/null)"
   if echo "$plan" | grep -E '"detail": *"SCAN [a-z_]+"' | grep -vq 'USING'; then echo "FAIL full scan: $q"; echo "$plan"; exit 1; fi
 done
