@@ -1,0 +1,36 @@
+# Portal worker: serves the pages (Static Assets) and the API from the same origin,
+# so the session can live in an HttpOnly cookie.
+name = "portal-a5"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# Paths that are not files (/api/*, /robo/*, /<tab>/*) fall through to the worker.
+not_found_handling = "none"
+
+[vars]
+# Tab name -> service binding name, e.g. {"energia":"TAB_ENERGIA"}. Empty until tabs exist.
+TABS = "{}"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "portal_a5"
+# Placeholder. scripts/deploy.sh looks up the real id by name and never commits it.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Tabs are private workers (workers_dev = false, preview_urls = false, no route) that export a
+# WorkerEntrypoint with handle(request, identity); their default fetch answers 404.
+# [[services]]
+# binding = "TAB_ENERGIA"
+# service = "portal-a5-energia"
+
+# Secrets (never in this file):
+#   ROBO_LOGIN_CHAVE  "pa5_robo_" + 32 random bytes; shared with the WhatsApp reader,
+#                     accepted only on POST /robo/login (header X-A5-Robo-Chave)
+#   OWNER_PHONE       the owner's number: target of the wa.me link and the first admin
+# Local: .dev.vars (git-ignored). Remote: scripts/deploy.sh pipes them from the Keychain.

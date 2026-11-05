@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.deploy/
+*.log
+.DS_Store
+
+*.vars
+.wrangler.deploy.toml

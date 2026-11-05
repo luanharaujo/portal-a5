@@ -1,0 +1,825 @@
+// Portal worker: WhatsApp sign-in, passkeys, devices, groups, and a router that hands each
+// tab (/<tab>/*) to a private worker over RPC.
+//
+// Trust levels:
+//   weak session    signed in through WhatsApp. Can read; can revoke its own devices.
+//   strong session  the same session after a passkey check (Face ID / Touch ID).
+//                   Every admin write needs a passkey check from the last 5 minutes.
+
+import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
+
+export interface Env {
+  DB: D1Database
+  ASSETS: Fetcher
+  ROBO_LOGIN_CHAVE: string
+  OWNER_PHONE: string
+  TABS?: string
+  [binding: string]: unknown
+}
+
+// What a tab worker receives. Tabs export a WorkerEntrypoint with handle(request, identity)
+// and answer 404 on their default fetch.
+export interface PortalIdentity {
+  person: number
+  name: string
+  groups: string[]
+  session: number
+  credential: 'browser'
+  strong: boolean
+  actions: string[]
+}
+interface TabService { handle(req: Request, who: PortalIdentity): Promise<Response> }
+
+const CODE_MINUTES = 10
+const SESSION_DAYS = 180
+const SESSION_TOUCH_MS = 5 * 60e3
+const PASSKEY_FRESH_MS = 5 * 60e3
+const CHALLENGE_MS = 5 * 60e3
+const MAX_DEVICES = 3 // non-admin; admins have no cap
+const PENDING_MAX = 20
+const PENDING_DAYS = 7
+const LIMITS = {
+  startPerIp: 20, startPerNumber: 5, statusPerIp: 900,
+  robotPerSender: 3, robotTotal: 30, // per hour
+}
+const COOKIE = '__Host-a5s'
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O/1/I/L
+// The reader matches this exact phrase, so it is part of the protocol, not UI text.
+const LOGIN_PHRASE = 'Entrar no Portal A5: '
+const ROBOT_KEY_PREFIX = 'pa5_robo_'
+const OWNER_GROUP = 'owner'
+
+const HTML_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
+  "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+const PAGE_HEADERS: Record<string, string> = {
+  'Content-Security-Policy': HTML_CSP,
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'publickey-credentials-get=(self), publickey-credentials-create=(self)',
+  'Strict-Transport-Security': 'max-age=31536000',
+  'X-Frame-Options': 'DENY',
+}
+const API_HEADERS: Record<string, string> = {
+  ...PAGE_HEADERS,
+  'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+  'Cache-Control': 'no-store',
+}
+
+type Row = Record<string, unknown>
+interface Person { id: number; name: string; phone: string; status: string }
+interface Group { id: string; name: string; tabs: string; is_admin: number }
+interface Who {
+  person: Person; sessionId: number; groups: Group[]; admin: boolean; tabs: Set<string>
+  passkeyAt: string | null; refreshCookie: string | null
+}
+
+class HttpError extends Error {
+  // message is a stable error code; the page turns it into text for people
+  constructor(public status: number, message: string, public extra: Row = {}) { super(message) }
+}
+
+// ------------------------------------------------------------------ small helpers
+const now = () => new Date().toISOString()
+const inMs = (ms: number) => new Date(Date.now() + ms).toISOString()
+
+async function sha256(s: string): Promise<string> {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+const randomToken = (bytes = 32) => b64url(crypto.getRandomValues(new Uint8Array(bytes)))
+
+function newCode(): string {
+  const b = crypto.getRandomValues(new Uint8Array(4))
+  return 'A5-' + [...b].map((x) => CODE_ALPHABET[x % CODE_ALPHABET.length]).join('')
+}
+
+// Constant-time comparison: hash both sides, then compare fixed-length digests.
+async function sameSecret(a: string, b: string): Promise<boolean> {
+  if (!a || !b) return false
+  const [x, y] = await Promise.all([sha256(a), sha256(b)])
+  let diff = 0
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i)
+  return diff === 0
+}
+
+// Digits only, country code first. Brazilian mobiles are stored with the 9th digit, since
+// WhatsApp ids for older numbers often drop it.
+export function normalizePhone(raw: unknown): string | null {
+  let d = String(raw ?? '').replace(/@.*$/, '').replace(/\D/g, '')
+  if (!d) return null
+  if (d.length === 10 || d.length === 11) d = '55' + d
+  if (d.startsWith('55') && d.length === 12 && /[6-9]/.test(d[4])) d = d.slice(0, 4) + '9' + d.slice(4)
+  if (d.length < 10 || d.length > 15) return null
+  return d
+}
+
+function text(v: unknown, max: number): string | null {
+  const s = String(v ?? '').replace(/[\u0000-\u001f\u007f<>]/g, ' ').trim()
+  return s ? s.slice(0, max) : null
+}
+
+function deviceLabel(ua: string | null, mode: unknown): string {
+  const u = ua ?? ''
+  const os = /iPhone/.test(u) ? 'iPhone' : /iPad/.test(u) ? 'iPad' : /Android/.test(u) ? 'Android'
+    : /Macintosh|Mac OS X/.test(u) ? 'Mac' : /Windows/.test(u) ? 'Windows' : /Linux/.test(u) ? 'Linux' : 'device'
+  const br = /Edg\//.test(u) ? 'Edge' : /Firefox\//.test(u) ? 'Firefox' : /CriOS|Chrome\//.test(u) ? 'Chrome'
+    : /Safari\//.test(u) ? 'Safari' : 'browser'
+  return mode === 'app' ? `${os} · app` : `${os} · ${br}`
+}
+
+const clientIp = (req: Request) => req.headers.get('CF-Connecting-IP') ?? 'local'
+
+function place(req: Request): string | null {
+  const cf = (req as unknown as { cf?: Row }).cf
+  if (!cf) return null
+  const bits = [cf.city, cf.region, cf.asn ? `AS${cf.asn}` : null, cf.asOrganization].filter(Boolean).map(String)
+  return bits.length ? bits.join(', ').slice(0, 120) : null
+}
+
+function json(data: unknown, status = 200, extra: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...API_HEADERS, ...extra },
+  })
+}
+
+async function body(req: Request): Promise<Row> {
+  const raw = await req.text()
+  if (raw.length > 16_384) throw new HttpError(413, 'too_large')
+  try {
+    const b = JSON.parse(raw || '{}')
+    return b && typeof b === 'object' && !Array.isArray(b) ? (b as Row) : {}
+  } catch {
+    throw new HttpError(400, 'bad_json')
+  }
+}
+
+function cookieValue(req: Request, name: string): string | null {
+  const h = req.headers.get('Cookie') ?? ''
+  for (const part of h.split(';')) {
+    const i = part.indexOf('=')
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim()
+  }
+  return null
+}
+
+// Lax, not Strict: a link from WhatsApp or a shortcut must arrive signed in.
+const sessionCookie = (token: string) =>
+  `${COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`
+const clearCookie = () => `${COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`
+
+const strength = (who: Who | null) => (who ? (fresh(who) ? 'strong' : 'weak') : null)
+const fresh = (who: Who) => !!who.passkeyAt && Date.now() - Date.parse(who.passkeyAt) < PASSKEY_FRESH_MS
+
+async function audit(env: Env, req: Request | null, a: { who?: Who | null; person?: number | null; strength?: string | null; action: string; target?: string | null; detail?: unknown }) {
+  await env.DB.prepare('INSERT INTO audit (at, person_id, session_id, strength, action, target, detail, ip, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(now(), a.person ?? a.who?.person.id ?? null, a.who?.sessionId ?? null, a.strength ?? strength(a.who ?? null), a.action,
+      a.target ?? null, a.detail == null ? null : JSON.stringify(a.detail).slice(0, 2000),
+      req ? clientIp(req) : null, req ? place(req) : null)
+    .run()
+}
+
+// Fixed-window counter keyed by `window` (default: the hour). False once over `max`.
+async function underLimit(env: Env, bucket: string, max: number, window = now().slice(0, 13)): Promise<boolean> {
+  const r = await env.DB.prepare(
+    'INSERT INTO rate_limits (bucket, hour, n) VALUES (?, ?, 1) ON CONFLICT (bucket, hour) DO UPDATE SET n = n + 1 RETURNING n',
+  ).bind(bucket, window).first<{ n: number }>()
+  return (r?.n ?? 0) <= max
+}
+
+// Every non-GET request must come from this exact origin and carry X-Portal: 1
+// (a header a cross-site form cannot set). GET never changes state.
+function requireSameOrigin(req: Request, url: URL) {
+  if (req.method === 'GET' || req.method === 'HEAD') return
+  if (req.headers.get('Origin') !== url.origin) throw new HttpError(403, 'bad_origin')
+  if (req.headers.get('X-Portal') !== '1') throw new HttpError(403, 'missing_x_portal')
+}
+
+// ------------------------------------------------------------------ people and groups
+async function groupsOf(env: Env, personId: number): Promise<Group[]> {
+  const r = await env.DB.prepare(
+    'SELECT g.* FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE pg.person_id = ?',
+  ).bind(personId).all<Group>()
+  return r.results
+}
+
+function tabsOf(groups: Group[]): Set<string> {
+  const s = new Set<string>()
+  for (const g of groups) {
+    try { for (const t of JSON.parse(g.tabs) as string[]) s.add(String(t)) } catch { /* bad JSON = no tabs */ }
+  }
+  return s
+}
+
+const personByPhone = (env: Env, phone: string) => env.DB.prepare('SELECT * FROM people WHERE phone = ?').bind(phone).first<Person>()
+
+// The owner bootstraps on first sign-in: their number is a secret, never a row in a migration.
+async function ensureOwner(env: Env, phone: string): Promise<Person | null> {
+  const owner = normalizePhone(env.OWNER_PHONE)
+  if (!owner || owner !== phone) return null
+  const p = await env.DB.prepare(
+    `INSERT INTO people (name, phone, status) VALUES ('Dono', ?, 'active')
+     ON CONFLICT (phone) DO UPDATE SET status = 'active' RETURNING *`,
+  ).bind(phone).first<Person>()
+  await env.DB.prepare('INSERT OR IGNORE INTO person_groups (person_id, group_id) VALUES (?, ?)').bind(p!.id, OWNER_GROUP).run()
+  return p
+}
+
+// ------------------------------------------------------------------ sessions
+async function currentSession(req: Request, env: Env): Promise<Who | null> {
+  const token = cookieValue(req, COOKIE)
+  if (!token || token.length < 40) return null
+  const s = await env.DB.prepare(
+    `SELECT s.id AS sid, s.last_used_at, s.passkey_at, p.* FROM sessions s JOIN people p ON p.id = s.person_id
+     WHERE s.token_hash = ? AND s.expires_at > ?`,
+  ).bind(await sha256(token), now()).first<Row>()
+  if (!s || s.status !== 'active') return null
+  let refreshCookie: string | null = null
+  if (Date.now() - Date.parse(String(s.last_used_at)) > SESSION_TOUCH_MS) {
+    await env.DB.prepare('UPDATE sessions SET last_used_at = ?, expires_at = ? WHERE id = ?')
+      .bind(now(), inMs(SESSION_DAYS * 864e5), s.sid).run()
+    refreshCookie = sessionCookie(token)
+  }
+  const person: Person = { id: Number(s.id), name: String(s.name), phone: String(s.phone), status: String(s.status) }
+  const groups = await groupsOf(env, person.id)
+  return {
+    person, sessionId: Number(s.sid), groups, admin: groups.some((g) => g.is_admin), tabs: tabsOf(groups),
+    passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie,
+  }
+}
+
+async function requireSession(req: Request, env: Env): Promise<Who> {
+  const who = await currentSession(req, env)
+  if (!who) throw new HttpError(401, 'signed_out')
+  return who
+}
+
+// Admin writes: admin group + passkey checked in the last 5 minutes on this session.
+function requireStrongAdmin(who: Who) {
+  if (!who.admin) throw new HttpError(403, 'admin_only')
+  if (!fresh(who)) throw new HttpError(403, 'passkey_required', { passkey: true })
+}
+
+async function createSession(env: Env, req: Request, person: Person, label: string): Promise<string> {
+  const groups = await groupsOf(env, person.id)
+  const admin = groups.some((g) => g.is_admin)
+  if (!admin) {
+    // keep the newest MAX_DEVICES - 1, so the new one fits
+    const old = await env.DB.prepare('SELECT id FROM sessions WHERE person_id = ? ORDER BY last_used_at DESC LIMIT -1 OFFSET ?')
+      .bind(person.id, MAX_DEVICES - 1).all<{ id: number }>()
+    for (const o of old.results) await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(o.id).run()
+  }
+  const token = randomToken(32)
+  const t = now()
+  const r = await env.DB.prepare(
+    `INSERT INTO sessions (person_id, token_hash, kind, label, ip, place, created_at, last_used_at, expires_at)
+     VALUES (?, ?, 'browser', ?, ?, ?, ?, ?, ?) RETURNING id`,
+  ).bind(person.id, await sha256(token), label, clientIp(req), place(req), t, t, inMs(SESSION_DAYS * 864e5)).first<{ id: number }>()
+  await env.DB.prepare(
+    'INSERT INTO audit (at, person_id, session_id, strength, action, target, ip, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).bind(t, person.id, r!.id, 'weak', admin ? 'login_admin' : 'login', label, clientIp(req), place(req)).run()
+  return token
+}
+
+// ------------------------------------------------------------------ login (browser side)
+// Same answer for known, unknown and blocked numbers: nothing here tells who is registered.
+async function loginStart(req: Request, env: Env) {
+  const b = await body(req)
+  const phone = normalizePhone(b.phone)
+  if (!phone) throw new HttpError(400, 'bad_number')
+  if (!(await underLimit(env, `start-ip:${clientIp(req)}`, LIMITS.startPerIp))) throw new HttpError(429, 'too_many_attempts')
+  if (!(await underLimit(env, `start-num:${phone}`, LIMITS.startPerNumber))) throw new HttpError(429, 'too_many_for_number')
+  const owner = normalizePhone(env.OWNER_PHONE)
+  if (!owner) throw new HttpError(503, 'not_configured')
+
+  // housekeeping, all on indexed columns
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM login_codes WHERE expires_at < ?').bind(inMs(-864e5)),
+    env.DB.prepare('DELETE FROM rate_limits WHERE hour < ?').bind(inMs(-3 * 3600e3).slice(0, 13)),
+    env.DB.prepare('DELETE FROM passkey_challenges WHERE expires_at < ?').bind(now()),
+  ])
+
+  let code = ''
+  for (let i = 0; i < 8; i++) {
+    code = newCode()
+    const busy = await env.DB.prepare('SELECT 1 FROM login_codes WHERE code_hash = ? AND expires_at > ?').bind(await sha256(code), now()).first()
+    if (!busy) break
+  }
+  const secret = randomToken(24)
+  const expires = inMs(CODE_MINUTES * 60e3)
+  await env.DB.batch([
+    // one live code per number: the previous one dies now
+    env.DB.prepare(`UPDATE login_codes SET expires_at = ? WHERE typed_phone = ? AND state = 'waiting' AND expires_at > ?`).bind(now(), phone, now()),
+    env.DB.prepare('INSERT INTO login_codes (code_hash, secret_hash, typed_phone, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(await sha256(code), await sha256(secret), phone, deviceLabel(req.headers.get('User-Agent'), b.mode), now(), expires),
+  ])
+  const message = LOGIN_PHRASE + code
+  return json({ code, secret, expires_at: expires, message, wa_link: `https://wa.me/${owner}?text=${encodeURIComponent(message)}` }, 201)
+}
+
+async function loginStatus(req: Request, env: Env) {
+  if (!(await underLimit(env, `status-ip:${clientIp(req)}`, LIMITS.statusPerIp))) throw new HttpError(429, 'too_many_polls')
+  const b = await body(req)
+  const secret = String(b.secret ?? '')
+  if (secret.length < 30) throw new HttpError(400, 'missing_secret')
+  const c = await env.DB.prepare('SELECT * FROM login_codes WHERE secret_hash = ?').bind(await sha256(secret)).first<Row>()
+  if (!c) throw new HttpError(404, 'code_not_found')
+  const state = String(c.state)
+  if (state === 'used' || state === 'refused') return json({ status: state })
+  if (String(c.expires_at) < now()) return json({ status: 'expired' })
+  if (state === 'waiting' || state === 'pending') return json({ status: state, expires_at: c.expires_at })
+  // confirmed: burn the code and hand out the session exactly once
+  const r = await env.DB.prepare(`UPDATE login_codes SET state = 'used' WHERE id = ? AND state = 'confirmed'`).bind(c.id).run()
+  if (!r.meta.changes) return json({ status: 'used' })
+  const p = await env.DB.prepare('SELECT * FROM people WHERE id = ?').bind(c.confirmed_person_id).first<Person>()
+  if (!p || p.status !== 'active') return json({ status: 'refused' })
+  const token = await createSession(env, req, p, deviceLabel(req.headers.get('User-Agent'), b.mode))
+  return json({ status: 'ok', name: p.name }, 200, { 'Set-Cookie': sessionCookie(token) })
+}
+
+// ------------------------------------------------------------------ login (robot side)
+// POST /robo/login. The WhatsApp reader saw the exact phrase in a private chat and reports the
+// number WhatsApp proved sent it. Identity is always the sender, never the number typed.
+// The key opens this route only, and a session born here is weak.
+async function robotLogin(req: Request, env: Env) {
+  const key = env.ROBO_LOGIN_CHAVE ?? ''
+  if (!key.startsWith(ROBOT_KEY_PREFIX) || key.length < 40) throw new HttpError(503, 'robot_key_not_configured')
+  if (!(await sameSecret(req.headers.get('X-A5-Robo-Chave') ?? '', key))) throw new HttpError(401, 'bad_key')
+  const b = await body(req)
+  const m = /^A5-[A-Z0-9]{4}$/.exec(String(b.codigo ?? '').trim().toUpperCase())
+  if (!m) throw new HttpError(400, 'missing_code')
+  const code = m[0]
+  const sender = normalizePhone(b.numero)
+  if (!sender) throw new HttpError(400, 'missing_number')
+  const self = b.eu_mesmo === true
+  const owner = normalizePhone(env.OWNER_PHONE)
+  if (self && sender !== owner) throw new HttpError(400, 'self_chat_not_owner')
+  const msgId = text(b.msg_id, 80)
+
+  if (!(await underLimit(env, 'robot-total', LIMITS.robotTotal))) return json({ ok: false, motivo: 'limite_total' })
+  if (!(await underLimit(env, `robot:${sender}`, LIMITS.robotPerSender))) return json({ ok: false, motivo: 'limite_remetente' })
+
+  const c = await env.DB.prepare(`SELECT * FROM login_codes WHERE code_hash = ? AND expires_at > ? AND state IN ('waiting', 'confirmed', 'pending') ORDER BY id DESC`)
+    .bind(await sha256(code), now()).first<Row>()
+  const reqInfo = { msg_id: msgId, eu_mesmo: self }
+  if (!c) {
+    await audit(env, req, { strength: 'robot', action: 'robot_invalid_code', detail: reqInfo })
+    return json({ ok: false, motivo: 'codigo_invalido' })
+  }
+  const device = { aparelho: c.label, pedido_em: c.created_at }
+  if (c.state === 'confirmed') return json({ ok: true, repetido: true, ...device })
+  if (c.state === 'pending') return json({ ok: false, motivo: 'aguardando_dono', repetido: true, ...device })
+
+  let person = await personByPhone(env, sender)
+  if (!person) person = await ensureOwner(env, sender)
+
+  if (person && person.status === 'blocked') {
+    await env.DB.prepare(`UPDATE login_codes SET state = 'refused' WHERE id = ?`).bind(c.id).run()
+    await audit(env, req, { person: person.id, strength: 'robot', action: 'robot_blocked', detail: reqInfo })
+    return json({ ok: false, motivo: 'bloqueado' })
+  }
+
+  if (person && sender === c.typed_phone) {
+    // admin numbers: at most one accepted login every 10 minutes
+    const admin = (await groupsOf(env, person.id)).some((g) => g.is_admin)
+    if (admin && !(await underLimit(env, `robot-admin:${sender}`, 1, now().slice(0, 15))))
+      return json({ ok: false, motivo: 'limite_admin' })
+    await env.DB.prepare(`UPDATE login_codes SET state = 'confirmed', confirmed_at = ?, confirmed_person_id = ? WHERE id = ? AND state = 'waiting'`)
+      .bind(now(), person.id, c.id).run()
+    await audit(env, req, { person: person.id, strength: 'robot', action: 'robot_confirmed', target: String(c.label ?? ''), detail: reqInfo })
+    return json({ ok: true, ...device })
+  }
+
+  // Unknown sender, or a sender other than the number typed: nobody signs in. The owner decides.
+  const pending = await env.DB.prepare(`SELECT COUNT(*) AS n FROM link_requests WHERE state = 'pending' AND expires_at > ?`).bind(now()).first<{ n: number }>()
+  if ((pending?.n ?? 0) >= PENDING_MAX) {
+    await env.DB.prepare(`UPDATE login_codes SET state = 'refused' WHERE id = ?`).bind(c.id).run()
+    return json({ ok: false, motivo: 'pendentes_demais' })
+  }
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE login_codes SET state = 'pending' WHERE id = ? AND state = 'waiting'`).bind(c.id),
+    env.DB.prepare(
+      `INSERT INTO link_requests (code_id, typed_phone, sender_phone, sender_person_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (code_id) DO NOTHING`,
+    ).bind(c.id, c.typed_phone, sender, person?.id ?? null, now(), inMs(PENDING_DAYS * 864e5)),
+  ])
+  await audit(env, req, { person: person?.id ?? null, strength: 'robot', action: 'robot_pending', detail: { ...reqInfo, mismatch: !!person } })
+  return json({ ok: false, motivo: 'aguardando_dono', ...device })
+}
+
+// ------------------------------------------------------------------ passkeys
+const rpOf = (url: URL) => ({ id: url.hostname, origin: url.origin })
+
+async function passkeyCount(env: Env, personId: number) {
+  return (await env.DB.prepare('SELECT COUNT(*) AS n FROM passkeys WHERE person_id = ?').bind(personId).first<{ n: number }>())?.n ?? 0
+}
+
+async function newChallenge(env: Env, who: Who, kind: 'create' | 'get') {
+  const challenge = randomToken(32)
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ?').bind(who.sessionId, kind),
+    env.DB.prepare('INSERT INTO passkey_challenges (session_id, kind, challenge, expires_at) VALUES (?, ?, ?, ?)')
+      .bind(who.sessionId, kind, challenge, inMs(CHALLENGE_MS)),
+  ])
+  return challenge
+}
+
+async function takeChallenge(env: Env, who: Who, kind: 'create' | 'get'): Promise<string> {
+  const c = await env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ? AND expires_at > ? RETURNING challenge')
+    .bind(who.sessionId, kind, now()).first<{ challenge: string }>()
+  if (!c) throw new HttpError(400, 'challenge_expired')
+  return c.challenge
+}
+
+// The first passkey of an admin can be added from a weak session (done once, with the owner
+// in front of the screen). Any later one needs a fresh passkey check.
+async function canAddPasskey(env: Env, who: Who) {
+  if (!who.admin) throw new HttpError(403, 'passkey_admin_only')
+  if (fresh(who)) return
+  if ((await passkeyCount(env, who.person.id)) > 0) throw new HttpError(403, 'passkey_required', { passkey: true })
+}
+
+async function passkeyCreateOptions(env: Env, url: URL, who: Who) {
+  await canAddPasskey(env, who)
+  const existing = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE person_id = ?').bind(who.person.id).all<{ credential_id: string }>()
+  const rp = rpOf(url)
+  return {
+    challenge: await newChallenge(env, who, 'create'),
+    rp: { id: rp.id, name: 'Portal A5' },
+    user: { id: b64url(new TextEncoder().encode(`a5-${who.person.id}`)), name: who.person.name, displayName: who.person.name },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+    excludeCredentials: existing.results.map((e) => ({ type: 'public-key', id: e.credential_id })),
+    timeout: CHALLENGE_MS,
+    attestation: 'none',
+  }
+}
+
+async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
+  await canAddPasskey(env, who)
+  const b = await body(req)
+  const rp = rpOf(url)
+  const challenge = await takeChallenge(env, who, 'create')
+  let reg
+  try {
+    reg = await verifyRegistration({
+      id: String(b.id ?? ''), clientDataJSON: String(b.clientDataJSON ?? ''), authenticatorData: String(b.authenticatorData ?? ''),
+      publicKey: String(b.publicKey ?? ''), publicKeyAlgorithm: Number(b.publicKeyAlgorithm),
+    }, { challenge, origin: rp.origin, rpId: rp.id })
+  } catch (e) {
+    if (e instanceof WebAuthnError) throw new HttpError(400, e.message)
+    throw e
+  }
+  const label = text(b.label, 60) ?? deviceLabel(req.headers.get('User-Agent'), null)
+  await env.DB.prepare('INSERT INTO passkeys (person_id, credential_id, public_key, sign_count, label, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(who.person.id, reg.credentialId, reg.publicKey, reg.signCount, label, now()).run()
+  await env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId).run()
+  await audit(env, req, { who, strength: 'strong', action: 'passkey_added', target: label })
+  return { ok: true }
+}
+
+async function passkeyGetOptions(env: Env, url: URL, who: Who) {
+  const creds = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE person_id = ?').bind(who.person.id).all<{ credential_id: string }>()
+  if (!creds.results.length) throw new HttpError(409, 'no_passkey', { no_passkey: true })
+  return {
+    challenge: await newChallenge(env, who, 'get'),
+    rpId: rpOf(url).id,
+    allowCredentials: creds.results.map((c) => ({ type: 'public-key', id: c.credential_id })),
+    userVerification: 'required',
+    timeout: CHALLENGE_MS,
+  }
+}
+
+async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
+  const b = await body(req)
+  const rp = rpOf(url)
+  const challenge = await takeChallenge(env, who, 'get')
+  const key = await env.DB.prepare('SELECT * FROM passkeys WHERE credential_id = ? AND person_id = ?')
+    .bind(String(b.id ?? ''), who.person.id).first<Row>()
+  if (!key) throw new HttpError(400, 'unknown_passkey')
+  let count
+  try {
+    count = await verifyAssertion(
+      { clientDataJSON: String(b.clientDataJSON ?? ''), authenticatorData: String(b.authenticatorData ?? ''), signature: String(b.signature ?? '') },
+      { publicKey: String(key.public_key), signCount: Number(key.sign_count) },
+      { challenge, origin: rp.origin, rpId: rp.id },
+    )
+  } catch (e) {
+    if (e instanceof WebAuthnError) {
+      await audit(env, req, { who, action: 'passkey_failed', detail: { reason: e.message } })
+      throw new HttpError(400, e.message)
+    }
+    throw e
+  }
+  await env.DB.batch([
+    env.DB.prepare('UPDATE passkeys SET sign_count = ?, last_used_at = ? WHERE id = ?').bind(count, now(), key.id),
+    env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId),
+  ])
+  await audit(env, req, { who, strength: 'strong', action: 'passkey_ok' })
+  return { ok: true }
+}
+
+// ------------------------------------------------------------------ "me"
+async function alertsOf(env: Env, who: Who) {
+  if (!who.admin) return []
+  const r = await env.DB.prepare(
+    'SELECT id, label, place, created_at FROM sessions WHERE person_id = ? AND ack_at IS NULL AND expires_at > ? ORDER BY id',
+  ).bind(who.person.id, now()).all<Row>()
+  return r.results.map((s) => ({ ...s, current: Number(s.id) === who.sessionId }))
+}
+
+async function me(env: Env, who: Who) {
+  return {
+    person: { id: who.person.id, name: who.person.name },
+    groups: who.groups.map((g) => ({ id: g.id, name: g.name })),
+    admin: who.admin,
+    tabs: [...who.tabs],
+    session_id: who.sessionId,
+    strong: fresh(who),
+    passkeys: who.admin ? await passkeyCount(env, who.person.id) : 0,
+    alerts: await alertsOf(env, who),
+  }
+}
+
+async function myDevices(env: Env, who: Who) {
+  const r = await env.DB.prepare('SELECT id, kind, label, place, created_at, last_used_at FROM sessions WHERE person_id = ? AND expires_at > ? ORDER BY last_used_at DESC')
+    .bind(who.person.id, now()).all<Row>()
+  return r.results.map((s) => ({ ...s, current: Number(s.id) === who.sessionId }))
+}
+
+async function revokeSession(env: Env, req: Request, who: Who, id: number, anyPerson: boolean) {
+  const s = await env.DB.prepare('SELECT id, person_id, label FROM sessions WHERE id = ?').bind(id).first<Row>()
+  if (!s || (!anyPerson && Number(s.person_id) !== who.person.id)) throw new HttpError(404, 'device_not_found')
+  await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(id).run()
+  await audit(env, req, { who, action: 'device_revoked', target: `${s.person_id}:${s.label ?? ''}` })
+}
+
+async function ackAlert(env: Env, req: Request, who: Who, id: number) {
+  requireStrongAdmin(who)
+  const r = await env.DB.prepare('UPDATE sessions SET ack_at = ? WHERE id = ? AND person_id = ? AND ack_at IS NULL').bind(now(), id, who.person.id).run()
+  if (!r.meta.changes) throw new HttpError(404, 'alert_not_found')
+  await audit(env, req, { who, action: 'device_acknowledged', target: String(id) })
+}
+
+// ------------------------------------------------------------------ admin
+async function listPeople(env: Env) {
+  const people = await env.DB.prepare('SELECT id, name, phone, status, created_at FROM people ORDER BY name').all<Row>()
+  const links = await env.DB.prepare('SELECT person_id, group_id FROM person_groups').all<Row>()
+  const devices = await env.DB.prepare('SELECT person_id, COUNT(*) AS n FROM sessions WHERE expires_at > ? GROUP BY person_id').bind(now()).all<Row>()
+  return people.results.map((p) => ({
+    ...p,
+    groups: links.results.filter((l) => l.person_id === p.id).map((l) => l.group_id),
+    devices: Number(devices.results.find((d) => d.person_id === p.id)?.n ?? 0),
+  }))
+}
+
+async function setGroups(env: Env, personId: number, groups: unknown) {
+  if (!Array.isArray(groups)) return
+  const valid = (await env.DB.prepare('SELECT id FROM groups').all<{ id: string }>()).results.map((g) => g.id)
+  const wanted = [...new Set(groups.map(String))].filter((g) => valid.includes(g))
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM person_groups WHERE person_id = ?').bind(personId),
+    ...wanted.map((g) => env.DB.prepare('INSERT INTO person_groups (person_id, group_id) VALUES (?, ?)').bind(personId, g)),
+  ])
+}
+
+async function guardOwner(env: Env, personId: number, change: { status?: string; groups?: unknown }) {
+  // The owner can never lock themselves out from the web UI.
+  const p = await env.DB.prepare('SELECT phone FROM people WHERE id = ?').bind(personId).first<Row>()
+  if (!p || normalizePhone(env.OWNER_PHONE) !== p.phone) return
+  if (change.status && change.status !== 'active') throw new HttpError(409, 'owner_not_blockable')
+  if (Array.isArray(change.groups) && !change.groups.includes(OWNER_GROUP)) throw new HttpError(409, 'owner_keeps_group')
+}
+
+async function addPerson(env: Env, req: Request, who: Who) {
+  const b = await body(req)
+  const name = text(b.name, 40)
+  const phone = normalizePhone(b.phone)
+  if (!name || !phone) throw new HttpError(400, 'name_and_number')
+  const p = await env.DB.prepare(`INSERT INTO people (name, phone, status, created_by) VALUES (?, ?, 'active', ?) ON CONFLICT (phone) DO NOTHING RETURNING id`)
+    .bind(name, phone, who.person.id).first<{ id: number }>()
+  if (!p) throw new HttpError(409, 'number_taken')
+  await setGroups(env, p.id, b.groups ?? [])
+  await audit(env, req, { who, action: 'person_added', target: String(p.id), detail: { groups: b.groups } })
+  return { id: p.id }
+}
+
+async function editPerson(env: Env, req: Request, who: Who, id: number) {
+  const b = await body(req)
+  const status = b.status == null ? undefined : String(b.status)
+  if (status && !['active', 'blocked'].includes(status)) throw new HttpError(400, 'bad_status')
+  await guardOwner(env, id, { status, groups: b.groups })
+  const exists = await env.DB.prepare('SELECT id FROM people WHERE id = ?').bind(id).first()
+  if (!exists) throw new HttpError(404, 'person_not_found')
+  const name = text(b.name, 40)
+  if (name) await env.DB.prepare('UPDATE people SET name = ? WHERE id = ?').bind(name, id).run()
+  if (status) {
+    await env.DB.prepare('UPDATE people SET status = ? WHERE id = ?').bind(status, id).run()
+    if (status === 'blocked') await env.DB.prepare('DELETE FROM sessions WHERE person_id = ?').bind(id).run()
+  }
+  if (b.groups !== undefined) await setGroups(env, id, b.groups)
+  await audit(env, req, { who, action: 'person_changed', target: String(id), detail: { name, status, groups: b.groups } })
+}
+
+async function listGroups(env: Env) {
+  const r = await env.DB.prepare('SELECT id, name, tabs, is_admin FROM groups ORDER BY is_admin DESC, id').all<Row>()
+  return r.results.map((g) => ({ ...g, tabs: JSON.parse(String(g.tabs)) }))
+}
+
+async function editGroup(env: Env, req: Request, who: Who, id: string) {
+  if (id === OWNER_GROUP) throw new HttpError(409, 'owner_group_fixed')
+  const b = await body(req)
+  if (!Array.isArray(b.tabs)) throw new HttpError(400, 'bad_tabs')
+  const tabs = [...new Set(b.tabs.map((t) => String(t).toLowerCase()).filter((t) => /^[a-z][a-z0-9-]{0,30}$/.test(t)))]
+  const r = await env.DB.prepare('UPDATE groups SET tabs = ? WHERE id = ?').bind(JSON.stringify(tabs), id).run()
+  if (!r.meta.changes) throw new HttpError(404, 'group_not_found')
+  await audit(env, req, { who, action: 'group_changed', target: id, detail: { tabs } })
+}
+
+async function listRequests(env: Env) {
+  await env.DB.prepare(`UPDATE link_requests SET state = 'expired' WHERE state = 'pending' AND expires_at < ?`).bind(now()).run()
+  const r = await env.DB.prepare(
+    `SELECT r.id, r.typed_phone, r.sender_phone, r.sender_person_id, s.name AS sender_known_as, r.created_at,
+            c.label AS device, c.expires_at AS code_expires_at, c.state AS code_state
+       FROM link_requests r LEFT JOIN people s ON s.id = r.sender_person_id LEFT JOIN login_codes c ON c.id = r.code_id
+      WHERE r.state = 'pending' ORDER BY r.id`,
+  ).all<Row>()
+  return r.results.map((x) => ({ ...x, code_valid: x.code_state === 'pending' && String(x.code_expires_at ?? '') > now() }))
+}
+
+// Approving signs the waiting tab in as the SENDER (the number WhatsApp proved), creating that
+// person if needed. It never signs anyone in as the number that was typed.
+async function resolveRequest(env: Env, req: Request, who: Who, id: number, action: 'approve' | 'refuse') {
+  const r = await env.DB.prepare(`SELECT * FROM link_requests WHERE id = ? AND state = 'pending' AND expires_at > ?`).bind(id, now()).first<Row>()
+  if (!r) throw new HttpError(404, 'request_not_found')
+  const done = (state: string) => env.DB.prepare(`UPDATE link_requests SET state = ?, resolved_at = ?, resolved_by = ? WHERE id = ?`).bind(state, now(), who.person.id, id)
+  if (action === 'refuse') {
+    await env.DB.batch([done('refused'), env.DB.prepare(`UPDATE login_codes SET state = 'refused' WHERE id = ? AND state = 'pending'`).bind(r.code_id)])
+    await audit(env, req, { who, action: 'request_refused', target: String(id) })
+    return { state: 'refused' }
+  }
+  const b = await body(req)
+  let person = await personByPhone(env, String(r.sender_phone))
+  if (person && person.status !== 'active') throw new HttpError(409, 'number_blocked')
+  if (!person) {
+    const name = text(b.name, 40)
+    if (!name) throw new HttpError(400, 'name_required')
+    person = await env.DB.prepare(`INSERT INTO people (name, phone, status, created_by) VALUES (?, ?, 'active', ?) RETURNING *`)
+      .bind(name, r.sender_phone, who.person.id).first<Person>()
+    await setGroups(env, person!.id, b.groups ?? [])
+  }
+  const c = await env.DB.prepare(`UPDATE login_codes SET state = 'confirmed', confirmed_at = ?, confirmed_person_id = ? WHERE id = ? AND state = 'pending' AND expires_at > ?`)
+    .bind(now(), person!.id, r.code_id, now()).run()
+  await done('approved').run()
+  await audit(env, req, { who, action: 'request_approved', target: String(id), detail: { person: person!.id } })
+  return { state: 'approved', code_valid: c.meta.changes > 0 }
+}
+
+async function listAllDevices(env: Env) {
+  const r = await env.DB.prepare(
+    `SELECT s.id, s.person_id, p.name, s.kind, s.label, s.place, s.created_at, s.last_used_at FROM sessions s JOIN people p ON p.id = s.person_id
+      WHERE s.expires_at > ? ORDER BY s.last_used_at DESC LIMIT 200`,
+  ).bind(now()).all<Row>()
+  return r.results
+}
+
+async function listAudit(env: Env, url: URL) {
+  const before = Number(url.searchParams.get('before')) || 9e15
+  const r = await env.DB.prepare(
+    `SELECT a.id, a.at, a.person_id, p.name, a.strength, a.action, a.target, a.detail, a.ip, a.place FROM audit a LEFT JOIN people p ON p.id = a.person_id
+      WHERE a.id < ? ORDER BY a.id DESC LIMIT 100`,
+  ).bind(before).all<Row>()
+  return r.results
+}
+
+// ------------------------------------------------------------------ tabs
+function tabBindings(env: Env): Record<string, string> {
+  try { return JSON.parse(env.TABS || '{}') } catch { return {} }
+}
+
+async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<Response | null> {
+  const binding = tabBindings(env)[tab]
+  const service = binding ? (env[binding] as TabService | undefined) : undefined
+  if (!service) return null
+  const who = await currentSession(req, env)
+  if (!who) {
+    if (req.method === 'GET' && (req.headers.get('Accept') ?? '').includes('text/html'))
+      return new Response(null, { status: 302, headers: { Location: `/?next=${encodeURIComponent(url.pathname)}` } })
+    throw new HttpError(401, 'signed_out')
+  }
+  if (!who.tabs.has('*') && !who.tabs.has(tab)) throw new HttpError(403, 'no_tab_access')
+  requireSameOrigin(req, url)
+  // The tab never sees the session cookie, client auth headers or spoofed portal headers.
+  const headers = new Headers(req.headers)
+  for (const k of [...headers.keys()]) {
+    const l = k.toLowerCase()
+    if (l === 'cookie' || l === 'authorization' || l.startsWith('x-portal') || l.startsWith('x-a5-')) headers.delete(k)
+  }
+  const forwarded = new Request(req.url, { method: req.method, headers, body: req.body })
+  const identity: PortalIdentity = {
+    person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id), session: who.sessionId,
+    credential: 'browser', strong: fresh(who), actions: [], // per-tab actions arrive with the first tab that has commands
+  }
+  const res = await service.handle(forwarded, identity)
+  // A tab is same-origin with the portal: it cannot set cookies or loosen the page policy.
+  const out = new Response(res.body, { status: res.status, statusText: res.statusText, headers: res.headers })
+  out.headers.delete('Set-Cookie')
+  for (const [k, v] of Object.entries(PAGE_HEADERS)) out.headers.set(k, v)
+  if (who.refreshCookie) out.headers.append('Set-Cookie', who.refreshCookie)
+  return out
+}
+
+// ------------------------------------------------------------------ router
+async function handle(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url)
+  const path = url.pathname
+  const m = req.method
+
+  if (path === '/robo/login' && m === 'POST') return robotLogin(req, env)
+  if (path.startsWith('/robo/')) throw new HttpError(404, 'not_found')
+
+  if (path.startsWith('/api/')) {
+    requireSameOrigin(req, url)
+    if (path === '/api/login/start' && m === 'POST') return loginStart(req, env)
+    if (path === '/api/login/status' && m === 'POST') return loginStatus(req, env)
+    if (path === '/api/logout' && m === 'POST') {
+      const who = await currentSession(req, env)
+      if (who) {
+        await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(who.sessionId).run()
+        await audit(env, req, { who, action: 'logout' })
+      }
+      return json({ ok: true }, 200, { 'Set-Cookie': clearCookie() })
+    }
+
+    const who = await requireSession(req, env)
+    const extra: Record<string, string> = who.refreshCookie ? { 'Set-Cookie': who.refreshCookie } : {}
+    const out = (data: unknown) => json(data, 200, extra)
+    let mm: RegExpMatchArray | null
+
+    if (path === '/api/me' && m === 'GET') return out(await me(env, who))
+    if (path === '/api/me/devices' && m === 'GET') return out(await myDevices(env, who))
+    if ((mm = path.match(/^\/api\/me\/devices\/(\d+)$/)) && m === 'DELETE') {
+      await revokeSession(env, req, who, Number(mm[1]), false)
+      return out({ ok: true })
+    }
+    if ((mm = path.match(/^\/api\/me\/alerts\/(\d+)\/ack$/)) && m === 'POST') {
+      await ackAlert(env, req, who, Number(mm[1]))
+      return out({ ok: true })
+    }
+    if (path === '/api/passkey/create/options' && m === 'POST') return out(await passkeyCreateOptions(env, url, who))
+    if (path === '/api/passkey/create/verify' && m === 'POST') return out(await passkeyCreateVerify(req, env, url, who))
+    if (path === '/api/passkey/get/options' && m === 'POST') return out(await passkeyGetOptions(env, url, who))
+    if (path === '/api/passkey/get/verify' && m === 'POST') return out(await passkeyGetVerify(req, env, url, who))
+
+    if (path.startsWith('/api/admin/')) {
+      if (!who.admin) throw new HttpError(403, 'admin_only')
+      // reads: any admin session
+      if (m === 'GET') {
+        if (path === '/api/admin/people') return out(await listPeople(env))
+        if (path === '/api/admin/groups') return out(await listGroups(env))
+        if (path === '/api/admin/requests') return out(await listRequests(env))
+        if (path === '/api/admin/devices') return out(await listAllDevices(env))
+        if (path === '/api/admin/audit') return out(await listAudit(env, url))
+        throw new HttpError(404, 'not_found')
+      }
+      // writes: passkey in the last 5 minutes
+      requireStrongAdmin(who)
+      if (path === '/api/admin/people' && m === 'POST') return out(await addPerson(env, req, who))
+      if ((mm = path.match(/^\/api\/admin\/people\/(\d+)$/)) && m === 'POST') {
+        await editPerson(env, req, who, Number(mm[1]))
+        return out({ ok: true })
+      }
+      if ((mm = path.match(/^\/api\/admin\/groups\/([a-z][a-z0-9-]{0,30})$/)) && m === 'POST') {
+        await editGroup(env, req, who, mm[1])
+        return out({ ok: true })
+      }
+      if ((mm = path.match(/^\/api\/admin\/requests\/(\d+)\/(approve|refuse)$/)) && m === 'POST')
+        return out(await resolveRequest(env, req, who, Number(mm[1]), mm[2] as 'approve' | 'refuse'))
+      if ((mm = path.match(/^\/api\/admin\/devices\/(\d+)$/)) && m === 'DELETE') {
+        await revokeSession(env, req, who, Number(mm[1]), true)
+        return out({ ok: true })
+      }
+    }
+    throw new HttpError(404, 'not_found')
+  }
+
+  const tab = /^\/([a-z][a-z0-9-]{0,30})(\/|$)/.exec(path)?.[1]
+  if (tab) {
+    const r = await routeTab(req, env, url, tab)
+    if (r) return r
+  }
+  return new Response('not_found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...API_HEADERS } })
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    try {
+      return await handle(req, env)
+    } catch (e) {
+      if (e instanceof HttpError) return json({ error: e.message, ...e.extra }, e.status)
+      console.error('unhandled', e instanceof Error ? e.message : String(e))
+      return json({ error: 'internal' }, 500)
+    }
+  },
+} satisfies ExportedHandler<Env>
