@@ -1058,8 +1058,8 @@ async function badgeOf(env: Env, who: Who, tab: string): Promise<number | null> 
     let timer: ReturnType<typeof setTimeout> | undefined
     const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), BADGE_TIMEOUT_MS) })
     try {
-      // a passkey tab gets no entry here: the badge is a count, never the tab's content
-      const r = await Promise.race([Promise.resolve(service.badge?.(identityOf(who, policyOf(tab), null))), late])
+      // no entry and never strong here: the badge is a count, never the tab's content or an action
+      const r = await Promise.race([Promise.resolve(service.badge?.({ ...identityOf(who, policyOf(tab), null), strong: false })), late])
       const n = (r as { count?: unknown } | null | undefined)?.count
       if (typeof n === 'number' && Number.isInteger(n) && n >= 0) count = Math.min(n, 99)
     } catch { /* no badge() or a failing tab: no number */ }

@@ -497,7 +497,7 @@ check('entry kind per tab', byId.jarvis.entry === 'passkey' && byId.energia.entr
 check('list carries id, path, badge and entry only', ot.data.tabs.every((t) => Object.keys(t).sort().join() === 'badge,entry,id,path'), ot.data.tabs)
 let calls = (await resident.req('GET', '/energia/badges', undefined, CORS)).data
 const ownerCall = calls.find((c) => c.person === ownerId)
-check('badge gets the person\'s identity, with no entry', ownerCall && ownerCall.credential === 'browser' && ownerCall.entered_at === null && ownerCall.entry_until === null, ownerCall)
+check('badge gets the person\'s identity, with no entry and never strong', ownerCall && ownerCall.credential === 'browser' && ownerCall.entered_at === null && ownerCall.entry_until === null && ownerCall.strong === false, ownerCall)
 const nCalls = calls.length
 await owner.req('GET', '/api/tabs')
 check('badge kept for a minute (no new call to the tab)', (await resident.req('GET', '/energia/badges', undefined, CORS)).data.length === nCalls)
