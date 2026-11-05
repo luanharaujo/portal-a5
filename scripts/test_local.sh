@@ -9,8 +9,8 @@ LOG="$STATE/wrangler.log"
 VARS="$STATE/test.vars"
 
 # fake values only; real ones never touch disk
-printf 'ROBO_LOGIN_CHAVE=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\n' "$(openssl rand -hex 32)" > "$VARS"
-KEY="$(sed -n 's/^ROBO_LOGIN_CHAVE=//p' "$VARS")"
+printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\n' "$(openssl rand -hex 32)" > "$VARS"
+KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 
 npx wrangler d1 migrations apply portal_a5 --local --persist-to "$STATE" >/dev/null
 npx wrangler dev --local --ip 127.0.0.1 --port "$PORT" --persist-to "$STATE" --env-file "$VARS" >"$LOG" 2>&1 &

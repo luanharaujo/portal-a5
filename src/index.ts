@@ -11,7 +11,7 @@ import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './we
 export interface Env {
   DB: D1Database
   ASSETS: Fetcher
-  ROBO_LOGIN_CHAVE: string
+  ROBOT_LOGIN_KEY: string
   OWNER_PHONE: string
   TABS?: string
   [binding: string]: unknown
@@ -346,33 +346,33 @@ async function loginStatus(req: Request, env: Env) {
 // number WhatsApp proved sent it. Identity is always the sender, never the number typed.
 // The key opens this route only, and a session born here is weak.
 async function robotLogin(req: Request, env: Env) {
-  const key = env.ROBO_LOGIN_CHAVE ?? ''
+  const key = env.ROBOT_LOGIN_KEY ?? ''
   if (!key.startsWith(ROBOT_KEY_PREFIX) || key.length < 40) throw new HttpError(503, 'robot_key_not_configured')
-  if (!(await sameSecret(req.headers.get('X-A5-Robo-Chave') ?? '', key))) throw new HttpError(401, 'bad_key')
+  if (!(await sameSecret(req.headers.get('X-A5-Robot-Key') ?? '', key))) throw new HttpError(401, 'bad_key')
   const b = await body(req)
-  const m = /^A5-[A-Z0-9]{4}$/.exec(String(b.codigo ?? '').trim().toUpperCase())
+  const m = /^A5-[A-Z0-9]{4}$/.exec(String(b.code ?? '').trim().toUpperCase())
   if (!m) throw new HttpError(400, 'missing_code')
   const code = m[0]
-  const sender = normalizePhone(b.numero)
+  const sender = normalizePhone(b.phone)
   if (!sender) throw new HttpError(400, 'missing_number')
-  const self = b.eu_mesmo === true
+  const self = b.self_chat === true
   const owner = normalizePhone(env.OWNER_PHONE)
   if (self && sender !== owner) throw new HttpError(400, 'self_chat_not_owner')
   const msgId = text(b.msg_id, 80)
 
-  if (!(await underLimit(env, 'robot-total', LIMITS.robotTotal))) return json({ ok: false, motivo: 'limite_total' })
-  if (!(await underLimit(env, `robot:${sender}`, LIMITS.robotPerSender))) return json({ ok: false, motivo: 'limite_remetente' })
+  if (!(await underLimit(env, 'robot-total', LIMITS.robotTotal))) return json({ ok: false, reason: 'total_limit' })
+  if (!(await underLimit(env, `robot:${sender}`, LIMITS.robotPerSender))) return json({ ok: false, reason: 'sender_limit' })
 
   const c = await env.DB.prepare(`SELECT * FROM login_codes WHERE code_hash = ? AND expires_at > ? AND state IN ('waiting', 'confirmed', 'pending') ORDER BY id DESC`)
     .bind(await sha256(code), now()).first<Row>()
-  const reqInfo = { msg_id: msgId, eu_mesmo: self }
+  const reqInfo = { msg_id: msgId, self_chat: self }
   if (!c) {
     await audit(env, req, { strength: 'robot', action: 'robot_invalid_code', detail: reqInfo })
-    return json({ ok: false, motivo: 'codigo_invalido' })
+    return json({ ok: false, reason: 'invalid_code' })
   }
-  const device = { aparelho: c.label, pedido_em: c.created_at }
-  if (c.state === 'confirmed') return json({ ok: true, repetido: true, ...device })
-  if (c.state === 'pending') return json({ ok: false, motivo: 'aguardando_dono', repetido: true, ...device })
+  const device = { device: c.label, requested_at: c.created_at }
+  if (c.state === 'confirmed') return json({ ok: true, repeated: true, ...device })
+  if (c.state === 'pending') return json({ ok: false, reason: 'awaiting_owner', repeated: true, ...device })
 
   let person = await personByPhone(env, sender)
   if (!person) person = await ensureOwner(env, sender)
@@ -380,14 +380,14 @@ async function robotLogin(req: Request, env: Env) {
   if (person && person.status === 'blocked') {
     await env.DB.prepare(`UPDATE login_codes SET state = 'refused' WHERE id = ?`).bind(c.id).run()
     await audit(env, req, { person: person.id, strength: 'robot', action: 'robot_blocked', detail: reqInfo })
-    return json({ ok: false, motivo: 'bloqueado' })
+    return json({ ok: false, reason: 'blocked' })
   }
 
   if (person && sender === c.typed_phone) {
     // admin numbers: at most one accepted login every 10 minutes
     const admin = (await groupsOf(env, person.id)).some((g) => g.is_admin)
     if (admin && !(await underLimit(env, `robot-admin:${sender}`, 1, now().slice(0, 15))))
-      return json({ ok: false, motivo: 'limite_admin' })
+      return json({ ok: false, reason: 'admin_limit' })
     await env.DB.prepare(`UPDATE login_codes SET state = 'confirmed', confirmed_at = ?, confirmed_person_id = ? WHERE id = ? AND state = 'waiting'`)
       .bind(now(), person.id, c.id).run()
     await audit(env, req, { person: person.id, strength: 'robot', action: 'robot_confirmed', target: String(c.label ?? ''), detail: reqInfo })
@@ -398,7 +398,7 @@ async function robotLogin(req: Request, env: Env) {
   const pending = await env.DB.prepare(`SELECT COUNT(*) AS n FROM link_requests WHERE state = 'pending' AND expires_at > ?`).bind(now()).first<{ n: number }>()
   if ((pending?.n ?? 0) >= PENDING_MAX) {
     await env.DB.prepare(`UPDATE login_codes SET state = 'refused' WHERE id = ?`).bind(c.id).run()
-    return json({ ok: false, motivo: 'pendentes_demais' })
+    return json({ ok: false, reason: 'too_many_pending' })
   }
   await env.DB.batch([
     env.DB.prepare(`UPDATE login_codes SET state = 'pending' WHERE id = ? AND state = 'waiting'`).bind(c.id),
@@ -408,7 +408,7 @@ async function robotLogin(req: Request, env: Env) {
     ).bind(c.id, c.typed_phone, sender, person?.id ?? null, now(), inMs(PENDING_DAYS * 864e5)),
   ])
   await audit(env, req, { person: person?.id ?? null, strength: 'robot', action: 'robot_pending', detail: { ...reqInfo, mismatch: !!person } })
-  return json({ ok: false, motivo: 'aguardando_dono', ...device })
+  return json({ ok: false, reason: 'awaiting_owner', ...device })
 }
 
 // ------------------------------------------------------------------ passkeys

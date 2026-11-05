@@ -27,13 +27,13 @@ Only SHA-256 hashes of codes, tab secrets and session tokens are stored.
 
 ```
 POST /robo/login
-X-A5-Robo-Chave: <ROBO_LOGIN_CHAVE>
+X-A5-Robot-Key: <ROBOT_LOGIN_KEY>
 Content-Type: application/json
 
-{"codigo": "A5-XXXX", "numero": "<digits, country code first>", "msg_id": "<message id>", "eu_mesmo": false}
+{"code": "A5-XXXX", "phone": "<digits, country code first>", "msg_id": "<message id>", "self_chat": false}
 ```
 
-`eu_mesmo: true` means the owner's own "message yourself" chat and is accepted only with the owner's number. Answers are always 200 with `{"ok": true}` or `{"ok": false, "motivo": ...}`; `motivo` is one of `codigo_invalido`, `aguardando_dono`, `bloqueado`, `limite_remetente`, `limite_total`, `limite_admin`, `pendentes_demais`. Successful answers carry `aparelho` (device that asked for the code) and `pedido_em`. Bad key: 401. The key opens this route and nothing else.
+`self_chat: true` means the owner's own "message yourself" chat and is accepted only with the owner's number. Answers are always 200 with `{"ok": true, "device", "requested_at"}` or `{"ok": false, "reason"}`, plus `"repeated": true` when the code was already handled. `reason` is one of `invalid_code`, `awaiting_owner`, `blocked`, `sender_limit`, `total_limit`, `admin_limit`, `too_many_pending`. `device` is the device that asked for the code. Bad key: 401. The key opens this route and nothing else.
 
 Limits in the Worker, on top of whatever the reader does: 3 accepted calls per sender per hour, 30 per hour in total, one sign-in every 10 minutes for admin numbers.
 

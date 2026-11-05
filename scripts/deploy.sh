@@ -4,8 +4,8 @@
 #
 # Keychain items (macOS, generic passwords; service names below):
 #   portal-a5-cloudflare          API token (Workers Scripts: Edit + D1: Edit, this account only)
-#   portal-a5-robo-login          ROBO_LOGIN_CHAVE ("pa5_robo_" + 32 random bytes)
-#   portal-a5-dono-telefone       OWNER_PHONE (digits, country code first)
+#   portal-a5-robot-key          ROBOT_LOGIN_KEY ("pa5_robo_" + 32 random bytes)
+#   portal-a5-owner-phone       OWNER_PHONE (digits, country code first)
 # The account id (not a secret, but kept out of git) comes from CLOUDFLARE_ACCOUNT_ID or from
 # the git-ignored file .deploy.local (a line CLOUDFLARE_ACCOUNT_ID=<id>).
 # Secrets go to wrangler through stdin only: never arguments, never files.
@@ -59,9 +59,9 @@ npx wrangler d1 migrations apply portal_a5 --remote -c "$CFG"
 npx wrangler deploy -c "$CFG"
 
 # 4. secrets through stdin
-kc portal-a5-robo-login | grep -q '^pa5_robo_' || { echo "robot key must start with pa5_robo_" >&2; exit 1; }
-kc portal-a5-robo-login | npx wrangler secret put ROBO_LOGIN_CHAVE -c "$CFG" >/dev/null
-kc portal-a5-dono-telefone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null
+kc portal-a5-robot-key | grep -q '^pa5_robo_' || { echo "robot key must start with pa5_robo_" >&2; exit 1; }
+kc portal-a5-robot-key | npx wrangler secret put ROBOT_LOGIN_KEY -c "$CFG" >/dev/null
+kc portal-a5-owner-phone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null
 mkdir -p .deploy
 printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" >> .deploy/deployed.log
 echo "deployed: portal-a5 at $COMMIT (account and D1 ids kept out of git)"

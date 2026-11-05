@@ -41,13 +41,13 @@ function client() {
 }
 
 const robot = (body, key = ROBO_KEY, path = '/robo/login') =>
-  fetch(BASE + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-A5-Robo-Chave': key }, body: JSON.stringify(body) })
+  fetch(BASE + path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-A5-Robot-Key': key }, body: JSON.stringify(body) })
     .then(async (r) => ({ status: r.status, data: await r.json().catch(() => null) }))
 
 async function signIn(c, typed, sender, self = false) {
   const s = await c.req('POST', '/api/login/start', { phone: typed })
   const code = /A5-[A-Z0-9]{4}/.exec(s.data.message)[0]
-  const r = await robot({ codigo: code, numero: sender, msg_id: 'test-' + Math.random(), eu_mesmo: self })
+  const r = await robot({ code, phone: sender, msg_id: 'test-' + Math.random(), self_chat: self })
   const st = await c.req('POST', '/api/login/status', { secret: s.data.secret })
   return { start: s, robot: r, status: st, code }
 }
@@ -107,16 +107,16 @@ check('status waiting', (await anon.req('POST', '/api/login/status', { secret: k
 
 // robot key boundaries
 const code0 = /A5-[A-Z0-9]{4}/.exec(known.data.message)[0]
-check('robot wrong key = 401', (await robot({ codigo: code0, numero: OWNER }, 'pa5_robo_wrong')).status === 401)
+check('robot wrong key = 401', (await robot({ code: code0, phone: OWNER }, 'pa5_robo_wrong')).status === 401)
 check('robot key on other /robo route = 404', (await robot({}, ROBO_KEY, '/robo/caixa')).status === 404)
-check('robot key on /api = 401/403', [401, 403].includes((await fetch(BASE + '/api/me', { headers: { 'X-A5-Robo-Chave': ROBO_KEY } })).status))
-check('eu_mesmo with other number = 400', (await robot({ codigo: code0, numero: RESIDENT, eu_mesmo: true })).status === 400)
+check('robot key on /api = 401/403', [401, 403].includes((await fetch(BASE + '/api/me', { headers: { 'X-A5-Robot-Key': ROBO_KEY } })).status))
+check('self_chat with other number = 400', (await robot({ code: code0, phone: RESIDENT, self_chat: true })).status === 400)
 
 // owner signs in (self chat)
 const owner = client()
 const o = await signIn(owner, OWNER, OWNER, true)
 check('owner robot ok', o.robot.data?.ok === true, o.robot.data)
-check('robot reply names the device', typeof o.robot.data?.aparelho === 'string')
+check('robot reply names the device', typeof o.robot.data?.device === 'string')
 check('owner status ok + cookie', o.status.data.status === 'ok' && /__Host-a5s=.{40,}; Path=\/; HttpOnly; Secure; SameSite=Lax/.test(o.status.setCookie || ''), o.status.setCookie)
 check('code is single use', (await owner.req('POST', '/api/login/status', { secret: o.start.data.secret })).data.status === 'used')
 let me = (await owner.req('GET', '/api/me')).data
@@ -125,7 +125,7 @@ check('new-device alert shown', me.alerts?.length === 1, me.alerts)
 
 // a second owner login inside 10 minutes is refused by the worker
 const o2 = await signIn(client(), OWNER, OWNER, true)
-check('owner 1 per 10 min', o2.robot.data?.motivo === 'limite_admin', o2.robot.data)
+check('owner 1 per 10 min', o2.robot.data?.reason === 'admin_limit', o2.robot.data)
 
 // weak session: reads yes, writes no
 check('weak admin read ok', (await owner.req('GET', '/api/admin/people')).status === 200)
@@ -183,7 +183,7 @@ const a2sid = (await admin2.req('GET', '/api/me')).data.session_id
 // a pending request whose sender is an admin can never be approved
 const trick = client()
 const tr = await signIn(trick, RESIDENT, OWNER)
-check('admin number sending someone else\'s code -> pending', tr.robot.data?.motivo === 'aguardando_dono', tr.robot.data)
+check('admin number sending someone else\'s code -> pending', tr.robot.data?.reason === 'awaiting_owner', tr.robot.data)
 const trReq = (await owner.req('GET', '/api/admin/requests')).data.find((x) => x.sender_phone === OWNER)
 const trAp = await owner.req('POST', `/api/admin/requests/${trReq.id}/approve`, {})
 check('approving an admin sender = 409', trAp.status === 409 && trAp.data.error === 'admin_direct_only', trAp)
@@ -204,7 +204,7 @@ check('resident cannot register passkey', (await resident.req('POST', '/api/pass
 // someone else sends the resident's code: nobody signs in until the owner approves
 const victimTab = client()
 const mm = await signIn(victimTab, RESIDENT, STRANGER)
-check('mismatch -> pending', mm.robot.data?.motivo === 'aguardando_dono' && mm.status.data.status === 'pending', [mm.robot.data, mm.status.data])
+check('mismatch -> pending', mm.robot.data?.reason === 'awaiting_owner' && mm.status.data.status === 'pending', [mm.robot.data, mm.status.data])
 check('pending tab has no cookie', !victimTab.cookie)
 const reqs = (await owner.req('GET', '/api/admin/requests')).data
 const pend = reqs.find((x) => x.sender_phone === STRANGER)
@@ -218,7 +218,7 @@ check('approved tab signs in as the SENDER', after.data.status === 'ok' && after
 const spam = client()
 let last
 for (let i = 0; i < 4; i++) last = await signIn(spam, '5561900000009', '5561900000009')
-check('robot 3/h per sender', last.robot.data?.motivo === 'limite_remetente', last.robot.data)
+check('robot 3/h per sender', last.robot.data?.reason === 'sender_limit', last.robot.data)
 
 // revoke own device; the revoked cookie stops working
 const resDevices = (await resident.req('GET', '/api/me/devices')).data

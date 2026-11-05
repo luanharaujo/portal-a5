@@ -30,7 +30,7 @@ migrations_dir = "migrations"
 # service = "portal-a5-energia"
 
 # Secrets (never in this file):
-#   ROBO_LOGIN_CHAVE  "pa5_robo_" + 32 random bytes; shared with the WhatsApp reader,
-#                     accepted only on POST /robo/login (header X-A5-Robo-Chave)
+#   ROBOT_LOGIN_KEY  "pa5_robo_" + 32 random bytes; shared with the WhatsApp reader,
+#                     accepted only on POST /robo/login (header X-A5-Robot-Key)
 #   OWNER_PHONE       the owner's number: target of the wa.me link and the first admin
 # Local: .dev.vars (git-ignored). Remote: scripts/deploy.sh pipes them from the Keychain.
