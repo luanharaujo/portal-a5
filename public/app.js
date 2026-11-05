@@ -5,6 +5,9 @@ const $main = document.getElementById('main')
 const $who = document.getElementById('who')
 const $alerts = document.getElementById('alerts')
 const $toast = document.getElementById('toast')
+const $title = document.getElementById('title')
+const ACCOUNT = '/conta/'
+const onAccount = () => location.pathname === ACCOUNT
 const MODE = (window.matchMedia('(display-mode: standalone)').matches || navigator.standalone) ? 'app' : 'browser'
 let ME = null
 
@@ -111,6 +114,7 @@ function nextPath() {
 }
 
 function loginView() {
+  plainTitle(T.title)
   $who.textContent = ''
   $alerts.replaceChildren()
   const input = el('input', { type: 'tel', inputmode: 'tel', autocomplete: 'tel', placeholder: T.phonePlaceholder, required: true, id: 'phone' })
@@ -197,13 +201,32 @@ function stepUpView(tab) {
       const r = await passkeyCheck(`entry:${tab}`)
       location.href = next.startsWith(`/${tab}/`) ? next : r.next
     }) }, T.stepUp.confirm),
-    el('button', { class: 'link', onclick: () => { history.replaceState(null, '', '/'); homeView() } }, T.back)))
+    el('button', { class: 'link', onclick: () => { if (history.length > 1) history.back(); else location.assign(ACCOUNT) } }, T.back)))
 }
 
-// ------------------------------------------------------------------ home
+// ------------------------------------------------------------------ opening and the account tab
+function plainTitle(t) { $title.replaceChildren(t) }
+
+// The account page's title is the tab selector too (Conta + arrow), except on a fixed screen.
+function accountTitle() {
+  if ($title.querySelector('[data-a5-tabs]')) return
+  if (ME.credential !== 'browser' || !window.A5Tabs) return plainTitle(T.account)
+  const b = el('button', { type: 'button', 'data-a5-tabs': true }, T.account)
+  $title.replaceChildren(b)
+  window.A5Tabs.mount(b)
+}
+
+// No home page: "/" opens the last tab used on this device, else the first tab, else the account.
+async function openLastTab() {
+  const data = window.A5Tabs ? await window.A5Tabs.load() : null
+  if (!data) { location.replace(ACCOUNT); return }
+  const last = window.A5Tabs.lastTab()
+  const tab = last === data.account.id ? data.account : data.tabs.find((t) => t.id === last) || data.tabs[0] || data.account
+  location.replace(tab.path)
+}
+
 function nav() {
   return el('nav', { class: 'nav' },
-    el('button', { onclick: () => homeView() }, T.nav.home),
     el('button', { onclick: () => guarded(devicesView) }, T.nav.devices),
     ME.admin ? el('button', { onclick: () => guarded(adminView) }, T.nav.admin) : null,
     el('button', { class: 'link', onclick: () => guarded(async () => { await rawApi('POST', '/api/logout', {}); start() }) }, T.nav.logout))
@@ -216,14 +239,6 @@ function renderAlerts() {
     `${a.label || T.device}, ${when(a.created_at)}${a.place ? ', ' + a.place : ''}${a.current ? T.thisDevice : ''}. `,
     el('button', { onclick: () => guarded(async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await start() }) }, T.itWasMe),
     a.current || !a.live || a.kind !== 'device' ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await start() }) }, T.revoke))))
-}
-
-function homeView() {
-  const tabs = ME.tabs.includes('*') ? [] : ME.tabs
-  show(nav(), el('section', { class: 'card' },
-    el('h2', {}, T.tabs),
-    tabs.length ? el('ul', { class: 'tabs' }, tabs.map((t) => el('li', {}, el('a', { href: `/${t}/` }, t))))
-      : el('p', { class: 'muted' }, T.noTabs)))
 }
 
 async function devicesView() {
@@ -392,14 +407,20 @@ async function start() {
   const q = new URLSearchParams(location.search)
   const stepUp = q.get('step_up')
   if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return stepUpView(stepUp)
-  if (q.get('pair') && ME.admin) {
-    adminView.pairCode = q.get('pair').slice(0, 12)
-    history.replaceState(null, '', '/')
-    return guarded(adminView)
-  }
   const n = nextPath()
   if (n && ME.credential === 'screen') { location.href = n; return }
-  homeView()
+  if (!onAccount()) {
+    // the pairing QR lands on "/?pair=": hand it to the account page
+    if (q.get('pair') && ME.admin) { location.replace(`${ACCOUNT}?pair=${encodeURIComponent(q.get('pair').slice(0, 12))}`); return }
+    return openLastTab()
+  }
+  accountTitle()
+  if (q.get('pair') && ME.admin) {
+    adminView.pairCode = q.get('pair').slice(0, 12)
+    history.replaceState(null, '', ACCOUNT)
+    return guarded(adminView)
+  }
+  guarded(devicesView)
 }
 
 start()

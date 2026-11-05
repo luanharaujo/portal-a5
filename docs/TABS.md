@@ -22,13 +22,14 @@ service = "portal-a5-notes"
 entrypoint = "NotesTab"
 ```
 
-plus `TABS = '{"notes":"TAB_NOTES"}'`. Through that single binding the portal calls three things:
+plus `TABS = '{"notes":"TAB_NOTES"}'`. The order of `TABS` is the order of the tab selector (section 9). A tab can't be named `api`, `robo`, `conta`, `locale` or `vendor` (the portal ignores such a binding). Through that single binding the portal calls these:
 
 | Call | When | Identity |
 |---|---|---|
 | `handle(request, identity)` (RPC) | every plain request and answer under `/<tab>/*`, including streamed bodies | typed argument |
 | `fetch(request)` | only WebSocket upgrades: live pages and machine bridges | `X-A5-Identity` request header, set by the portal: base64url of the UTF-8 JSON (names may hold emoji, which a raw header cannot carry) |
 | `revoke(ref)` (RPC, optional but expected) | a session, screen or machine key was revoked, or a person blocked | `ref = {session?, machine?, person?}`; close every socket opened with that credential |
+| `badge(identity)` (RPC, optional) | `GET /api/tabs`, for a person with more than one tab | typed argument; answers `{count}` (section 9) |
 
 `fetch` exists only because a 101 answer cannot cross an RPC call. The entrypoint's `fetch` is reachable only through a service binding; the public address stays off. The tab's `fetch` answers 401 when `X-A5-Identity` is missing or does not decode to JSON, 404 to anything that is not an upgrade, and never passes the header on.
 
@@ -73,12 +74,14 @@ After the call:
 - set on the answer, overwriting whatever the tab sent: a CSP bound to the tab's path, `nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, HSTS and the tab's `Permissions-Policy`. The CSP:
 
   ```
-  default-src 'self'; script-src https://<portal>/<tab>/; style-src 'self'; img-src 'self' data:;
-  connect-src https://<portal>/<tab>/ wss://<portal>/<tab>/; object-src 'none'; base-uri 'none';
-  frame-ancestors 'none'; form-action https://<portal>/<tab>/
+  default-src 'self';
+  script-src https://<portal>/<tab>/ https://<portal>/_shell/tabs.js https://<portal>/locale/pt-BR.js;
+  style-src 'self'; img-src 'self' data:;
+  connect-src https://<portal>/<tab>/ wss://<portal>/<tab>/ https://<portal>/api/tabs;
+  object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action https://<portal>/<tab>/
   ```
 
-  A tab page cannot run inline script, and cannot load scripts from, fetch from or post to anything outside its own path (no `/api/*`, no other tab). Navigating to the portal (a link, `location.href = step_up`) is fine;
+  A tab page cannot run inline script, and cannot load scripts from, fetch from or post to anything outside its own path (no other `/api/*`, no other tab). The only exceptions are the shared selector's two files and the read-only `GET /api/tabs` (section 9); a source without a trailing slash matches that exact path only. Navigating to the portal (a link, `location.href = step_up`) is fine;
 - a 101 goes back with no tab headers at all.
 
 So a tab page: scripts and styles in files under its own path, `textContent` for every value, no inline handlers, no cookies, no CORS.
@@ -148,13 +151,16 @@ JSON text frames. Every tab uses these names; payload fields are the tab's.
 
 ```
 machine → cloud
-  {"t":"hello","v":1}                                  after connecting; cloud answers {"t":"hello","v":1} and re-sends live commands
+  {"t":"hello","v":1}                                  right after connecting; cloud answers {"t":"hello","v":1} and re-sends live commands
   {"t":"state", ...}                                   the machine's current data (each tab caps how often)
   {"t":"result","id":"<uuid>","ok":true|false, ...}    final answer to one command
   "ping"                                               answered "pong" by the runtime without waking the object
 cloud → machine
   {"t":"cmd","id":"<uuid>","action":"<name>","params":{...},"expires_at":"<ISO>"}
+  {"t":"state_ack", ...}                               informative, after each state: counts only, never commands
 ```
+
+The machine sends `hello` as its first message, and so does a page socket. In local `workerd`, a socket that never sent a message did not get a close started by the server when it passed portal → tab → Durable Object, so a `revoke` test with a silent socket looks broken locally. Check revocation against production when a tab goes live.
 
 Rules for commands:
 - `id` unique (UUID), `expires_at` = creation + 60 s. The cloud never re-sends an expired command; on `hello` it re-sends only live ones.
@@ -191,3 +197,62 @@ The tab never says who did it: the portal fills that in. Events with no request 
 - Sockets: Hibernation API; one bridge per machine; check `identity.credential`.
 - Commands: section 6 rules, and a security review of the tab and its bridge before they are switched on.
 - Ask the portal for its policy line (features, entry, credentials) and binding.
+- Title marked with `data-a5-tabs` and the selector's files loaded (section 9); `badge` if something waits for people there.
+
+## 9. Tab selector and pending counts
+
+There is no home page. `/` opens the last tab used on that device (`localStorage` key `a5.lastTab`), else the first tab the person can open, else the account page. Every tab's title is the way to the other tabs.
+
+### In the tab page
+
+```html
+<link rel="stylesheet" href="/_shell/tabs.css">
+<script src="/locale/pt-BR.js" defer></script>
+<script src="/_shell/tabs.js" defer></script>
+...
+<h1><button type="button" data-a5-tabs>Painel de Energia da Casa</button></h1>
+```
+
+- The script asks `GET /api/tabs?current=<tab>`, adds an SVG arrow and the dot to the marked title and turns it into a menu button. With no selector (fixed screens, signed out, any error) the title stays a plain title, and `tabs.css` keeps a marked `<button>` looking like the title around it.
+- The list opens on tap, click, Enter, Space or arrow down; closes on Esc, a tap outside or the title again. Arrow keys, Home and End move, Enter or Space picks (TV remotes and keyboards: nothing needs hover). Focus stays in the list while it is open. Picking is a full page navigation (`location.assign`), never an iframe, and records `a5.lastTab`. The tab page also records itself on load.
+- Counts come back when the page loads, when the list opens and when the page becomes visible again (`visibilitychange`). No polling.
+- `locale/pt-BR.js` sets `window.T` and `window.A5_TEXT`; the selector reads `A5_TEXT` only, so a tab may keep its own `T` (load the locale before the tab's scripts).
+- Colors: dark by default (`--a5t-*` tokens in `tabs.css`); a tab may override the tokens. The portal's own pages map them to the device theme.
+
+### `GET /api/tabs`
+
+Session required (401 otherwise), GET only, `Cache-Control: no-store`.
+
+```json
+{
+  "selector": true,
+  "current": "energia",
+  "tabs": [
+    {"id": "energia", "path": "/energia/", "badge": null, "entry": "session"},
+    {"id": "jarvis", "path": "/jarvis/", "badge": 2, "entry": "passkey"}
+  ],
+  "account": {"id": "conta", "path": "/conta/"}
+}
+```
+
+- `tabs`: the tabs this session can open (group and the tab's `credentials` policy, the same rule as `/<tab>/*`), in `TABS` order. Tab names come from the locale by `id`.
+- `selector` is `false` for a fixed screen (`credential: 'screen'`): plain title, no counts.
+- `current` is the `current` query echoed back only when it is `conta` or a listed tab.
+- `entry: "passkey"` shows "Face ID" next to the tab in the list.
+
+### `badge(identity)` (optional)
+
+```ts
+async badge(identity: PortalIdentity): Promise<{ count: number }>
+```
+
+- How many things wait for this person in the tab (Jarvis: decisions waiting; agents: pending items). The tab decides what counts. Only the number leaves the tab, never the content.
+- Called only for a browser session with more than one tab, for each of its tabs. Never for a fixed screen or a person with a single tab.
+- The identity is the person's, with `entered_at` and `entry_until` null: a passkey tab's count shows without Face ID, its content stays behind the entry.
+- The portal waits 300 ms at most, then shows no number. Anything but a non-negative integer is no number; above 99 is shown as 99 (the dot itself shows `9+` above 9). The answer is kept per person and tab for 60 seconds in the portal's isolate.
+- The dot next to the title is the sum of the other tabs' counts; inside the list each tab shows its own.
+
+### The account tab
+
+`/conta/` is a portal page (portal CSP, device theme): my devices, people and groups, screens, bridges, audit, sign out. It is always the last entry of the list, after a line, and its title carries the same selector.
+

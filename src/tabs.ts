@@ -7,6 +7,8 @@
 //                              travels in the X-A5-Identity header the portal sets
 //   revoke(ref)                optional; the portal calls it when a session, screen or machine
 //                              key is revoked, so the tab closes that credential's sockets
+//   badge(identity)            optional; how many things wait for this person in the tab
+//                              ({count}), shown next to the tab selector. Only the number leaves.
 
 export type Credential = 'browser' | 'screen' | 'machine' | 'shortcut'
 
@@ -29,7 +31,16 @@ export interface TabService {
   handle(req: Request, who: PortalIdentity): Promise<Response>
   fetch(req: Request): Promise<Response>
   revoke?(ref: RevokeRef): Promise<void>
+  badge?(who: PortalIdentity): Promise<{ count: number }>
 }
+
+// Names a tab can never take: portal pages and routes living at /<name>/.
+export const RESERVED_TABS = ['api', 'robo', 'conta', 'locale', 'vendor']
+
+// The shared tab selector every tab page may load. These exact files (and /api/tabs) are the
+// only portal paths a tab page may script from or connect to.
+export const SHELL_SCRIPTS = ['/_shell/tabs.js', '/locale/pt-BR.js']
+export const SHELL_API = '/api/tabs'
 
 export interface TabPolicy {
   // browser features this tab's pages may use (everything else stays off)
@@ -71,10 +82,13 @@ const DROP_FROM_TAB = ['set-cookie', 'clear-site-data', 'service-worker-allowed'
 
 // A tab's pages may load scripts, connect and post only under the tab's own path, so a script
 // in one tab cannot call the portal API (/api/*) or another tab with the person's cookie.
+// The one exception is the shared selector: two exact script files and the read-only
+// GET /api/tabs (a source without a trailing slash matches that path only).
 export function tabCsp(origin: string, tab: string): string {
   const base = `${origin}/${tab}/`
   const ws = `${origin.replace(/^http/, 'ws')}/${tab}/`
-  return `default-src 'self'; script-src ${base}; style-src 'self'; img-src 'self' data:; connect-src ${base} ${ws}; ` +
+  const shell = SHELL_SCRIPTS.map((p) => origin + p).join(' ')
+  return `default-src 'self'; script-src ${base} ${shell}; style-src 'self'; img-src 'self' data:; connect-src ${base} ${ws} ${origin}${SHELL_API}; ` +
     `object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action ${base}`
 }
 

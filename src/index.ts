@@ -8,8 +8,8 @@
 
 import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
 import {
-  type PortalIdentity, type RevokeRef, type TabService, isNavigation, isUpgrade, permissionsPolicy, policyOf,
-  readTabAudit, sanitizeTabHeaders, stripRequestHeaders,
+  RESERVED_TABS, type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
+  policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders,
 } from './tabs'
 
 export type { PortalIdentity } from './tabs'
@@ -32,6 +32,9 @@ const SCREEN_DAYS = 365
 const PAIR_MINUTES = 5
 const PAIR_PICKUP_GRACE_MS = 5 * 60e3 // an approved pairing can be picked up until expires_at + 5 min
 const ENTRY_GRANT_MS = 60e3
+const BADGE_TIMEOUT_MS = 300
+const BADGE_CACHE_MS = 60e3
+const ACCOUNT_PATH = '/conta/'
 const MACHINE_KEY_PREFIX = 'pa5_maq_'
 const BRIDGE_ALERT_PER_HOUR = 3 // more reconnections than this in an hour warns the admins
 const BRIDGE_MAX_PER_HOUR = 120
@@ -955,7 +958,10 @@ async function listAudit(env: Env, url: URL) {
 
 // ------------------------------------------------------------------ tabs
 function tabBindings(env: Env): Record<string, string> {
-  try { return JSON.parse(env.TABS || '{}') } catch { return {} }
+  let all: Record<string, string>
+  try { all = JSON.parse(env.TABS || '{}') } catch { return {} }
+  // a tab named like a portal page would never be reached; drop it instead of half-serving it
+  return Object.fromEntries(Object.entries(all).filter(([t]) => /^[a-z][a-z0-9-]{0,30}$/.test(t) && !RESERVED_TABS.includes(t)))
 }
 
 function tabService(env: Env, tab: string): TabService | null {
@@ -1025,6 +1031,74 @@ async function forwardSocket(env: Env, req: Request, service: TabService, tab: s
   return new Response(null, { status: 101, webSocket: res.webSocket })
 }
 
+function identityOf(who: Who, policy: TabPolicy, enteredAt: string | null): PortalIdentity {
+  return {
+    credential: who.kind, person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id),
+    session: who.sessionId, machine: null, strong: fresh(who), entered_at: enteredAt,
+    entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null, actions: [],
+  }
+}
+
+// Tabs this session can open from a page, in the order of the TABS binding.
+function visibleTabs(env: Env, who: Who): string[] {
+  return Object.keys(tabBindings(env)).filter((t) => canOpen(who, t) && policyOf(t).credentials.includes(who.kind))
+}
+
+// badge(identity) answers per person, kept for a minute in this isolate (no D1 read). A tab that
+// is slow, has no badge() or answers anything but an integer shows no number.
+const badgeCache = new Map<string, { at: number; count: number | null }>()
+
+async function badgeOf(env: Env, who: Who, tab: string): Promise<number | null> {
+  const key = `${who.person.id}:${tab}`
+  const hit = badgeCache.get(key)
+  if (hit && Date.now() - hit.at < BADGE_CACHE_MS) return hit.count
+  let count: number | null = null
+  const service = tabService(env, tab)
+  if (service) {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), BADGE_TIMEOUT_MS) })
+    try {
+      // a passkey tab gets no entry here: the badge is a count, never the tab's content
+      const r = await Promise.race([Promise.resolve(service.badge?.(identityOf(who, policyOf(tab), null))), late])
+      const n = (r as { count?: unknown } | null | undefined)?.count
+      if (typeof n === 'number' && Number.isInteger(n) && n >= 0) count = Math.min(n, 99)
+    } catch { /* no badge() or a failing tab: no number */ }
+    if (timer !== undefined) clearTimeout(timer)
+  }
+  if (badgeCache.size > 500) badgeCache.clear()
+  badgeCache.set(key, { at: Date.now(), count })
+  return count
+}
+
+// GET /api/tabs: what the shared selector (/_shell/tabs.js) shows. The only portal API a tab page
+// may call (its CSP allows this exact path), so it answers with names, paths and counts only.
+async function tabsMenu(env: Env, who: Who, url: URL) {
+  const tabs = visibleTabs(env, who)
+  // fixed screens get no selector; the list is still there so "/" knows where to go
+  const selector = who.kind === 'browser'
+  // the dot only makes sense with more than one tab besides the account
+  const withBadges = selector && tabs.length > 1
+  const badges = withBadges ? await Promise.all(tabs.map((t) => badgeOf(env, who, t))) : tabs.map(() => null)
+  const cur = url.searchParams.get('current')
+  return {
+    selector,
+    current: cur === 'conta' || (cur && tabs.includes(cur)) ? cur : null,
+    tabs: tabs.map((t, i) => ({ id: t, path: `/${t}/`, badge: badges[i], entry: policyOf(t).entry })),
+    account: { id: 'conta', path: ACCOUNT_PATH },
+  }
+}
+
+// The account tab is a portal page: the same index.html, with the portal's own headers.
+async function accountPage(req: Request, env: Env, url: URL): Promise<Response> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'not_found')
+  if (url.pathname !== ACCOUNT_PATH) return new Response(null, { status: 301, headers: { Location: ACCOUNT_PATH + url.search, ...API_HEADERS } })
+  const page = await env.ASSETS.fetch(new Request(url.origin + '/', { method: req.method }))
+  const out = new Response(page.body, { status: page.status, headers: page.headers })
+  for (const [k, v] of Object.entries(PAGE_HEADERS)) out.headers.set(k, v)
+  out.headers.set('Cache-Control', 'no-cache')
+  return out
+}
+
 async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<Response | null> {
   const service = tabService(env, tab)
   if (!service) return null
@@ -1048,11 +1122,7 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
     if (e instanceof Response) return e
     enteredAt = e
   }
-  const identity: PortalIdentity = {
-    credential: who.kind, person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id),
-    session: who.sessionId, machine: null, strong: fresh(who), entered_at: enteredAt,
-    entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null, actions: [],
-  }
+  const identity = identityOf(who, policy, enteredAt)
   if (isUpgrade(req)) return forwardSocket(env, req, service, tab, identity, who)
 
   const forwarded = new Request(req.url, { method: req.method, headers: stripRequestHeaders(req.headers), body: req.body })
@@ -1098,6 +1168,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
     let mm: RegExpMatchArray | null
 
     if (path === '/api/me' && m === 'GET') return out(await me(env, who))
+    if (path === '/api/tabs' && m === 'GET') return out(await tabsMenu(env, who, url))
     if (path === '/api/me/devices' && m === 'GET') return out(await myDevices(env, who))
     if ((mm = path.match(/^\/api\/me\/devices\/(\d+)$/)) && m === 'DELETE') {
       // an admin weak session must not be able to kick the owner's real devices out
@@ -1157,6 +1228,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
     }
     throw new HttpError(404, 'not_found')
   }
+
+  if (path === ACCOUNT_PATH || path === '/conta') return accountPage(req, env, url)
 
   const tab = /^\/([a-z][a-z0-9-]{0,30})(\/|$)/.exec(path)?.[1]
   if (tab) {

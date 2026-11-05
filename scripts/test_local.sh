@@ -12,10 +12,11 @@ VARS="$STATE/test.vars"
 printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\n' "$(openssl rand -hex 32)" > "$VARS"
 KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 
-# The portal plus a fake tab worker bound as two tabs (energia, jarvis). The config is
+# The portal plus a fake tab worker bound as tabs: energia, jarvis, lento (slow badge),
+# torto (bad badge) and conta (a reserved name the portal must ignore). The config is
 # wrangler.toml with the tab bindings added, written next to it so relative paths still work.
 TESTCFG=".wrangler.test.toml"
-sed 's/^TABS = .*/TABS = "{\\"energia\\":\\"TAB_ENERGIA\\",\\"jarvis\\":\\"TAB_JARVIS\\"}"/' wrangler.toml > "$TESTCFG"
+sed 's/^TABS = .*/TABS = "{\\"energia\\":\\"TAB_ENERGIA\\",\\"jarvis\\":\\"TAB_JARVIS\\",\\"lento\\":\\"TAB_LENTO\\",\\"torto\\":\\"TAB_TORTO\\",\\"conta\\":\\"TAB_ENERGIA\\"}"/' wrangler.toml > "$TESTCFG"
 cat >> "$TESTCFG" <<'EOF2'
 
 [[services]]
@@ -27,6 +28,16 @@ entrypoint = "FakeTab"
 binding = "TAB_JARVIS"
 service = "portal-a5-fake-tab"
 entrypoint = "FakeTab"
+
+[[services]]
+binding = "TAB_LENTO"
+service = "portal-a5-fake-tab"
+entrypoint = "SlowTab"
+
+[[services]]
+binding = "TAB_TORTO"
+service = "portal-a5-fake-tab"
+entrypoint = "OddTab"
 EOF2
 grep -q '^TABS = "{\\"energia' "$TESTCFG" || { echo "FAIL could not write the test config"; exit 1; }
 

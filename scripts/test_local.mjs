@@ -2,6 +2,7 @@
 // reader (POST /robo/login) and a software passkey. Run through scripts/test_local.sh.
 import { webcrypto as wc } from 'node:crypto'
 import http from 'node:http'
+import { browserChecks } from './test_browser.mjs'
 
 const BASE = process.env.BASE
 const ROBO_KEY = process.env.ROBO_KEY
@@ -305,8 +306,11 @@ check('Set-Cookie from the tab removed', !/stolen/.test(bad.setCookie || ''), ba
 check('tab cannot send Clear-Site-Data, Service-Worker-Allowed or CORS', !bad.headers.get('clear-site-data') && !bad.headers.get('service-worker-allowed') &&
   ![...bad.headers.keys()].some((k) => k.startsWith('access-control-')))
 const tabCspE = bad.headers.get('content-security-policy') || ''
-check('portal CSP replaces the tab CSP (inline script blocked)', tabCspE.includes(`script-src ${BASE}/energia/;`) && !/unsafe-inline|\*/.test(tabCspE) && tabCspE.includes("frame-ancestors 'none'"), tabCspE)
-check('tab CSP: connect and form-action only under the tab path', tabCspE.includes(`connect-src ${BASE}/energia/ ${WS_BASE}/energia/;`) && tabCspE.includes(`form-action ${BASE}/energia/`), tabCspE)
+check('portal CSP replaces the tab CSP (inline script blocked)', tabCspE.includes(`script-src ${BASE}/energia/ ${BASE}/_shell/tabs.js ${BASE}/locale/pt-BR.js;`) && !/unsafe-inline|\*/.test(tabCspE) && tabCspE.includes("frame-ancestors 'none'"), tabCspE)
+check('tab CSP: connect only under the tab path plus /api/tabs; form-action only the tab', tabCspE.includes(`connect-src ${BASE}/energia/ ${WS_BASE}/energia/ ${BASE}/api/tabs;`) && tabCspE.includes(`form-action ${BASE}/energia/`), tabCspE)
+const cspPart = (csp, d) => (csp.split(';').map((x) => x.trim()).find((x) => x.startsWith(d + ' ')) || '').split(' ').slice(1)
+check('tab CSP: the only portal scripts are the two shell files', cspPart(tabCspE, 'script-src').join() === [`${BASE}/energia/`, `${BASE}/_shell/tabs.js`, `${BASE}/locale/pt-BR.js`].join(), cspPart(tabCspE, 'script-src'))
+check('tab CSP: the only portal API is /api/tabs (no /api/ prefix, no self)', cspPart(tabCspE, 'connect-src').join() === [`${BASE}/energia/`, `${WS_BASE}/energia/`, `${BASE}/api/tabs`].join(), cspPart(tabCspE, 'connect-src'))
 check('portal pages keep the portal CSP', ownerCsp.includes("script-src 'self'") && !ownerCsp.includes('/energia/'), ownerCsp)
 check('tab page keeps nosniff and DENY', bad.headers.get('x-content-type-options') === 'nosniff' && bad.headers.get('x-frame-options') === 'DENY')
 const ppE = bad.headers.get('permissions-policy') || ''
@@ -406,6 +410,8 @@ check('screen cannot register a passkey', (await tv.req('POST', '/api/passkey/cr
 check('screen cannot join the owner group', (await owner.req('POST', `/api/admin/people/${ap1.data.screen}`, { groups: ['owner'] })).status === 409)
 const tvws = await openWs('/energia/live', { Cookie: tv.cookie, Origin: BASE })
 check('screen page socket', tvws.ok && tvws.data.identity.credential === 'screen', tvws)
+const tvTabs = await tv.req('GET', '/api/tabs')
+check('fixed screen: no selector, energia only, no counts', tvTabs.status === 200 && tvTabs.data.selector === false && tvTabs.data.tabs.map((t) => t.id).join() === 'energia' && tvTabs.data.tabs.every((t) => t.badge === null), tvTabs.data)
 const tvPeople = (await owner.req('GET', '/api/admin/people')).data.find((p) => p.id === ap1.data.screen)
 check('screen listed as kind screen without a phone', tvPeople && tvPeople.kind === 'screen' && tvPeople.phone === null, tvPeople)
 const tvDev = (await owner.req('GET', '/api/admin/devices')).data.find((d) => d.person_id === ap1.data.screen)
@@ -472,6 +478,56 @@ check('resident lost the tab at once', (await resident.req('GET', '/energia/echo
 check('group gets energia back', (await owner.req('POST', '/api/admin/groups/residents', { tabs: ['energia'] })).status === 200)
 const revAfter = await tabRevoked()
 check('tabs told when a group loses a tab', revAfter.length > revBefore && revAfter.slice(revBefore).some((r) => r.person === residentId), revAfter.slice(revBefore))
+
+// shell v2: /api/tabs, badge, the account page and the shared selector files
+check('/api/tabs signed out = 401', (await anon.req('GET', '/api/tabs')).status === 401)
+check('/api/tabs is GET only', (await owner.req('POST', '/api/tabs', {})).status === 404)
+const t0 = Date.now()
+const ot = await owner.req('GET', '/api/tabs?current=energia')
+const took = Date.now() - t0
+check('owner: every bound tab in binding order, reserved name dropped', ot.status === 200 && ot.data.selector === true && ot.data.tabs.map((t) => t.id).join() === 'energia,jarvis,lento,torto', ot.data)
+check('owner: account entry at /conta/', ot.data.account && ot.data.account.id === 'conta' && ot.data.account.path === '/conta/', ot.data.account)
+check('current echoed only for a listed tab', ot.data.current === 'energia' && (await owner.req('GET', '/api/tabs?current=nothing')).data.current === null &&
+  (await owner.req('GET', '/api/tabs?current=conta')).data.current === 'conta')
+const byId = Object.fromEntries(ot.data.tabs.map((t) => [t.id, t]))
+check('badge comes from the tab', byId.energia.badge === 3 && byId.jarvis.badge === 3, byId)
+check('slow badge: no number, and the answer does not wait for it', byId.lento.badge === null && took < 1500, [byId.lento, took])
+check('badge that is not a count: no number', byId.torto.badge === null, byId.torto)
+check('entry kind per tab', byId.jarvis.entry === 'passkey' && byId.energia.entry === 'session')
+check('list carries id, path, badge and entry only', ot.data.tabs.every((t) => Object.keys(t).sort().join() === 'badge,entry,id,path'), ot.data.tabs)
+let calls = (await resident.req('GET', '/energia/badges', undefined, CORS)).data
+const ownerCall = calls.find((c) => c.person === ownerId)
+check('badge gets the person\'s identity, with no entry', ownerCall && ownerCall.credential === 'browser' && ownerCall.entered_at === null && ownerCall.entry_until === null, ownerCall)
+const nCalls = calls.length
+await owner.req('GET', '/api/tabs')
+check('badge kept for a minute (no new call to the tab)', (await resident.req('GET', '/energia/badges', undefined, CORS)).data.length === nCalls)
+const rt = await resident.req('GET', '/api/tabs?current=energia')
+check('resident: Energia + Conta only', rt.status === 200 && rt.data.selector === true && rt.data.tabs.map((t) => t.id).join() === 'energia' && rt.data.account.path === '/conta/', rt.data)
+calls = (await resident.req('GET', '/energia/badges', undefined, CORS)).data
+check('resident: no count, and the tab is never asked', rt.data.tabs[0].badge === null && !calls.some((c) => c.person === residentId), rt.data)
+check('fixed screen: the tab is never asked for a count', !calls.some((c) => c.credential === 'screen'))
+const sj = await fetch(BASE + '/_shell/tabs.js')
+const sjt = await sj.text()
+check('/_shell/tabs.js served as a script, no innerHTML', sj.status === 200 && /javascript/.test(sj.headers.get('content-type') || '') && sjt.includes('A5Tabs') && !/innerHTML|insertAdjacentHTML|outerHTML/.test(sjt))
+check('/_shell/tabs.css served', (await fetch(BASE + '/_shell/tabs.css')).status === 200)
+check('locale exposes the selector texts under A5_TEXT', /window\.A5_TEXT = window\.T/.test(await (await fetch(BASE + '/locale/pt-BR.js')).text()))
+check('portal page loads the selector', /\/_shell\/tabs\.js/.test(home.data) && /\/_shell\/tabs\.css/.test(home.data))
+const acc = await navigate(owner, '/conta/')
+check('account page: the portal page with the portal CSP', acc.status === 200 && /id="title"/.test(acc.data) && acc.headers.get('content-security-policy') === ownerCsp, [acc.status, acc.headers.get('content-security-policy')])
+check('account page answers signed out too (sign-in screen)', (await navigate(anon, '/conta/')).status === 200)
+check('/conta redirects to /conta/', (await navigate(owner, '/conta')).status === 301)
+check('reserved name: /conta/* never reaches a tab', (await navigate(owner, '/conta/echo')).status === 404)
+check('reserved name: no machine key for it', (await owner.req('POST', '/api/admin/machines', { tab: 'conta', label: 'x' })).status === 400)
+
+// the selector in a real browser (owner, resident and a freshly paired screen)
+const g5 = await owner.req('POST', '/api/passkey/get/options', {})
+await owner.req('POST', '/api/passkey/get/verify', await auth.get(g5.data))
+const tv3 = client()
+const ps3 = await tv3.req('POST', '/api/pair/start', {})
+await owner.req('POST', '/api/admin/pair', { code: ps3.data.code, name: 'TV browser' })
+await tv3.req('POST', '/api/pair/status', { secret: ps3.data.secret })
+check('screen for the browser test paired', !!tv3.cookie)
+await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie })
 
 // pairing start is capped per IP (last: it uses up the bucket)
 let pl

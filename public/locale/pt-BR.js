@@ -17,9 +17,18 @@ window.T = {
     used: 'Esse código já foi usado. Volte e peça outro.',
     refused: 'Pedido recusado. Fale com o dono do portal.',
   },
-  nav: { home: 'Início', devices: 'Meus aparelhos', admin: 'Pessoas e grupos', logout: 'Sair' },
-  tabs: 'Abas',
-  noTabs: 'Nenhuma aba ainda.',
+  nav: { devices: 'Meus aparelhos', admin: 'Pessoas e grupos', logout: 'Sair' },
+  account: 'Conta',
+  title: 'Portal A5',
+  // the tab selector (/_shell/tabs.js), also loaded by the tab pages
+  shell: {
+    tabNames: { energia: 'Energia', jarvis: 'Jarvis', agentes: 'Agentes', financas: 'Finanças', conta: 'Conta' },
+    hints: { conta: 'aparelhos, pessoas, auditoria' },
+    passkeyHint: 'Face ID',
+    switchTab: 'Trocar de aba',
+    menuLabel: 'Abas',
+    waiting: (n) => `${n} esperando você`,
+  },
   myDevices: 'Meus aparelhos',
   thisOne: ' (este)',
   thisDevice: ' (este aparelho)',
@@ -146,3 +155,5 @@ window.T = {
     missing_secret: 'Pedido inválido.',
   },
 }
+// tab pages may have their own T; the selector reads this name only
+window.A5_TEXT = window.T
