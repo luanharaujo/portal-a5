@@ -82,7 +82,7 @@ async function page(b, base, cookie) {
 
 const KEYS = { Enter: ['Enter', 'Enter', 13], Escape: ['Escape', 'Escape', 27], ArrowDown: ['ArrowDown', 'ArrowDown', 40], End: ['End', 'End', 35], Tab: ['Tab', 'Tab', 9] }
 
-export async function browserChecks({ base, check, owner, resident, screen }) {
+export async function browserChecks({ base, check, owner, resident, screen, approve }) {
   if (!existsSync(CHROME)) { console.log('skip browser checks: Chrome not found (set CHROME)'); return }
   const b = await launch()
   try {
@@ -167,6 +167,18 @@ export async function browserChecks({ base, check, owner, resident, screen }) {
       check('browser: fixed screen keeps a plain title (no arrow, no menu)', st.on === null && !st.svg && st.popup === null, st)
       await s.go('/')
       check('browser: fixed screen "/" opens its tab', await s.waitFor(`location.pathname === '/tab-a/'`))
+    }
+
+    // pairing a new screen from its own page, with a deep link: after approval it lands on `next`
+    if (approve) {
+      const p = await page(b, base, null)
+      await p.go('/?screen=1&next=%2Ftab-a%2F%3Fview%3Dlandscape')
+      check('browser: pairing page shows a code', await p.waitFor(`!!document.querySelector('.pair-code')`))
+      await sleep(7000) // at least one status poll has answered "waiting"
+      const waitingText = await p.evaluate(`document.querySelector('.pair .muted').textContent`)
+      check('browser: pairing status is translated while waiting', waitingText === await p.evaluate('A5_TEXT.pair.waiting'), waitingText)
+      await approve(await p.evaluate(`document.querySelector('.pair-code').textContent`))
+      check('browser: paired screen lands on next, query kept', await p.waitFor(`location.pathname + location.search === '/tab-a/?view=landscape'`, 8000), [await p.evaluate('location.href'), await p.evaluate(`document.querySelector('.pair .muted')?.textContent`), p.log])
     }
 
     // signed out: "/" and /conta/ show the sign-in page, title without a selector

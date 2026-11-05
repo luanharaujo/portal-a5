@@ -62,7 +62,7 @@ The tab trusts this object and nothing in the request that claims to be identity
 ## 3. What the portal does on every tab request
 
 Before the call:
-- session cookie checked; signed out: navigation gets 302 to `/?next=/<tab>/...`, anything else 401 `signed_out`;
+- session cookie checked; signed out: navigation gets 302 to `/?next=<path and query>` (query dropped above 512 characters), anything else 401 `signed_out`;
 - group must include the tab (`*` = all), and the tab policy must accept the credential (section 4), else 403 `no_tab_access`;
 - non-GET needs `Origin` equal to the portal origin and `X-Portal: 1` (403 otherwise). GET must never change state;
 - WebSocket upgrades from pages also need that exact `Origin` (cross-site socket hijacking);
@@ -119,7 +119,7 @@ Fail closed: there is no default policy. A tab whose entry misses `allow`, `entr
 
 For a tab with `entry: 'passkey'`:
 
-1. A navigation into the tab (`Sec-Fetch-Mode: navigate`) without a fresh grant gets 302 to `/?step_up=<tab>&next=<path>`.
+1. A navigation into the tab (`Sec-Fetch-Mode: navigate`) without a fresh grant gets 302 to `/?step_up=<tab>&next=<path and query>`.
 2. The portal page shows "confirm with Face ID", runs a passkey check with `purpose: "entry:<tab>"` and navigates back to `next`.
 3. The check leaves a single-use grant valid for 60 s. The next navigation burns it, the tab is served, and `identity.entered_at` is set.
 4. Any other request inside the tab (API, assets, streams, sockets) is accepted while the last entry is younger than `entryHours`; otherwise 401 `{"error":"entry_required","step_up":"/?step_up=<tab>&next=/<tab>/"}`. The page sends the person to `step_up`.
@@ -131,7 +131,7 @@ The tab does not need its own "entered" bookkeeping; `entered_at`/`entry_until` 
 
 A TV or monitor gets its own account, kind `screen`, in `residents`:
 
-1. The screen opens `/?screen=1&next=/<tab>/` (or taps the pairing link on the sign-in page). It gets a 6-character code (`ABC-DEF`, 5 minutes, single use) and a QR for `/?pair=ABCDEF`.
+1. The screen opens `/?screen=1&next=/<tab>/` (URL-encoded; a query is kept, e.g. `next=%2F<tab>%2F%3Fview%3Dlandscape`) (or taps the pairing link on the sign-in page). It gets a 6-character code (`ABC-DEF`, 5 minutes, single use) and a QR for `/?pair=ABCDEF`.
 2. The owner, on the phone, on the admin page, in the screens card, types the code or scans the QR, sees which browser, place and IP is asking, and picks an existing screen account or names a new one. Approving is an admin write: passkey in the last 5 minutes. A request from another IP than the approving phone is refused (`PAIR_OTHER_IP = "refuse"`: a screen is paired on the same network as the phone), with a clear message and an audit line `screen_pair_refused`. `"warn"` only shows a red warning.
 3. The screen's poll gets a session cookie for 365 days, renewed on use, if it picks up the approval before the code's expiry + 5 minutes. Only the hash is stored. A screen account holds one session; pairing it again ends the old one (and calls `revoke`).
 4. The session shows up in the list of all devices and is revoked there. Each pairing is audited (`screen_paired`, `screen_signed_in`).

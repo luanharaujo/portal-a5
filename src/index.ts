@@ -981,6 +981,8 @@ async function notifyTabs(env: Env, ref: RevokeRef, only?: string) {
 }
 
 const stepUpUrl = (tab: string, next: string) => `/?step_up=${tab}&next=${encodeURIComponent(next)}`
+// where to come back after sign-in or Face ID: same path and query (a same-origin path, never a full URL)
+const backTo = (url: URL) => (url.pathname + url.search).length <= 512 ? url.pathname + url.search : url.pathname
 
 // Face ID on entry: a navigation burns a grant left by a passkey check made for this entry (60 s); anything
 // else inside the tab needs an entry from the last entryHours. Returns when the session entered.
@@ -994,7 +996,7 @@ async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: strin
       await audit(env, req, { who, strength: 'strong', action: 'tab_entered', target: tab })
       return t
     }
-    return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, url.pathname), ...API_HEADERS } })
+    return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, backTo(url)), ...API_HEADERS } })
   }
   const e = await env.DB.prepare('SELECT used_at FROM tab_entries WHERE session_id = ? AND tab = ? AND used_at > ? AND granted_at >= ? ORDER BY used_at DESC LIMIT 1')
     .bind(who.sessionId, tab, inMs(-policy.entryHours * 3600e3), who.sessionCreatedAt).first<{ used_at: string }>()
@@ -1106,7 +1108,7 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
   if (!service) return null
   const who = await currentSession(req, env)
   if (!who) {
-    if (isNavigation(req)) return new Response(null, { status: 302, headers: { Location: `/?next=${encodeURIComponent(url.pathname)}`, ...API_HEADERS } })
+    if (isNavigation(req)) return new Response(null, { status: 302, headers: { Location: `/?next=${encodeURIComponent(backTo(url))}`, ...API_HEADERS } })
     throw new HttpError(401, 'signed_out')
   }
   if (!canOpen(who, tab)) throw new HttpError(403, 'no_tab_access')

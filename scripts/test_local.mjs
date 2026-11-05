@@ -288,6 +288,8 @@ const tabRevoked = async () => (await resident.req('GET', '/tab-a/revoked', unde
 
 // signed out
 check('tab signed out: navigation redirects to sign-in', (await navigate(anon, '/tab-a/')).headers.get('location') === '/?next=%2Ftab-a%2F')
+check('tab signed out: next keeps the query', (await navigate(anon, '/tab-a/?view=landscape')).headers.get('location') === '/?next=%2Ftab-a%2F%3Fview%3Dlandscape')
+check('tab signed out: overlong query falls back to the path', (await navigate(anon, '/tab-a/?x=' + 'a'.repeat(600))).headers.get('location') === '/?next=%2Ftab-a%2F')
 check('tab signed out: fetch = 401', (await anon.req('GET', '/tab-a/echo', undefined, CORS)).status === 401)
 
 // identity and request headers
@@ -341,6 +343,7 @@ check('malformed tab audit recorded as invalid', rows.some((a) => a.action === '
 // Face ID on every entry into tab-b
 const nav1 = (await navigate(owner, '/tab-b/'))
 check('tab-b entry without Face ID -> step-up page', nav1.status === 302 && nav1.headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F', [nav1.status, nav1.headers.get('location')])
+check('tab-b step-up next keeps the query', (await navigate(owner, '/tab-b/?v=1')).headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F%3Fv%3D1')
 const in1 = await owner.req('GET', '/tab-b/echo', undefined, CORS)
 check('tab-b request without entry = 401 entry_required', in1.status === 401 && in1.data.error === 'entry_required' && in1.data.step_up, in1.data)
 check('tab-b socket without entry = 401', (await upgradeStatus('/tab-b/live', { Cookie: owner.cookie, Origin: BASE })) === 401)
@@ -530,7 +533,8 @@ const ps3 = await tv3.req('POST', '/api/pair/start', {})
 await owner.req('POST', '/api/admin/pair', { code: ps3.data.code, name: 'TV browser' })
 await tv3.req('POST', '/api/pair/status', { secret: ps3.data.secret })
 check('screen for the browser test paired', !!tv3.cookie)
-await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie })
+await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie,
+  approve: async (code) => check('browser pairing approved', (await owner.req('POST', '/api/admin/pair', { code, name: 'TV deep link' })).status === 200) })
 
 // pairing start is capped per IP (last: it uses up the bucket)
 let pl

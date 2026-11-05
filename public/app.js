@@ -182,10 +182,16 @@ async function pairScreenView() {
     el('button', { class: 'link', onclick: () => { clearTimeout(pollTimer); loginView() } }, T.back)))
   const poll = async () => {
     let s
-    try { s = await rawApi('POST', '/api/pair/status', { secret: r.secret }) } catch (e) { status.textContent = e.message; return }
-    if (s.status === 'ok') { location.href = nextPath() || '/'; return }
+    // a screen is unattended: a network blip must not stop the polling for good
+    try { s = await rawApi('POST', '/api/pair/status', { secret: r.secret }) } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return pairScreenView()
+      status.textContent = T.offline
+      pollTimer = setTimeout(poll, 5000)
+      return
+    }
+    if (s.status === 'ok') { location.replace(nextPath() || '/'); return }
     if (s.status === 'expired') return pairScreenView() // a fresh code, the screen stays unattended
-    status.textContent = T.pair.status[s.status] || s.status
+    status.textContent = T.pair.status[s.status] || T.pair.waiting
     if (s.status === 'waiting') pollTimer = setTimeout(poll, 3000)
   }
   pollTimer = setTimeout(poll, 3000)
