@@ -5,3 +5,9 @@
   Permissions-Policy: camera=(), microphone=(), geolocation=(), screen-wake-lock=(), display-capture=(), usb=(), serial=(), bluetooth=(), hid=(), payment=(), publickey-credentials-get=(self), publickey-credentials-create=(self)
   Strict-Transport-Security: max-age=31536000
   X-Frame-Options: DENY
+
+# the page itself is always revalidated; its scripts and styles carry a content version (deploy)
+/
+  Cache-Control: no-cache
+/index.html
+  Cache-Control: no-cache
