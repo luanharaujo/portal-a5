@@ -12,6 +12,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Only committed code goes out: refuse a dirty tree, and remember which commit was published.
+git diff --quiet && git diff --cached --quiet && [ -z "$(git status --porcelain --untracked-files=normal)" ] \
+  || { echo "working tree is not clean; commit first" >&2; exit 1; }
+COMMIT="$(git rev-parse HEAD)"
+
 kc() { security find-generic-password -s "$1" -w 2>/dev/null || { echo "missing Keychain item: $1" >&2; exit 1; }; }
 
 export CLOUDFLARE_API_TOKEN="$(kc portal-a5-cloudflare)"
@@ -57,4 +62,6 @@ npx wrangler deploy -c "$CFG"
 kc portal-a5-robo-login | grep -q '^pa5_robo_' || { echo "robot key must start with pa5_robo_" >&2; exit 1; }
 kc portal-a5-robo-login | npx wrangler secret put ROBO_LOGIN_CHAVE -c "$CFG" >/dev/null
 kc portal-a5-dono-telefone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null
-echo "deployed: portal-a5 (account and D1 ids kept out of git)"
+mkdir -p .deploy
+printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" >> .deploy/deployed.log
+echo "deployed: portal-a5 at $COMMIT (account and D1 ids kept out of git)"
