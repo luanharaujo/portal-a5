@@ -4,9 +4,10 @@
 #
 # Keychain items (macOS, generic passwords; service names below):
 #   portal-a5-cloudflare          API token (Workers Scripts: Edit + D1: Edit, this account only)
-#   portal-a5-cloudflare-conta    account id
 #   portal-a5-robo-login          ROBO_LOGIN_CHAVE ("pa5_robo_" + 32 random bytes)
 #   portal-a5-dono-telefone       OWNER_PHONE (digits, country code first)
+# The account id (not a secret, but kept out of git) comes from CLOUDFLARE_ACCOUNT_ID or from
+# the git-ignored file .deploy.local (a line CLOUDFLARE_ACCOUNT_ID=<id>).
 # Secrets go to wrangler through stdin only: never arguments, never files.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -14,14 +15,19 @@ cd "$(dirname "$0")/.."
 kc() { security find-generic-password -s "$1" -w 2>/dev/null || { echo "missing Keychain item: $1" >&2; exit 1; }; }
 
 export CLOUDFLARE_API_TOKEN="$(kc portal-a5-cloudflare)"
-export CLOUDFLARE_ACCOUNT_ID="$(kc portal-a5-cloudflare-conta)"
+if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -f .deploy.local ]; then
+  CLOUDFLARE_ACCOUNT_ID="$(sed -n 's/^CLOUDFLARE_ACCOUNT_ID=//p' .deploy.local)"
+fi
+[[ "${CLOUDFLARE_ACCOUNT_ID:-}" =~ ^[0-9a-f]{32}$ ]] || { echo "set CLOUDFLARE_ACCOUNT_ID (env or .deploy.local)" >&2; exit 1; }
+export CLOUDFLARE_ACCOUNT_ID
 # keep wrangler away from any OAuth login stored in the user's global config
 export XDG_CONFIG_HOME="$(mktemp -d)"
 trap 'rm -rf "$XDG_CONFIG_HOME"' EXIT
 
 # 1. the token must be valid and see exactly this one account
 api() { curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/$1"; }
-api user/tokens/verify | grep -q '"status":"active"' || { echo "token not active" >&2; exit 1; }
+# account-owned token: verified under the account, not under /user
+api "accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify" | grep -q '"status":"active"' || { echo "token not active for this account" >&2; exit 1; }
 accounts="$(api 'accounts?per_page=50' | python3 -c 'import json,sys; print(" ".join(a["id"] for a in json.load(sys.stdin)["result"]))')"
 [ "$accounts" = "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "token sees accounts [$accounts], expected only the portal account" >&2; exit 1; }
 
