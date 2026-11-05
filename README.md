@@ -39,13 +39,13 @@ Limits in the Worker, on top of whatever the reader does: 3 accepted calls per s
 
 ## Sessions: weak and strong
 
-A WhatsApp sign-in gives a weak session: it can read everything its groups allow and disconnect its own devices. Admin writes (people, groups, pending requests, other people's devices) need a passkey check from the last 5 minutes on that session. The first passkey of an admin can be added from a weak session; any later one needs a fresh check.
+A WhatsApp sign-in gives a weak session: it can read everything its groups allow and disconnect its own devices. Admin writes (people, groups, pending requests, other people's devices) need a passkey check from the last 5 minutes on that session. A weak session can add a passkey only while the portal has none at all (the very first one, done with the owner in front of the screen), or with an invite a strong admin created for that person, valid 24 hours. Weak admin sessions also see phone numbers masked, and disconnecting any device other than the current one needs a passkey check. A pending request whose sender is an admin can never be approved: admins only sign in by typing and sending from their own number.
 
 If the owner loses every passkey, delete the rows from `passkeys` in D1 with wrangler and register again.
 
 Session cookie: `__Host-a5s`, `HttpOnly; Secure; SameSite=Lax`, 180 days, renewed on use. Lax and not Strict so a link opened from WhatsApp arrives signed in. Every non-GET request must carry `Origin` equal to the portal origin and `X-Portal: 1`; GET never changes state.
 
-Every new device of an admin shows a banner on all their devices until it is confirmed with a passkey.
+Every new device of an admin shows a banner on all their devices until it is confirmed with a passkey. The warning lives in its own table, so revoking that session does not make it go away.
 
 ## Groups and tabs
 
@@ -64,7 +64,7 @@ Every query on a hot path must use an index; the test runs `EXPLAIN QUERY PLAN` 
 
 ## Deploying
 
-`npm run deploy` reads the token, the account id, the reader key and the owner's number from the Keychain, checks that the token sees only the portal account, creates the D1 database on first run, applies migrations, deploys and sets the secrets through stdin. Account and database ids go into a git-ignored config, never into this repository.
+`npm run deploy` refuses a dirty working tree, logs the published commit in the git-ignored `.deploy/deployed.log`, reads the token, the account id, the reader key and the owner's number from the Keychain, checks that the token sees only the portal account, creates the D1 database on first run, applies migrations, deploys and sets the secrets through stdin. Account and database ids go into a git-ignored config, never into this repository.
 
 ## License
 

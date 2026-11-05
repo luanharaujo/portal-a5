@@ -42,11 +42,35 @@ CREATE TABLE sessions (
   created_at TEXT NOT NULL,
   last_used_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
-  passkey_at TEXT,                   -- last successful passkey check on this session
-  ack_at TEXT                        -- admin devices: when the owner confirmed "this was me"
+  passkey_at TEXT                    -- last successful passkey check on this session
 );
 CREATE INDEX sessions_person ON sessions (person_id, last_used_at);
 CREATE INDEX sessions_expires ON sessions (expires_at);
+
+-- "New device signed in as an admin" banner. Lives apart from sessions so revoking the
+-- session (or the session expiring) never makes the warning disappear.
+CREATE TABLE device_alerts (
+  id INTEGER PRIMARY KEY,
+  person_id INTEGER NOT NULL,
+  session_id INTEGER NOT NULL,
+  label TEXT,
+  place TEXT,
+  created_at TEXT NOT NULL,
+  ack_at TEXT,
+  ack_session_id INTEGER
+);
+CREATE INDEX device_alerts_person ON device_alerts (person_id, ack_at);
+
+-- A strong admin invites another admin to add a first passkey from a weak session.
+CREATE TABLE passkey_invites (
+  id INTEGER PRIMARY KEY,
+  person_id INTEGER NOT NULL,
+  created_by INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
+);
+CREATE INDEX passkey_invites_person ON passkey_invites (person_id, expires_at);
 
 CREATE TABLE passkeys (
   id INTEGER PRIMARY KEY,

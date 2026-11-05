@@ -279,6 +279,9 @@ async function createSession(env: Env, req: Request, person: Person, label: stri
   await env.DB.prepare(
     'INSERT INTO audit (at, person_id, session_id, strength, action, target, ip, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
   ).bind(t, person.id, r!.id, 'weak', admin ? 'login_admin' : 'login', label, clientIp(req), place(req)).run()
+  if (admin)
+    await env.DB.prepare('INSERT INTO device_alerts (person_id, session_id, label, place, created_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(person.id, r!.id, label, place(req), t).run()
   return token
 }
 
@@ -432,12 +435,26 @@ async function takeChallenge(env: Env, who: Who, kind: 'create' | 'get'): Promis
   return c.challenge
 }
 
-// The first passkey of an admin can be added from a weak session (done once, with the owner
-// in front of the screen). Any later one needs a fresh passkey check.
-async function canAddPasskey(env: Env, who: Who) {
+// From a weak session a passkey can be added only (a) when the portal has no passkey at all,
+// once, with the owner in front of the screen, or (b) with an unexpired invite a strong admin
+// created for this person. Anything else needs a fresh passkey check.
+async function canAddPasskey(env: Env, who: Who): Promise<number | null> {
   if (!who.admin) throw new HttpError(403, 'passkey_admin_only')
-  if (fresh(who)) return
-  if ((await passkeyCount(env, who.person.id)) > 0) throw new HttpError(403, 'passkey_required', { passkey: true })
+  if (fresh(who)) return null
+  const any = await env.DB.prepare('SELECT 1 FROM passkeys LIMIT 1').first()
+  if (!any) return null
+  const inv = await env.DB.prepare('SELECT id FROM passkey_invites WHERE person_id = ? AND expires_at > ? AND used_at IS NULL ORDER BY id DESC')
+    .bind(who.person.id, now()).first<{ id: number }>()
+  if (inv) return inv.id
+  throw new HttpError(403, 'passkey_required', { passkey: true })
+}
+
+async function createInvite(env: Env, req: Request, who: Who, personId: number) {
+  const target = (await groupsOf(env, personId)).some((g) => g.is_admin)
+  if (!target) throw new HttpError(409, 'invite_admin_only')
+  await env.DB.prepare('INSERT INTO passkey_invites (person_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .bind(personId, who.person.id, now(), inMs(864e5)).run()
+  await audit(env, req, { who, action: 'passkey_invite', target: String(personId) })
 }
 
 async function passkeyCreateOptions(env: Env, url: URL, who: Who) {
@@ -457,7 +474,7 @@ async function passkeyCreateOptions(env: Env, url: URL, who: Who) {
 }
 
 async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
-  await canAddPasskey(env, who)
+  const invite = await canAddPasskey(env, who)
   const b = await body(req)
   const rp = rpOf(url)
   const challenge = await takeChallenge(env, who, 'create')
@@ -475,7 +492,8 @@ async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
   await env.DB.prepare('INSERT INTO passkeys (person_id, credential_id, public_key, sign_count, label, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .bind(who.person.id, reg.credentialId, reg.publicKey, reg.signCount, label, now()).run()
   await env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId).run()
-  await audit(env, req, { who, strength: 'strong', action: 'passkey_added', target: label })
+  if (invite) await env.DB.prepare('UPDATE passkey_invites SET used_at = ? WHERE id = ?').bind(now(), invite).run()
+  await audit(env, req, { who, strength: 'strong', action: 'passkey_added', target: label, detail: invite ? { invite } : null })
   return { ok: true }
 }
 
@@ -524,9 +542,11 @@ async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
 async function alertsOf(env: Env, who: Who) {
   if (!who.admin) return []
   const r = await env.DB.prepare(
-    'SELECT id, label, place, created_at FROM sessions WHERE person_id = ? AND ack_at IS NULL AND expires_at > ? ORDER BY id',
-  ).bind(who.person.id, now()).all<Row>()
-  return r.results.map((s) => ({ ...s, current: Number(s.id) === who.sessionId }))
+    `SELECT a.id, a.session_id, a.label, a.place, a.created_at, s.id IS NOT NULL AS live
+       FROM device_alerts a LEFT JOIN sessions s ON s.id = a.session_id
+      WHERE a.person_id = ? AND a.ack_at IS NULL ORDER BY a.id`,
+  ).bind(who.person.id).all<Row>()
+  return r.results.map((a) => ({ ...a, live: !!a.live, current: Number(a.session_id) === who.sessionId }))
 }
 
 async function me(env: Env, who: Who) {
@@ -557,12 +577,21 @@ async function revokeSession(env: Env, req: Request, who: Who, id: number, anyPe
 
 async function ackAlert(env: Env, req: Request, who: Who, id: number) {
   requireStrongAdmin(who)
-  const r = await env.DB.prepare('UPDATE sessions SET ack_at = ? WHERE id = ? AND person_id = ? AND ack_at IS NULL').bind(now(), id, who.person.id).run()
+  const r = await env.DB.prepare('UPDATE device_alerts SET ack_at = ?, ack_session_id = ? WHERE id = ? AND person_id = ? AND ack_at IS NULL')
+    .bind(now(), who.sessionId, id, who.person.id).run()
   if (!r.meta.changes) throw new HttpError(404, 'alert_not_found')
   await audit(env, req, { who, action: 'device_acknowledged', target: String(id) })
 }
 
 // ------------------------------------------------------------------ admin
+// Weak admin sessions read lists with numbers masked; a passkey check shows them in full.
+const mask = (v: unknown) =>
+  String(v ?? '').replace(/\d{8,}/g, (d) => d.slice(0, 4) + '•'.repeat(d.length - 6) + d.slice(-2))
+function masked<T extends Row>(rows: T[], who: Who, cols: string[]): T[] {
+  if (fresh(who)) return rows
+  return rows.map((r) => { const o: Row = { ...r }; for (const c of cols) if (o[c] != null) o[c] = mask(o[c]); return o as T })
+}
+
 async function listPeople(env: Env) {
   const people = await env.DB.prepare('SELECT id, name, phone, status, created_at FROM people ORDER BY name').all<Row>()
   const links = await env.DB.prepare('SELECT person_id, group_id FROM person_groups').all<Row>()
@@ -662,6 +691,8 @@ async function resolveRequest(env: Env, req: Request, who: Who, id: number, acti
   const b = await body(req)
   let person = await personByPhone(env, String(r.sender_phone))
   if (person && person.status !== 'active') throw new HttpError(409, 'number_blocked')
+  // admins sign in only through the direct path (their own number typed and sent)
+  if (person && (await groupsOf(env, person.id)).some((g) => g.is_admin)) throw new HttpError(409, 'admin_direct_only')
   if (!person) {
     const name = text(b.name, 40)
     if (!name) throw new HttpError(400, 'name_required')
@@ -760,6 +791,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
     if (path === '/api/me' && m === 'GET') return out(await me(env, who))
     if (path === '/api/me/devices' && m === 'GET') return out(await myDevices(env, who))
     if ((mm = path.match(/^\/api\/me\/devices\/(\d+)$/)) && m === 'DELETE') {
+      // an admin weak session must not be able to kick the owner's real devices out
+      if (who.admin && Number(mm[1]) !== who.sessionId) requireStrongAdmin(who)
       await revokeSession(env, req, who, Number(mm[1]), false)
       return out({ ok: true })
     }
@@ -776,11 +809,11 @@ async function handle(req: Request, env: Env): Promise<Response> {
       if (!who.admin) throw new HttpError(403, 'admin_only')
       // reads: any admin session
       if (m === 'GET') {
-        if (path === '/api/admin/people') return out(await listPeople(env))
+        if (path === '/api/admin/people') return out(masked(await listPeople(env), who, ['phone']))
         if (path === '/api/admin/groups') return out(await listGroups(env))
-        if (path === '/api/admin/requests') return out(await listRequests(env))
+        if (path === '/api/admin/requests') return out(masked(await listRequests(env), who, ['typed_phone', 'sender_phone']))
         if (path === '/api/admin/devices') return out(await listAllDevices(env))
-        if (path === '/api/admin/audit') return out(await listAudit(env, url))
+        if (path === '/api/admin/audit') return out(masked(await listAudit(env, url), who, ['detail']))
         throw new HttpError(404, 'not_found')
       }
       // writes: passkey in the last 5 minutes
@@ -788,6 +821,10 @@ async function handle(req: Request, env: Env): Promise<Response> {
       if (path === '/api/admin/people' && m === 'POST') return out(await addPerson(env, req, who))
       if ((mm = path.match(/^\/api\/admin\/people\/(\d+)$/)) && m === 'POST') {
         await editPerson(env, req, who, Number(mm[1]))
+        return out({ ok: true })
+      }
+      if ((mm = path.match(/^\/api\/admin\/people\/(\d+)\/passkey-invite$/)) && m === 'POST') {
+        await createInvite(env, req, who, Number(mm[1]))
         return out({ ok: true })
       }
       if ((mm = path.match(/^\/api\/admin\/groups\/([a-z][a-z0-9-]{0,30})$/)) && m === 'POST') {

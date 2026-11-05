@@ -161,7 +161,7 @@ function renderAlerts() {
     el('strong', {}, T.newDevice(ME.person.name)),
     `${a.label || T.device}, ${when(a.created_at)}${a.place ? ', ' + a.place : ''}${a.current ? T.thisDevice : ''}. `,
     el('button', { onclick: () => guarded(async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await start() }) }, T.itWasMe),
-    a.current ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await rawApi('DELETE', `/api/me/devices/${a.id}`); await start() }) }, T.revoke))))
+    a.current || !a.live ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await start() }) }, T.revoke))))
 }
 
 function homeView() {
@@ -179,7 +179,7 @@ async function devicesView() {
     el('ul', { class: 'rows' }, list.map((d) => el('li', {},
       el('div', {}, el('strong', {}, d.label || T.device), d.current ? T.thisOne : ''),
       el('div', { class: 'muted' }, T.devLine(when(d.created_at), d.place, when(d.last_used_at))),
-      d.current ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await rawApi('DELETE', `/api/me/devices/${d.id}`); devicesView() }) }, T.disconnect))))))
+      d.current ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${d.id}`); devicesView() }) }, T.disconnect))))))
 }
 
 // ------------------------------------------------------------------ admin
@@ -233,7 +233,10 @@ async function adminView() {
         el('button', { onclick: () => guarded(async () => { await api('POST', `/api/admin/people/${p.id}`, { name: name.value, groups: checked(f, `pg${p.id}`) }); toast(T.saved); await start(); adminView() }) }, T.save),
         el('button', { class: p.status === 'blocked' ? '' : 'danger', onclick: () => guarded(async () => {
           await api('POST', `/api/admin/people/${p.id}`, { status: p.status === 'blocked' ? 'active' : 'blocked' }); adminView()
-        }) }, p.status === 'blocked' ? T.unblock : T.block))
+        }) }, p.status === 'blocked' ? T.unblock : T.block),
+        p.groups.includes('owner') && p.id !== ME.person.id
+          ? el('button', { class: 'link', onclick: () => guarded(async () => { await api('POST', `/api/admin/people/${p.id}/passkey-invite`, {}); toast(T.inviteSent) }) }, T.invitePasskey)
+          : null)
       return el('li', {}, f)
     })),
     el('h3', {}, T.addPerson), addForm)

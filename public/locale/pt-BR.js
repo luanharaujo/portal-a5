@@ -35,6 +35,8 @@ window.T = {
   passkeyCount: (n) => `${n} passkey(s). Cada mudança pede Face ID (vale 5 minutos).`,
   addAnotherPasskey: 'Cadastrar outra passkey',
   passkeyAdded: 'Passkey cadastrada.',
+  invitePasskey: 'Convidar para cadastrar passkey (24 h)',
+  inviteSent: 'Convite criado: a pessoa entra e cadastra a passkey em até 24 h.',
   requests: 'Pedidos para entrar',
   noRequests: 'Nenhum pedido.',
   reqLine: (typed, device, when, valid) => `digitou ${typed} · ${device} · ${when}${valid ? '' : ' · código vencido'}`,
@@ -87,5 +89,7 @@ window.T = {
     bad_origin: 'Pedido recusado pelo portal.',
     missing_x_portal: 'Pedido recusado pelo portal.',
     internal: 'Erro no portal. Tente de novo.',
+    admin_direct_only: 'Esse número é de administrador: ele entra digitando o próprio número.',
+    invite_admin_only: 'Convite de passkey só para administradores.',
   },
 }

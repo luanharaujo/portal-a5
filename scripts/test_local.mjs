@@ -161,6 +161,37 @@ check('wrong origin rejected', (await owner.req('POST', '/api/passkey/get/verify
 const go3 = await owner.req('POST', '/api/passkey/get/options', {})
 check('no user verification rejected', (await owner.req('POST', '/api/passkey/get/verify', await auth.get(go3.data, { uv: false }))).status === 400)
 
+// second admin: no first passkey from a weak session once the portal has one; an invite opens it
+const ADMIN2 = '5561900000004'
+check('owner adds a second admin', (await owner.req('POST', '/api/admin/people', { name: 'Admin2', phone: ADMIN2, groups: ['owner'] })).status === 200)
+const admin2 = client()
+const a2 = await signIn(admin2, ADMIN2, ADMIN2)
+check('second admin signed in (weak)', a2.status.data.status === 'ok', a2.status.data)
+check('weak admin: no passkey once the portal has one', (await admin2.req('POST', '/api/passkey/create/options', {})).status === 403)
+const kick = await admin2.req('DELETE', `/api/me/devices/${me.session_id}`)
+check('weak admin: revoking another device needs a passkey', kick.status === 403 && kick.data.passkey === true, kick)
+check('weak admin sees masked numbers', (await admin2.req('GET', '/api/admin/people')).data.every((p) => p.phone.includes('•')))
+const a2id = (await owner.req('GET', '/api/admin/people')).data.find((p) => p.phone === ADMIN2).id
+check('strong admin sees full numbers', !!a2id)
+check('owner invites second admin', (await owner.req('POST', `/api/admin/people/${a2id}/passkey-invite`, {})).status === 200)
+const auth2 = await makeAuthenticator()
+const co2 = await admin2.req('POST', '/api/passkey/create/options', {})
+check('invite opens passkey options', co2.status === 200, co2.data)
+check('invited admin registers passkey', (await admin2.req('POST', '/api/passkey/create/verify', await auth2.create(co2.data))).status === 200)
+const a2sid = (await admin2.req('GET', '/api/me')).data.session_id
+
+// a pending request whose sender is an admin can never be approved
+const trick = client()
+const tr = await signIn(trick, RESIDENT, OWNER)
+check('admin number sending someone else\'s code -> pending', tr.robot.data?.motivo === 'aguardando_dono', tr.robot.data)
+const trReq = (await owner.req('GET', '/api/admin/requests')).data.find((x) => x.sender_phone === OWNER)
+const trAp = await owner.req('POST', `/api/admin/requests/${trReq.id}/approve`, {})
+check('approving an admin sender = 409', trAp.status === 409 && trAp.data.error === 'admin_direct_only', trAp)
+check('refuse it', (await owner.req('POST', `/api/admin/requests/${trReq.id}/refuse`, {})).status === 200)
+
+// the owner revokes the second admin's session; its warning must stay (checked in the shell script)
+check('owner revokes the second admin device', (await owner.req('DELETE', `/api/admin/devices/${a2sid}`)).status === 200)
+
 // resident: sees only their tab, no admin
 const resident = client()
 const r1 = await signIn(resident, RESIDENT, RESIDENT)
