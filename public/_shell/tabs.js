@@ -28,7 +28,8 @@
     } catch { return null }
   }
 
-  const nameOf = (id) => (text().tabNames && text().tabNames[id]) || id
+  // a tab's name comes with the list (portal configuration); the account's from the locale
+  const nameOf = (e) => e.label || (text().tabNames && text().tabNames[e.id]) || e.id
   const shown = (n) => (n > 9 ? '9+' : String(n))
 
   function node(tag, cls, ...kids) {
@@ -46,6 +47,32 @@
     const p = document.createElementNS(SVG, 'path')
     p.setAttribute('d', 'M2 4l4 4 4-4')
     s.append(p)
+    return s
+  }
+
+  // Fixed line drawings (24x24, stroke only, current color), picked by name in the tab's
+  // configuration. Only these shapes are ever drawn; an unknown name draws nothing.
+  const ICONS = {
+    bolt: [['path', { d: 'M13 2 4 14h7l-1 8 9-12h-7z' }]],
+    mic: [['rect', { x: 9, y: 3, width: 6, height: 11, rx: 3 }], ['path', { d: 'M5 11a7 7 0 0 0 14 0M12 18v3' }]],
+    terminal: [['rect', { x: 3, y: 4, width: 18, height: 14, rx: 2 }], ['path', { d: 'm7 9 3 3-3 3M13 15h4' }]],
+    coin: [['circle', { cx: 12, cy: 12, r: 9 }], ['path', { d: 'M15 9.5c-.5-1-1.6-1.5-3-1.5-1.7 0-3 .8-3 2s1.3 1.7 3 2 3 .8 3 2-1.3 2-3 2c-1.4 0-2.5-.5-3-1.5M12 6v2M12 16v2' }]],
+    grid: [['rect', { x: 4, y: 4, width: 6, height: 6, rx: 1 }], ['rect', { x: 14, y: 4, width: 6, height: 6, rx: 1 }], ['rect', { x: 4, y: 14, width: 6, height: 6, rx: 1 }], ['rect', { x: 14, y: 14, width: 6, height: 6, rx: 1 }]],
+    person: [['circle', { cx: 12, cy: 8, r: 4 }], ['path', { d: 'M4 21c1-4 4-6 8-6s7 2 8 6' }]],
+  }
+
+  function icon(name) {
+    const parts = Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : null
+    if (!parts) return null
+    const s = document.createElementNS(SVG, 'svg')
+    s.setAttribute('viewBox', '0 0 24 24')
+    s.setAttribute('class', 'a5-tabs-icon')
+    s.setAttribute('aria-hidden', 'true')
+    for (const [tag, attrs] of parts) {
+      const e = document.createElementNS(SVG, tag)
+      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v))
+      s.append(e)
+    }
     return s
   }
 
@@ -81,8 +108,8 @@
     }
 
     function entries() {
-      const list = data.tabs.map((t) => ({ id: t.id, path: t.path, badge: t.badge, hint: t.entry === 'passkey' ? text().passkeyHint : null }))
-      list.push({ id: data.account.id, path: data.account.path, badge: null, hint: text().hints && text().hints[data.account.id], account: true })
+      const list = data.tabs.map((t) => ({ id: t.id, path: t.path, label: t.label, icon: t.icon, badge: t.badge, hint: t.entry === 'passkey' ? text().passkeyHint : null }))
+      list.push({ id: data.account.id, path: data.account.path, icon: 'person', badge: null, hint: text().hints && text().hints[data.account.id], account: true })
       return list
     }
 
@@ -95,14 +122,15 @@
         const current = e.id === data.current
         const it = node('button', 'a5-tabs-item' + (current ? ' a5-tabs-current' : ''),
           node('span', 'a5-tabs-check', current ? '✓' : ''),
-          node('span', 'a5-tabs-name', nameOf(e.id)),
+          icon(e.icon),
+          node('span', 'a5-tabs-name', nameOf(e)),
           e.hint ? node('span', 'a5-tabs-hint', e.hint) : null,
           e.badge ? node('span', 'a5-tabs-dot', shown(e.badge)) : null)
         it.type = 'button'
         it.setAttribute('role', 'menuitem')
         it.tabIndex = -1
         if (current) it.setAttribute('aria-current', 'page')
-        if (e.badge && text().waiting) it.setAttribute('aria-label', `${nameOf(e.id)}, ${text().waiting(e.badge)}`)
+        if (e.badge && text().waiting) it.setAttribute('aria-label', `${nameOf(e)}, ${text().waiting(e.badge)}`)
         it.addEventListener('click', () => choose(e))
         menu.append(it)
         items.push(it)

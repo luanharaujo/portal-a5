@@ -12,36 +12,31 @@ VARS="$STATE/test.vars"
 printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\n' "$(openssl rand -hex 32)" > "$VARS"
 KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 
-# The portal plus a fake tab worker bound as tabs: energia, jarvis, lento (slow badge),
-# torto (bad badge) and conta (a reserved name the portal must ignore). The config is
-# wrangler.toml with the tab bindings added, written next to it so relative paths still work.
+# The portal plus a fake tab worker bound as several tabs (test/fake_tab), written through the
+# same generator as a deploy. tab-a: session entry, screens allowed. tab-b: Face ID on entry.
+# tab-slow and tab-odd: badges that are slow or malformed. The portal must drop conta (a
+# reserved name), tab-bad (an unknown key) and tab-nopolicy (no policy written out).
 TESTCFG=".wrangler.test.toml"
-sed 's/^TABS = .*/TABS = "{\\"energia\\":\\"TAB_ENERGIA\\",\\"jarvis\\":\\"TAB_JARVIS\\",\\"lento\\":\\"TAB_LENTO\\",\\"torto\\":\\"TAB_TORTO\\",\\"conta\\":\\"TAB_ENERGIA\\"}"/' wrangler.toml > "$TESTCFG"
-cat >> "$TESTCFG" <<'EOF2'
-
-[[services]]
-binding = "TAB_ENERGIA"
-service = "portal-a5-fake-tab"
-entrypoint = "FakeTab"
-
-[[services]]
-binding = "TAB_JARVIS"
-service = "portal-a5-fake-tab"
-entrypoint = "FakeTab"
-
-[[services]]
-binding = "TAB_LENTO"
-service = "portal-a5-fake-tab"
-entrypoint = "SlowTab"
-
-[[services]]
-binding = "TAB_TORTO"
-service = "portal-a5-fake-tab"
-entrypoint = "OddTab"
+cat > "$STATE/tabs.json" <<'EOF2'
+{
+  "tab-a": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab A", "icon": "bolt",
+            "allow": ["screen-wake-lock"], "entry": "session", "credentials": ["browser", "screen", "machine"]},
+  "tab-b": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab B", "icon": "mic",
+            "allow": ["microphone", "screen-wake-lock"], "entry": "passkey", "entryHours": 4,
+            "credentials": ["browser", "machine"], "serviceWorker": false},
+  "tab-slow": {"service": "portal-a5-fake-tab", "entrypoint": "SlowTab", "allow": [], "entry": "session", "credentials": ["browser"]},
+  "tab-odd": {"service": "portal-a5-fake-tab", "entrypoint": "OddTab", "label": "Odd", "allow": [], "entry": "session", "credentials": ["browser"]},
+  "conta": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "allow": [], "entry": "session", "credentials": ["browser"]},
+  "tab-bad": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "allow": [], "entry": "session", "credentials": ["browser"], "camera": true},
+  "tab-nopolicy": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "No policy"}
+}
 EOF2
-grep -q '^TABS = "{\\"energia' "$TESTCFG" || { echo "FAIL could not write the test config"; exit 1; }
+python3 scripts/make_config.py "$STATE/tabs.json" > "$TESTCFG" 2>/dev/null
+grep -q '^TABS = "{\\"tab-a' "$TESTCFG" || { echo "FAIL could not write the test config"; exit 1; }
 
 npx wrangler d1 migrations apply portal_a5 --local --persist-to "$STATE" >/dev/null
+# residents see the first test tab (a fresh database gives them none)
+npx wrangler d1 execute portal_a5 --local --persist-to "$STATE" --command "UPDATE groups SET tabs = '[\"tab-a\"]' WHERE id = 'residents'" >/dev/null
 npx wrangler dev -c "$TESTCFG" -c test/fake_tab/wrangler.toml --local --ip 127.0.0.1 --port "$PORT" --persist-to "$STATE" --env-file "$VARS" >"$LOG" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -rf "$STATE" "$TESTCFG"' EXIT

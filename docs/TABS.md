@@ -15,14 +15,14 @@ preview_urls = false
 It exports a `WorkerEntrypoint` class, and its default `fetch` answers 404 to everything. The portal binds that class with one service binding:
 
 ```toml
-# portal wrangler.toml
+# generated at deploy time
 [[services]]
 binding = "TAB_NOTES"
 service = "portal-a5-notes"
 entrypoint = "NotesTab"
 ```
 
-plus `TABS = '{"notes":"TAB_NOTES"}'`. The order of `TABS` is the order of the tab selector (section 9). A tab can't be named `api`, `robo`, `conta`, `locale` or `vendor` (the portal ignores such a binding). Through that single binding the portal calls these:
+Which tabs exist, and each one's policy, label and icon, live outside the code: in `.tabs.local.json` on the deploying machine (git-ignored; format in `tabs.example.json`). `scripts/deploy.sh` turns it into the bindings above plus the `TABS` variable of the portal Worker, which the portal validates on start (`parseTabs` in `src/tabs.ts`). Nobody can change it from the web. The order of the file is the order of the tab selector (section 9). A tab can't be named `api`, `robo`, `conta`, `locale` or `vendor`. Through that single binding the portal calls these:
 
 | Call | When | Identity |
 |---|---|---|
@@ -88,15 +88,30 @@ So a tab page: scripts and styles in files under its own path, `textContent` for
 
 ## 4. Policy per tab (decided by the portal)
 
-One line per tab in `TAB_POLICY` (`src/tabs.ts`):
+One entry per tab in the tab configuration (section 1):
 
-| Field | Meaning | Default |
+```json
+{
+  "notes": {
+    "service": "portal-a5-notes", "entrypoint": "NotesTab",
+    "label": "Notes", "icon": "grid",
+    "allow": ["screen-wake-lock"], "entry": "session", "credentials": ["browser", "screen", "machine"]
+  }
+}
+```
+
+| Field | Meaning | Required |
 |---|---|---|
-| `allow` | browser features the tab's pages may use (`microphone`, `screen-wake-lock`, ...) | none |
-| `entry` | `session`: a session with access is enough; `passkey`: Face ID on every entry | `session` |
-| `entryHours` | with `passkey`: how long requests inside the tab are accepted after an entry | 0 |
-| `credentials` | which of `browser`, `screen`, `machine` may reach the tab | browser, machine |
-| `serviceWorker` | `false` refuses service worker registration | true |
+| `service`, `entrypoint` | the tab Worker and its `WorkerEntrypoint` class (used by the deploy only) | yes |
+| `allow` | browser features the tab's pages may use (`microphone`, `screen-wake-lock`, ...); `[]` for none | yes |
+| `entry` | `session`: a session with access is enough; `passkey`: Face ID on every entry | yes |
+| `entryHours` | with `passkey`: how long requests inside the tab are accepted after an entry, more than 0 and at most 24 | with `passkey` |
+| `credentials` | which of `browser`, `screen`, `machine` may reach the tab, at least one | yes |
+| `serviceWorker` | `false` refuses service worker registration; always `false` with `passkey` | no (true) |
+| `label` | the tab's name in the selector (up to 40 characters) | no (the tab id) |
+| `icon` | one of the selector's drawings: `bolt`, `mic`, `terminal`, `coin`, `grid` | no (none) |
+
+Fail closed: there is no default policy. A tab whose entry misses `allow`, `entry` or `credentials`, has an unknown key or a value out of range is not bound at all (its path answers 404) and the portal logs `tab config refused`. After a deploy, check `GET /api/tabs` (a passkey tab must say `"entry": "passkey"`).
 
 `Permissions-Policy` lists camera, microphone, geolocation, screen-wake-lock, display-capture, usb, serial, bluetooth, hid and payment as `()` everywhere except what the tab is allowed, which gets `(self)`. Several of these default to `self` when left out, so they are always written down. A tab that needs a new feature asks the portal; it cannot add it itself.
 
@@ -210,7 +225,7 @@ There is no home page. `/` opens the last tab used on that device (`localStorage
 <script src="/locale/pt-BR.js" defer></script>
 <script src="/_shell/tabs.js" defer></script>
 ...
-<h1><button type="button" data-a5-tabs>Painel de Energia da Casa</button></h1>
+<h1><button type="button" data-a5-tabs>Notes</button></h1>
 ```
 
 - The script asks `GET /api/tabs?current=<tab>`, adds an SVG arrow and the dot to the marked title and turns it into a menu button. With no selector (fixed screens, signed out, any error) the title stays a plain title, and `tabs.css` keeps a marked `<button>` looking like the title around it.
@@ -226,16 +241,16 @@ Session required (401 otherwise), GET only, `Cache-Control: no-store`.
 ```json
 {
   "selector": true,
-  "current": "energia",
+  "current": "notes",
   "tabs": [
-    {"id": "energia", "path": "/energia/", "badge": null, "entry": "session"},
-    {"id": "jarvis", "path": "/jarvis/", "badge": 2, "entry": "passkey"}
+    {"id": "notes", "path": "/notes/", "label": "Notes", "icon": "grid", "badge": null, "entry": "session"},
+    {"id": "voice", "path": "/voice/", "label": "Voice", "icon": "mic", "badge": 2, "entry": "passkey"}
   ],
   "account": {"id": "conta", "path": "/conta/"}
 }
 ```
 
-- `tabs`: the tabs this session can open (group and the tab's `credentials` policy, the same rule as `/<tab>/*`), in `TABS` order. Tab names come from the locale by `id`.
+- `tabs`: the tabs this session can open (group and the tab's `credentials` policy, the same rule as `/<tab>/*`), in configuration order, with the configured `label` and `icon` (or null). The account's name comes from the locale.
 - `selector` is `false` for a fixed screen (`credential: 'screen'`): plain title, no counts.
 - `current` is the `current` query echoed back only when it is `conta` or a listed tab.
 - `entry: "passkey"` shows "Face ID" next to the tab in the list.

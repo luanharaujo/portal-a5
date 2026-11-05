@@ -42,17 +42,11 @@ DB_ID="$(db_id)"
 if [ -z "$DB_ID" ]; then npx wrangler d1 create portal_a5 >/dev/null; DB_ID="$(db_id)"; fi
 [ -n "$DB_ID" ] || { echo "could not find or create D1 portal_a5" >&2; exit 1; }
 
-# 3. deploy config = wrangler.toml + real ids (git-ignored)
+# 3. deploy config = wrangler.toml + real ids + the tabs (all git-ignored). Tabs come from
+# .tabs.local.json (see tabs.example.json): one service binding each, and the TABS variable the
+# worker validates. No file = no tabs.
 CFG=.wrangler.deploy.toml
-python3 - "$DB_ID" "$CLOUDFLARE_ACCOUNT_ID" > "$CFG" <<'PY'
-import sys, re
-db, acct = sys.argv[1], sys.argv[2]
-s = open('wrangler.toml').read()
-s = s.replace('database_id = "00000000-0000-0000-0000-000000000000"', f'database_id = "{db}"')
-s = re.sub(r'^(main = .*)$', rf'\1\naccount_id = "{acct}"', s, count=1, flags=re.M)
-assert f'database_id = "{db}"' in s and 'account_id' in s
-print(s)
-PY
+python3 scripts/make_config.py .tabs.local.json "$DB_ID" "$CLOUDFLARE_ACCOUNT_ID" > "$CFG"
 
 npx tsc --noEmit
 

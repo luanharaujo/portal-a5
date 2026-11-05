@@ -39,6 +39,8 @@ button[data-a5-tabs] {
 .a5-tabs-item:focus-visible { outline: 2px solid var(--a5t-check); outline-offset: -2px; }
 .a5-tabs-current { background: var(--a5t-current); }
 .a5-tabs-check { width: 1em; color: var(--a5t-check); font-weight: 700; }
+.a5-tabs-icon { width: 1.3em; height: 1.3em; flex: none; margin-right: 2px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.a5-tabs-current .a5-tabs-icon { stroke: var(--a5t-check); }
 .a5-tabs-name { font-weight: 600; }
 .a5-tabs-hint { color: var(--a5t-muted); font-size: .85em; }
 .a5-tabs-item .a5-tabs-dot { margin-left: auto; font-size: .8em; min-width: 1.5em; height: 1.5em; border-radius: .75em; }

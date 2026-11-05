@@ -13,7 +13,9 @@ binding = "ASSETS"
 not_found_handling = "none"
 
 [vars]
-# Tab name -> service binding name, e.g. {"energia":"TAB_ENERGIA"}. Empty until tabs exist.
+# Tabs and their policy, e.g. {"notes":{"binding":"TAB_NOTES","label":"Notes","icon":"grid"}}.
+# Left empty here: scripts/deploy.sh fills it, and the [[services]] bindings, from .tabs.local.json
+# (git-ignored; format in tabs.example.json). The worker validates it (src/tabs.ts, parseTabs).
 TABS = "{}"
 # Screen pairing whose request came from another IP than the approving phone: "refuse"
 # (screens are paired on the same network as the phone) or "warn" (red warning only).
@@ -27,10 +29,8 @@ database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
 # Tabs are private workers (workers_dev = false, preview_urls = false, no route) that export a
-# WorkerEntrypoint with handle(request, identity); their default fetch answers 404.
-# [[services]]
-# binding = "TAB_ENERGIA"
-# service = "portal-a5-energia"
+# WorkerEntrypoint with handle(request, identity); their default fetch answers 404. Their
+# [[services]] bindings are added at deploy time from .tabs.local.json.
 
 # Secrets (never in this file):
 #   ROBOT_LOGIN_KEY  "pa5_robo_" + 32 random bytes; shared with the WhatsApp reader,

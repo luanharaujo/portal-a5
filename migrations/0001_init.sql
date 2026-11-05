@@ -11,7 +11,7 @@ CREATE TABLE groups (
 
 INSERT INTO groups (id, name, tabs, is_admin) VALUES
   ('owner', 'Owner', '["*"]', 1),
-  ('residents', 'Residents', '["energia"]', 0);
+  ('residents', 'Residents', '[]', 0);
 
 CREATE TABLE people (
   id INTEGER PRIMARY KEY,

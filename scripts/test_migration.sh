@@ -35,7 +35,7 @@ seed() { # seed <state dir> <config>: migrations 0001-0003 + owner, session, pas
       VALUES (7, 1, '$HASH', 'browser', 'iPhone · Safari', '2026-11-05T12:08:00.000Z', '2026-11-05T12:08:00.000Z', '2027-05-04T12:08:00.000Z', '2026-11-05T12:10:00.000Z');
     INSERT INTO passkeys (person_id, credential_id, public_key, sign_count, label, created_at)
       VALUES (1, 'cred-test', 'pk-test', 3, 'iPhone', '2026-11-05T12:10:00.000Z');
-    INSERT INTO tab_entries (session_id, tab, granted_at) VALUES (99, 'jarvis', '2026-11-05T12:00:00.000Z');" >/dev/null
+    INSERT INTO tab_entries (session_id, tab, granted_at) VALUES (99, 'tab-b', '2026-11-05T12:00:00.000Z');" >/dev/null
 }
 
 # --- 1. all-or-nothing

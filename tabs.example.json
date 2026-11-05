@@ -1,0 +1,23 @@
+{
+  "notes": {
+    "service": "portal-a5-notes",
+    "entrypoint": "NotesTab",
+    "label": "Notes",
+    "icon": "grid",
+    "allow": ["screen-wake-lock"],
+    "entry": "session",
+    "credentials": ["browser", "screen", "machine"],
+    "serviceWorker": true
+  },
+  "voice": {
+    "service": "portal-a5-voice",
+    "entrypoint": "VoiceTab",
+    "label": "Voice",
+    "icon": "mic",
+    "allow": ["microphone", "screen-wake-lock"],
+    "entry": "passkey",
+    "entryHours": 4,
+    "credentials": ["browser", "machine"],
+    "serviceWorker": false
+  }
+}

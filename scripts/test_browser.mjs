@@ -91,7 +91,7 @@ export async function browserChecks({ base, check, owner, resident, screen }) {
 
     // the owner on a tab page using the selector, under the tab's real CSP
     const o = await page(b, base, owner)
-    await o.go('/energia/page')
+    await o.go('/tab-a/page')
     check('browser: selector mounts on a tab page under the tab CSP', await o.waitFor(ON))
     check('browser: no CSP violation or error on the tab page', !o.log.some((t) => /Content Security Policy|exception/i.test(t)), o.log)
     const t = await o.evaluate(`(() => { const b = document.querySelector('[data-a5-tabs]'); return {
@@ -100,22 +100,25 @@ export async function browserChecks({ base, check, owner, resident, screen }) {
       font: getComputedStyle(b).fontSize === getComputedStyle(b.parentElement).fontSize } })()`)
     check('browser: title is a menu button with an SVG arrow, same size as the title', t.popup === 'menu' && t.expanded === 'false' && t.svg && t.font, t)
     check('browser: dot = what waits in the other tabs', t.dot === '3', t)
-    check('browser: the tab page records itself as the last tab', t.last === 'energia', t)
+    check('browser: the tab page records itself as the last tab', t.last === 'tab-a', t)
 
     await o.evaluate(`document.querySelector('[data-a5-tabs]').focus()`)
     await press(o, 'Enter')
     const m = await o.evaluate(`(() => { const m = document.querySelector('[role=menu]'); if (!m) return null; const it = [...m.querySelectorAll('[role=menuitem]')]; return {
       names: it.map((i) => i.querySelector('.a5-tabs-name').textContent), sep: !!m.querySelector('.a5-tabs-sep'),
       current: it.findIndex((i) => i.getAttribute('aria-current') === 'page'), check: it[0].querySelector('.a5-tabs-check').textContent,
-      focused: it.indexOf(document.activeElement), jarvisHint: it[1].querySelector('.a5-tabs-hint')?.textContent,
-      jarvisDot: it[1].querySelector('.a5-tabs-dot')?.textContent, heights: it.map((i) => i.getBoundingClientRect().height),
+      focused: it.indexOf(document.activeElement), passkeyHint: it[1].querySelector('.a5-tabs-hint')?.textContent,
+      passkeyDot: it[1].querySelector('.a5-tabs-dot')?.textContent, heights: it.map((i) => i.getBoundingClientRect().height),
       expanded: document.querySelector('[data-a5-tabs]').getAttribute('aria-expanded') } })()`)
-    check('browser: Enter opens the list with every tab, then Conta after a line', m && m.names.join() === 'Energia,Jarvis,lento,torto,Conta' && m.sep && m.expanded === 'true', m)
+    check('browser: Enter opens the list with every tab, then Conta after a line', m && m.names.join() === 'Tab A,Tab B,tab-slow,Odd,Conta' && m.sep && m.expanded === 'true', m)
     check('browser: current tab marked and focused', m && m.current === 0 && m.check === '✓' && m.focused === 0, m)
-    check('browser: Jarvis shows Face ID and its own count', m && m.jarvisHint === 'Face ID' && m.jarvisDot === '3', m)
+    check('browser: the Face ID tab says so and shows its own count', m && m.passkeyHint === 'Face ID' && m.passkeyDot === '3', m)
+    const ic = await o.evaluate(`[...document.querySelectorAll('[role=menuitem]')].map((i) => { const s = i.querySelector('svg.a5-tabs-icon'); return s ? getComputedStyle(s).stroke : null })`)
+    check('browser: configured icons drawn, the current one in the accent color; none without an icon',
+      ic[0] === 'rgb(246, 183, 60)' && ic[1] && ic[1] !== ic[0] && ic[2] === null && ic[3] === null && ic[4], ic)
     check('browser: items at least 44 px tall', await o.waitFor(`[...document.querySelectorAll('[role=menuitem]')].every((i) => i.getBoundingClientRect().height >= 44)`, 2000), m)
     await press(o, 'ArrowDown')
-    check('browser: arrow down moves to the next tab', await o.evaluate(`document.activeElement.textContent.includes('Jarvis')`))
+    check('browser: arrow down moves to the next tab', await o.evaluate(`document.activeElement.textContent.includes('Tab B')`))
     await press(o, 'Tab'); await press(o, 'Tab'); await press(o, 'Tab'); await press(o, 'Tab')
     check('browser: Tab keeps the focus inside the open list', await o.evaluate(`!!document.activeElement.closest('[role=menu]')`))
     await press(o, 'Escape')
@@ -138,32 +141,32 @@ export async function browserChecks({ base, check, owner, resident, screen }) {
     // "/" opens the last tab on this device
     await o.go('/')
     check('browser: "/" opens the last tab (Conta)', await o.waitFor(`location.pathname === '/conta/' && ${ON}`))
-    await o.evaluate(`localStorage.setItem('a5.lastTab', 'energia')`)
+    await o.evaluate(`localStorage.setItem('a5.lastTab', 'tab-a')`)
     await o.go('/')
-    check('browser: "/" opens the last tab (Energia)', await o.waitFor(`location.pathname === '/energia/'`))
+    check('browser: "/" opens the last tab (Tab A)', await o.waitFor(`location.pathname === '/tab-a/'`))
     await o.evaluate(`localStorage.setItem('a5.lastTab', 'gone')`)
     await o.go('/')
-    check('browser: unknown last tab: "/" opens the first tab', await o.waitFor(`location.pathname === '/energia/'`))
+    check('browser: unknown last tab: "/" opens the first tab', await o.waitFor(`location.pathname === '/tab-a/'`))
 
-    // a resident: Energia + Conta, no dot
+    // a resident: Tab A + Conta, no dot
     const r = await page(b, base, resident)
-    await r.go('/energia/page')
+    await r.go('/tab-a/page')
     check('browser: resident gets the selector', await r.waitFor(ON))
     await r.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
     await r.waitFor(`!!document.querySelector('[role=menu]')`)
     const rm = await r.evaluate(`({ names: [...document.querySelectorAll('[role=menuitem] .a5-tabs-name')].map((x) => x.textContent),
       dot: document.querySelector('[data-a5-tabs] > .a5-tabs-dot').hidden })`)
-    check('browser: resident sees Energia and Conta only, no dot', rm.names.join() === 'Energia,Conta' && rm.dot === true, rm)
+    check('browser: resident sees Tab A and Conta only, no dot', rm.names.join() === 'Tab A,Conta' && rm.dot === true, rm)
 
     // a fixed screen: plain title, and "/" goes straight to its tab
     if (screen) {
       const s = await page(b, base, screen)
-      await s.go('/energia/page')
+      await s.go('/tab-a/page')
       await sleep(800)
       const st = await s.evaluate(`(() => { const b = document.querySelector('[data-a5-tabs]'); return { on: b.dataset.a5TabsOn || null, svg: !!b.querySelector('svg'), popup: b.getAttribute('aria-haspopup') } })()`)
       check('browser: fixed screen keeps a plain title (no arrow, no menu)', st.on === null && !st.svg && st.popup === null, st)
       await s.go('/')
-      check('browser: fixed screen "/" opens its tab', await s.waitFor(`location.pathname === '/energia/'`))
+      check('browser: fixed screen "/" opens its tab', await s.waitFor(`location.pathname === '/tab-a/'`))
     }
 
     // signed out: "/" and /conta/ show the sign-in page, title without a selector

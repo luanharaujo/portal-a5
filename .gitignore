@@ -10,3 +10,4 @@ node_modules/
 .wrangler.deploy.toml
 .deploy.local
 .wrangler.test.toml
+.tabs.local.json

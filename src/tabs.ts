@@ -42,6 +42,7 @@ export const RESERVED_TABS = ['api', 'robo', 'conta', 'locale', 'vendor']
 export const SHELL_SCRIPTS = ['/_shell/tabs.js', '/locale/pt-BR.js']
 export const SHELL_API = '/api/tabs'
 
+// What the portal enforces for one tab. Set per tab in the TABS configuration (see parseTabs).
 export interface TabPolicy {
   // browser features this tab's pages may use (everything else stays off)
   allow: string[]
@@ -55,16 +56,80 @@ export interface TabPolicy {
   serviceWorker: boolean
 }
 
-const DEFAULT_POLICY: TabPolicy = { allow: [], entry: 'session', entryHours: 0, credentials: ['browser', 'machine'], serviceWorker: true }
+const CLOSED_POLICY: TabPolicy = { allow: [], entry: 'passkey', entryHours: 0, credentials: [], serviceWorker: false }
 
-export const TAB_POLICY: Record<string, Partial<TabPolicy>> = {
-  // fixed screens show the energy panel and keep the display awake
-  energia: { allow: ['screen-wake-lock'], credentials: ['browser', 'screen', 'machine'] },
-  // voice conversation; Face ID on every entry, free inside
-  jarvis: { allow: ['microphone', 'screen-wake-lock'], entry: 'passkey', entryHours: 4, credentials: ['browser', 'machine'], serviceWorker: false },
+// Drawings the selector knows (public/_shell/tabs.js). A tab picks one by name.
+export const TAB_ICONS = ['bolt', 'mic', 'terminal', 'coin', 'grid']
+
+// One tab as configured outside the code: the binding, how the selector shows it, and its policy.
+export interface TabConfig extends TabPolicy {
+  binding: string
+  label: string | null
+  icon: string | null
 }
 
-export const policyOf = (tab: string): TabPolicy => ({ ...DEFAULT_POLICY, ...(TAB_POLICY[tab] ?? {}) })
+// The TABS variable is generated at deploy time from a file kept out of git (scripts/deploy.sh):
+//   {"<tab>": {"binding": "TAB_X", "label": "...", "icon": "bolt", "allow": [...], "entry": "session",
+//              "entryHours": 0, "credentials": ["browser"], "serviceWorker": true}}
+// Fail closed: allow, entry and credentials must be written out for every tab (no default policy),
+// and anything that does not validate drops the whole tab, logged. A dropped tab answers 404.
+export function parseTabs(raw: string | undefined): Record<string, TabConfig> {
+  let all: unknown
+  try { all = JSON.parse(raw || '{}') } catch { console.error('TABS is not JSON'); return {} }
+  if (!all || typeof all !== 'object' || Array.isArray(all)) return {}
+  const out: Record<string, TabConfig> = {}
+  for (const [tab, v] of Object.entries(all as Record<string, unknown>)) {
+    const c = validTab(tab, v)
+    if (c) out[tab] = c
+    else console.error('tab config refused', tab)
+  }
+  return out
+}
+
+const CREDENTIALS: Credential[] = ['browser', 'screen', 'machine']
+const isList = (v: unknown, ok: string[]) => Array.isArray(v) && v.every((x) => typeof x === 'string' && ok.includes(x))
+
+function validTab(tab: string, v: unknown): TabConfig | null {
+  if (!/^[a-z][a-z0-9-]{0,30}$/.test(tab) || RESERVED_TABS.includes(tab)) return null
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+  const o = v as Record<string, unknown>
+  const known = ['binding', 'label', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker']
+  if (Object.keys(o).some((k) => !known.includes(k))) return null
+  if (typeof o.binding !== 'string' || !/^[A-Z][A-Z0-9_]{0,40}$/.test(o.binding)) return null
+  if (o.label != null && (typeof o.label !== 'string' || !o.label.trim() || o.label.length > 40 || /[\u0000-\u001f<>]/.test(o.label))) return null
+  if (o.icon != null && (typeof o.icon !== 'string' || !TAB_ICONS.includes(o.icon))) return null
+  if (!isList(o.allow, FEATURES)) return null
+  if (o.entry !== 'session' && o.entry !== 'passkey') return null
+  if (!isList(o.credentials, CREDENTIALS) || !(o.credentials as string[]).length) return null
+  if (o.serviceWorker != null && typeof o.serviceWorker !== 'boolean') return null
+  const entry = o.entry as TabPolicy['entry']
+  const hours = o.entryHours ?? 0
+  if (typeof hours !== 'number' || !Number.isFinite(hours) || hours < 0 || hours > 24) return null
+  if (entry === 'passkey' && hours <= 0) return null
+  return {
+    binding: o.binding, label: (o.label as string | undefined)?.trim() ?? null, icon: (o.icon as string | undefined) ?? null,
+    allow: [...new Set(o.allow as string[])],
+    entry,
+    entryHours: entry === 'passkey' ? hours : 0,
+    credentials: [...new Set(o.credentials as Credential[])],
+    // a cached page would skip the Face ID check on entry
+    serviceWorker: entry === 'passkey' ? false : ((o.serviceWorker as boolean | undefined) ?? true),
+  }
+}
+
+// The router reads the configuration once per isolate (re-parsed only if the variable changes).
+let loadedRaw: string | undefined
+let loaded: Record<string, TabConfig> = {}
+export function tabsConfig(raw: string | undefined): Record<string, TabConfig> {
+  if (raw !== loadedRaw) { loaded = parseTabs(raw); loadedRaw = raw }
+  return loaded
+}
+
+export const policyOf = (tab: string): TabPolicy => {
+  const c = loaded[tab]
+  // a tab that is not configured is never routed (no binding); this answer only keeps callers simple
+  return c ? { allow: c.allow, entry: c.entry, entryHours: c.entryHours, credentials: c.credentials, serviceWorker: c.serviceWorker } : { ...CLOSED_POLICY }
+}
 
 // Features a page could ask for. Listed as () unless the tab allows them, because several
 // (microphone, camera, screen-wake-lock) default to 'self' when the header leaves them out.

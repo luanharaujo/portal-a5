@@ -199,7 +199,7 @@ const resident = client()
 const r1 = await signIn(resident, RESIDENT, RESIDENT)
 check('resident ok', r1.status.data.status === 'ok', [r1.robot.data, r1.status.data])
 const rme = (await resident.req('GET', '/api/me')).data
-check('resident tabs = energia, not admin', rme.admin === false && rme.tabs.join() === 'energia', rme)
+check('resident tabs = tab-a, not admin', rme.admin === false && rme.tabs.join() === 'tab-a', rme)
 check('resident admin read = 403', (await resident.req('GET', '/api/admin/people')).status === 403)
 check('resident cannot register passkey', (await resident.req('POST', '/api/passkey/create/options', {})).status === 403)
 
@@ -247,7 +247,7 @@ for (const a of ['login_admin', 'passkey_added', 'passkey_ok', 'person_added', '
 check('audit marks strength', auditRows.some((a) => a.strength === 'strong') && auditRows.some((a) => a.strength === 'weak'))
 
 // ------------------------------------------------------------------ stage 2: tabs, screens, bridges
-// Two tabs are bound to a fake tab worker (test/fake_tab): energia (residents) and jarvis
+// Two tabs are bound to a fake tab worker (test/fake_tab): tab-a (residents) and tab-b
 // (owner only, Face ID on every entry). The fake tab echoes what it receives.
 const NAV = { 'Sec-Fetch-Mode': 'navigate', Accept: 'text/html' }
 const CORS = { 'Sec-Fetch-Mode': 'cors', Accept: 'application/json' }
@@ -284,14 +284,14 @@ function rawGet(path, headers) {
 }
 const upgradeStatus = async (path, headers) => (await rawGet(path, { Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': Buffer.from(wc.getRandomValues(new Uint8Array(16))).toString('base64'), ...headers })).status
 const navigate = (c, path) => rawGet(path, { ...NAV, ...(c.cookie ? { Cookie: c.cookie } : {}) })
-const tabRevoked = async () => (await resident.req('GET', '/energia/revoked', undefined, CORS)).data
+const tabRevoked = async () => (await resident.req('GET', '/tab-a/revoked', undefined, CORS)).data
 
 // signed out
-check('tab signed out: navigation redirects to sign-in', (await navigate(anon, '/energia/')).headers.get('location') === '/?next=%2Fenergia%2F')
-check('tab signed out: fetch = 401', (await anon.req('GET', '/energia/echo', undefined, CORS)).status === 401)
+check('tab signed out: navigation redirects to sign-in', (await navigate(anon, '/tab-a/')).headers.get('location') === '/?next=%2Ftab-a%2F')
+check('tab signed out: fetch = 401', (await anon.req('GET', '/tab-a/echo', undefined, CORS)).status === 401)
 
 // identity and request headers
-const echo = await resident.req('GET', '/energia/echo', undefined, {
+const echo = await resident.req('GET', '/tab-a/echo', undefined, {
   ...CORS, 'X-Portal-Person': 'owner', 'X-A5-Identity': '{"person":1,"groups":["owner"]}', Authorization: 'Bearer x', 'X-A5-Machine-Key': 'pa5_maq_fake',
 })
 const id = echo.data.identity
@@ -301,81 +301,81 @@ const fh = echo.data.headers || {}
 check('forged portal headers never reach the tab', !('x-portal-person' in fh) && !('x-a5-identity' in fh) && !('x-a5-machine-key' in fh), fh)
 check('tab never sees Cookie or Authorization', !('cookie' in fh) && !('authorization' in fh), fh)
 
-const bad = (await navigate(resident, '/energia/html'))
+const bad = (await navigate(resident, '/tab-a/html'))
 check('Set-Cookie from the tab removed', !/stolen/.test(bad.setCookie || ''), bad.setCookie)
 check('tab cannot send Clear-Site-Data, Service-Worker-Allowed or CORS', !bad.headers.get('clear-site-data') && !bad.headers.get('service-worker-allowed') &&
   ![...bad.headers.keys()].some((k) => k.startsWith('access-control-')))
 const tabCspE = bad.headers.get('content-security-policy') || ''
-check('portal CSP replaces the tab CSP (inline script blocked)', tabCspE.includes(`script-src ${BASE}/energia/ ${BASE}/_shell/tabs.js ${BASE}/locale/pt-BR.js;`) && !/unsafe-inline|\*/.test(tabCspE) && tabCspE.includes("frame-ancestors 'none'"), tabCspE)
-check('tab CSP: connect only under the tab path plus /api/tabs; form-action only the tab', tabCspE.includes(`connect-src ${BASE}/energia/ ${WS_BASE}/energia/ ${BASE}/api/tabs;`) && tabCspE.includes(`form-action ${BASE}/energia/`), tabCspE)
+check('portal CSP replaces the tab CSP (inline script blocked)', tabCspE.includes(`script-src ${BASE}/tab-a/ ${BASE}/_shell/tabs.js ${BASE}/locale/pt-BR.js;`) && !/unsafe-inline|\*/.test(tabCspE) && tabCspE.includes("frame-ancestors 'none'"), tabCspE)
+check('tab CSP: connect only under the tab path plus /api/tabs; form-action only the tab', tabCspE.includes(`connect-src ${BASE}/tab-a/ ${WS_BASE}/tab-a/ ${BASE}/api/tabs;`) && tabCspE.includes(`form-action ${BASE}/tab-a/`), tabCspE)
 const cspPart = (csp, d) => (csp.split(';').map((x) => x.trim()).find((x) => x.startsWith(d + ' ')) || '').split(' ').slice(1)
-check('tab CSP: the only portal scripts are the two shell files', cspPart(tabCspE, 'script-src').join() === [`${BASE}/energia/`, `${BASE}/_shell/tabs.js`, `${BASE}/locale/pt-BR.js`].join(), cspPart(tabCspE, 'script-src'))
-check('tab CSP: the only portal API is /api/tabs (no /api/ prefix, no self)', cspPart(tabCspE, 'connect-src').join() === [`${BASE}/energia/`, `${WS_BASE}/energia/`, `${BASE}/api/tabs`].join(), cspPart(tabCspE, 'connect-src'))
-check('portal pages keep the portal CSP', ownerCsp.includes("script-src 'self'") && !ownerCsp.includes('/energia/'), ownerCsp)
+check('tab CSP: the only portal scripts are the two shell files', cspPart(tabCspE, 'script-src').join() === [`${BASE}/tab-a/`, `${BASE}/_shell/tabs.js`, `${BASE}/locale/pt-BR.js`].join(), cspPart(tabCspE, 'script-src'))
+check('tab CSP: the only portal API is /api/tabs (no /api/ prefix, no self)', cspPart(tabCspE, 'connect-src').join() === [`${BASE}/tab-a/`, `${WS_BASE}/tab-a/`, `${BASE}/api/tabs`].join(), cspPart(tabCspE, 'connect-src'))
+check('portal pages keep the portal CSP', ownerCsp.includes("script-src 'self'") && !ownerCsp.includes('/tab-a/'), ownerCsp)
 check('tab page keeps nosniff and DENY', bad.headers.get('x-content-type-options') === 'nosniff' && bad.headers.get('x-frame-options') === 'DENY')
 const ppE = bad.headers.get('permissions-policy') || ''
-check('energia: wake lock on, microphone off', ppE.includes('screen-wake-lock=(self)') && ppE.includes('microphone=()') && ppE.includes('camera=()'), ppE)
+check('tab-a: wake lock on, microphone off', ppE.includes('screen-wake-lock=(self)') && ppE.includes('microphone=()') && ppE.includes('camera=()'), ppE)
 const ppHome = home.headers.get('permissions-policy') || ''
 check('portal pages: microphone and wake lock off', ppHome.includes('microphone=()') && ppHome.includes('screen-wake-lock=()'), ppHome)
 
 // writes to a tab follow the portal's CSRF rule
-check('tab POST without X-Portal = 403', (await resident.req('POST', '/energia/echo', { a: 1 }, { 'X-Portal': undefined })).status === 403)
-check('tab POST from other origin = 403', (await resident.req('POST', '/energia/echo', { a: 1 }, { Origin: 'https://evil.example' })).status === 403)
-const post = await resident.req('POST', '/energia/echo', { a: 1 })
+check('tab POST without X-Portal = 403', (await resident.req('POST', '/tab-a/echo', { a: 1 }, { 'X-Portal': undefined })).status === 403)
+check('tab POST from other origin = 403', (await resident.req('POST', '/tab-a/echo', { a: 1 }, { Origin: 'https://evil.example' })).status === 403)
+const post = await resident.req('POST', '/tab-a/echo', { a: 1 })
 check('tab POST body reaches the tab', post.status === 200 && post.data.body === '{"a":1}', post.data)
-check('tab streams pass through', (await resident.req('GET', '/energia/stream', undefined, CORS)).data === 'data: one\n\n')
+check('tab streams pass through', (await resident.req('GET', '/tab-a/stream', undefined, CORS)).data === 'data: one\n\n')
 
 // no tab in the group
-check('resident on jarvis = 403', (await resident.req('GET', '/jarvis/echo', undefined, CORS)).status === 403)
-check('resident navigating to jarvis = 403', (await navigate(resident, '/jarvis/')).status === 403)
+check('resident on tab-b = 403', (await resident.req('GET', '/tab-b/echo', undefined, CORS)).status === 403)
+check('resident navigating to tab-b = 403', (await navigate(resident, '/tab-b/')).status === 403)
 
 // audit through X-Tab-Audit
-const au = await resident.req('GET', '/energia/audit', undefined, CORS)
+const au = await resident.req('GET', '/tab-a/audit', undefined, CORS)
 check('X-Tab-Audit stripped from the answer', au.status === 200 && !au.headers.get('x-tab-audit'))
-await resident.req('GET', '/energia/badaudit', undefined, CORS)
+await resident.req('GET', '/tab-a/badaudit', undefined, CORS)
 let rows = (await owner.req('GET', '/api/admin/audit')).data
-const tabRow = rows.find((a) => a.action === 'energia.turn_on')
+const tabRow = rows.find((a) => a.action === 'tab-a.turn_on')
 check('tab audit recorded with the portal\'s person', tabRow && tabRow.person_id === residentId && tabRow.target === 'ac:living' && /"credential":"browser"/.test(tabRow.detail), tabRow)
-check('malformed tab audit recorded as invalid', rows.some((a) => a.action === 'energia.invalid_audit' && a.person_id === residentId))
+check('malformed tab audit recorded as invalid', rows.some((a) => a.action === 'tab-a.invalid_audit' && a.person_id === residentId))
 
-// Face ID on every entry into jarvis
-const nav1 = (await navigate(owner, '/jarvis/'))
-check('jarvis entry without Face ID -> step-up page', nav1.status === 302 && nav1.headers.get('location') === '/?step_up=jarvis&next=%2Fjarvis%2F', [nav1.status, nav1.headers.get('location')])
-const in1 = await owner.req('GET', '/jarvis/echo', undefined, CORS)
-check('jarvis request without entry = 401 entry_required', in1.status === 401 && in1.data.error === 'entry_required' && in1.data.step_up, in1.data)
-check('jarvis socket without entry = 401', (await upgradeStatus('/jarvis/live', { Cookie: owner.cookie, Origin: BASE })) === 401)
+// Face ID on every entry into tab-b
+const nav1 = (await navigate(owner, '/tab-b/'))
+check('tab-b entry without Face ID -> step-up page', nav1.status === 302 && nav1.headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F', [nav1.status, nav1.headers.get('location')])
+const in1 = await owner.req('GET', '/tab-b/echo', undefined, CORS)
+check('tab-b request without entry = 401 entry_required', in1.status === 401 && in1.data.error === 'entry_required' && in1.data.step_up, in1.data)
+check('tab-b socket without entry = 401', (await upgradeStatus('/tab-b/live', { Cookie: owner.cookie, Origin: BASE })) === 401)
 // a passkey check without the entry purpose does not open the tab
 const plain = await owner.req('POST', '/api/passkey/get/options', {})
 await owner.req('POST', '/api/passkey/get/verify', await auth.get(plain.data))
-check('plain passkey check is not an entry', (await navigate(owner, '/jarvis/')).status === 302)
-check('entry purpose for a session-only tab = 400', (await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:energia' })).status === 400)
+check('plain passkey check is not an entry', (await navigate(owner, '/tab-b/')).status === 302)
+check('entry purpose for a session-only tab = 400', (await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:tab-a' })).status === 400)
 check('entry purpose for an unknown tab = 400', (await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:nothing' })).status === 400)
-check('resident cannot ask a jarvis entry', (await resident.req('POST', '/api/passkey/get/options', { purpose: 'entry:jarvis' })).status === 400)
-const eo = await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:jarvis' })
+check('resident cannot ask a tab-b entry', (await resident.req('POST', '/api/passkey/get/options', { purpose: 'entry:tab-b' })).status === 400)
+const eo = await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:tab-b' })
 const ev = await owner.req('POST', '/api/passkey/get/verify', await auth.get(eo.data))
-check('entry passkey ok', ev.status === 200 && ev.data.next === '/jarvis/', ev.data)
-const nav2 = (await navigate(owner, '/jarvis/'))
-check('jarvis entry after Face ID = 200 with entered_at', nav2.status === 200 && !!nav2.data.identity.entered_at && nav2.data.identity.strong === true, nav2.data)
+check('entry passkey ok', ev.status === 200 && ev.data.next === '/tab-b/', ev.data)
+const nav2 = (await navigate(owner, '/tab-b/'))
+check('tab-b entry after Face ID = 200 with entered_at', nav2.status === 200 && !!nav2.data.identity.entered_at && nav2.data.identity.strong === true, nav2.data)
 check('identity says when the entry ends (4 h)', Date.parse(nav2.data.identity.entry_until) - Date.parse(nav2.data.identity.entered_at) === 4 * 3600e3, nav2.data.identity)
-check('jarvis refuses a service worker', (await owner.req('GET', '/jarvis/sw.js', undefined, { ...CORS, 'Service-Worker': 'script' })).status === 403)
-check('energia allows a service worker', (await resident.req('GET', '/energia/sw.js', undefined, { ...CORS, 'Service-Worker': 'script' })).status === 200)
+check('tab-b refuses a service worker', (await owner.req('GET', '/tab-b/sw.js', undefined, { ...CORS, 'Service-Worker': 'script' })).status === 403)
+check('tab-a allows a service worker', (await resident.req('GET', '/tab-a/sw.js', undefined, { ...CORS, 'Service-Worker': 'script' })).status === 200)
 const ppJ = nav2.headers.get('permissions-policy') || ''
-check('jarvis: microphone and wake lock on, camera off', ppJ.includes('microphone=(self)') && ppJ.includes('screen-wake-lock=(self)') && ppJ.includes('camera=()'), ppJ)
-check('jarvis inside: requests free after entry', (await owner.req('GET', '/jarvis/echo', undefined, CORS)).status === 200)
-check('jarvis: the grant is single use (reload asks again)', (await navigate(owner, '/jarvis/')).status === 302)
-const jws = await openWs('/jarvis/live', { Cookie: owner.cookie, Origin: BASE })
-check('jarvis socket after entry carries identity', jws.ok && jws.data.identity.credential === 'browser' && !!jws.data.identity.entered_at && !('cookie' in jws.data.headers), jws)
+check('tab-b: microphone and wake lock on, camera off', ppJ.includes('microphone=(self)') && ppJ.includes('screen-wake-lock=(self)') && ppJ.includes('camera=()'), ppJ)
+check('tab-b inside: requests free after entry', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 200)
+check('tab-b: the grant is single use (reload asks again)', (await navigate(owner, '/tab-b/')).status === 302)
+const jws = await openWs('/tab-b/live', { Cookie: owner.cookie, Origin: BASE })
+check('tab-b socket after entry carries identity', jws.ok && jws.data.identity.credential === 'browser' && !!jws.data.identity.entered_at && !('cookie' in jws.data.headers), jws)
 rows = (await owner.req('GET', '/api/admin/audit')).data
 check('audit has tab_entry_granted and tab_entered', rows.some((a) => a.action === 'tab_entry_granted') && rows.some((a) => a.action === 'tab_entered'))
 
-// live page sockets (energia)
-const rws = await openWs('/energia/live', { Cookie: resident.cookie, Origin: BASE })
+// live page sockets (tab-a)
+const rws = await openWs('/tab-a/live', { Cookie: resident.cookie, Origin: BASE })
 check('page socket: identity of the session', rws.ok && rws.data.identity.credential === 'browser' && rws.data.identity.person === residentId, rws)
-check('page socket from another origin = 403', (await upgradeStatus('/energia/live', { Cookie: resident.cookie, Origin: 'https://evil.example' })) === 403)
-check('page socket without Origin = 403', (await upgradeStatus('/energia/live', { Cookie: resident.cookie })) === 403)
-check('page socket signed out = 401', (await upgradeStatus('/energia/live', { Origin: BASE })) === 401)
+check('page socket from another origin = 403', (await upgradeStatus('/tab-a/live', { Cookie: resident.cookie, Origin: 'https://evil.example' })) === 403)
+check('page socket without Origin = 403', (await upgradeStatus('/tab-a/live', { Cookie: resident.cookie })) === 403)
+check('page socket signed out = 401', (await upgradeStatus('/tab-a/live', { Origin: BASE })) === 401)
 rows = (await owner.req('GET', '/api/admin/audit')).data
-check('audit header on a socket answer is recorded', rows.some((a) => a.action === 'energia.socket_opened'))
+check('audit header on a socket answer is recorded', rows.some((a) => a.action === 'tab-a.socket_opened'))
 
 // fixed screens
 const tv = client()
@@ -402,16 +402,16 @@ const pst = await tv.req('POST', '/api/pair/status', { secret: ps.data.secret })
 check('screen gets a 1-year cookie', pst.data.status === 'ok' && /Max-Age=31536000/.test(pst.setCookie || '') && /HttpOnly; Secure; SameSite=Lax/.test(pst.setCookie || ''), [pst.data, pst.setCookie])
 check('pairing secret single use', (await tv.req('POST', '/api/pair/status', { secret: ps.data.secret })).data.status === 'used')
 const tvMe = (await tv.req('GET', '/api/me')).data
-check('screen is a resident, never admin', tvMe.credential === 'screen' && tvMe.admin === false && tvMe.tabs.join() === 'energia' && !/[<>]/.test(tvMe.person.name), tvMe)
-const tvEcho = await tv.req('GET', '/energia/echo', undefined, CORS)
+check('screen is a resident, never admin', tvMe.credential === 'screen' && tvMe.admin === false && tvMe.tabs.join() === 'tab-a' && !/[<>]/.test(tvMe.person.name), tvMe)
+const tvEcho = await tv.req('GET', '/tab-a/echo', undefined, CORS)
 check('screen identity reaches the tab', tvEcho.status === 200 && tvEcho.data.identity.credential === 'screen' && tvEcho.data.identity.person === ap1.data.screen, tvEcho.data)
 check('screen has no admin access', (await tv.req('GET', '/api/admin/people')).status === 403)
 check('screen cannot register a passkey', (await tv.req('POST', '/api/passkey/create/options', {})).status === 403)
 check('screen cannot join the owner group', (await owner.req('POST', `/api/admin/people/${ap1.data.screen}`, { groups: ['owner'] })).status === 409)
-const tvws = await openWs('/energia/live', { Cookie: tv.cookie, Origin: BASE })
+const tvws = await openWs('/tab-a/live', { Cookie: tv.cookie, Origin: BASE })
 check('screen page socket', tvws.ok && tvws.data.identity.credential === 'screen', tvws)
 const tvTabs = await tv.req('GET', '/api/tabs')
-check('fixed screen: no selector, energia only, no counts', tvTabs.status === 200 && tvTabs.data.selector === false && tvTabs.data.tabs.map((t) => t.id).join() === 'energia' && tvTabs.data.tabs.every((t) => t.badge === null), tvTabs.data)
+check('fixed screen: no selector, tab-a only, no counts', tvTabs.status === 200 && tvTabs.data.selector === false && tvTabs.data.tabs.map((t) => t.id).join() === 'tab-a' && tvTabs.data.tabs.every((t) => t.badge === null), tvTabs.data)
 const tvPeople = (await owner.req('GET', '/api/admin/people')).data.find((p) => p.id === ap1.data.screen)
 check('screen listed as kind screen without a phone', tvPeople && tvPeople.kind === 'screen' && tvPeople.phone === null, tvPeople)
 const tvDev = (await owner.req('GET', '/api/admin/devices')).data.find((d) => d.person_id === ap1.data.screen)
@@ -426,39 +426,39 @@ check('tabs told to close the old screen session', (await tabRevoked()).some((r)
 // revoke from "all devices"
 const tv2sid = (await tv2.req('GET', '/api/me')).data.session_id
 check('owner revokes the screen', (await owner.req('DELETE', `/api/admin/devices/${tv2sid}`)).status === 200)
-check('revoked screen = 401', (await tv2.req('GET', '/energia/echo', undefined, CORS)).status === 401)
+check('revoked screen = 401', (await tv2.req('GET', '/tab-a/echo', undefined, CORS)).status === 401)
 rows = (await owner.req('GET', '/api/admin/audit')).data
 check('audit has screen_paired and screen_signed_in', rows.some((a) => a.action === 'screen_paired') && rows.some((a) => a.action === 'screen_signed_in'))
 
 // machine bridges
-const mk = await owner.req('POST', '/api/admin/machines', { tab: 'energia', label: 'Pi ⚡' })
+const mk = await owner.req('POST', '/api/admin/machines', { tab: 'tab-a', label: 'Pi ⚡' })
 check('machine key created once', mk.status === 200 && /^pa5_maq_[A-Za-z0-9_-]{43}$/.test(mk.data.key), mk.data)
 check('machine key for unknown tab = 400', (await owner.req('POST', '/api/admin/machines', { tab: 'nothing', label: 'x' })).status === 400)
-check('resident cannot create machine keys', (await resident.req('POST', '/api/admin/machines', { tab: 'energia', label: 'x' })).status === 403)
+check('resident cannot create machine keys', (await resident.req('POST', '/api/admin/machines', { tab: 'tab-a', label: 'x' })).status === 403)
 const ml = (await owner.req('GET', '/api/admin/machines')).data
 check('machine list never shows the key', ml.length === 1 && !JSON.stringify(ml).includes(mk.data.key) && !('key_hash' in ml[0]), ml)
 const KEY = { 'X-A5-Machine-Key': mk.data.key }
-const bws = await openWs('/_bridge/energia', { ...KEY, Cookie: owner.cookie })
+const bws = await openWs('/_bridge/tab-a', { ...KEY, Cookie: owner.cookie })
 check('identity header survives non-Latin-1 names', bws.ok && bws.data.identity.name === 'Pi ⚡', bws)
 check('bridge: tab gets a machine identity', bws.ok && bws.data.identity.credential === 'machine' && bws.data.identity.machine === mk.data.id &&
   bws.data.identity.person === null && bws.data.identity.groups.length === 0, bws)
 check('bridge: key and cookie never reach the tab', bws.ok && !('x-a5-machine-key' in bws.data.headers) && !('cookie' in bws.data.headers), bws.data?.headers)
-check('bridge: key for another tab = 401', (await upgradeStatus('/_bridge/jarvis', KEY)) === 401)
-check('bridge: wrong key = 401', (await upgradeStatus('/_bridge/energia', { 'X-A5-Machine-Key': 'pa5_maq_' + 'A'.repeat(43) })) === 401)
-check('bridge: one byte changed = 401', (await upgradeStatus('/_bridge/energia', { 'X-A5-Machine-Key': mk.data.key.slice(0, -1) + (mk.data.key.endsWith('A') ? 'B' : 'A') })) === 401)
-check('bridge: no key = 401', (await upgradeStatus('/_bridge/energia', {})) === 401)
-check('bridge: robot key = 401', (await upgradeStatus('/_bridge/energia', { 'X-A5-Machine-Key': ROBO_KEY })) === 401)
-check('bridge: session cookie alone = 401', (await upgradeStatus('/_bridge/energia', { Cookie: owner.cookie, Origin: BASE })) === 401)
-check('bridge: without upgrade = 426', (await rawGet('/_bridge/energia', KEY)).status === 426)
+check('bridge: key for another tab = 401', (await upgradeStatus('/_bridge/tab-b', KEY)) === 401)
+check('bridge: wrong key = 401', (await upgradeStatus('/_bridge/tab-a', { 'X-A5-Machine-Key': 'pa5_maq_' + 'A'.repeat(43) })) === 401)
+check('bridge: one byte changed = 401', (await upgradeStatus('/_bridge/tab-a', { 'X-A5-Machine-Key': mk.data.key.slice(0, -1) + (mk.data.key.endsWith('A') ? 'B' : 'A') })) === 401)
+check('bridge: no key = 401', (await upgradeStatus('/_bridge/tab-a', {})) === 401)
+check('bridge: robot key = 401', (await upgradeStatus('/_bridge/tab-a', { 'X-A5-Machine-Key': ROBO_KEY })) === 401)
+check('bridge: session cookie alone = 401', (await upgradeStatus('/_bridge/tab-a', { Cookie: owner.cookie, Origin: BASE })) === 401)
+check('bridge: without upgrade = 426', (await rawGet('/_bridge/tab-a', KEY)).status === 426)
 check('bridge: unknown tab = 404', (await upgradeStatus('/_bridge/nothing', KEY)) === 404)
-check('bridge: other paths = 404', (await upgradeStatus('/_bridge/energia/x', KEY)) === 404)
+check('bridge: other paths = 404', (await upgradeStatus('/_bridge/tab-a/x', KEY)) === 404)
 check('machine key on /api = 401', (await fetch(BASE + '/api/me', { headers: KEY })).status === 401)
-check('machine key on a tab page = 401', (await fetch(BASE + '/energia/echo', { headers: { ...KEY, ...CORS } })).status === 401)
+check('machine key on a tab page = 401', (await fetch(BASE + '/tab-a/echo', { headers: { ...KEY, ...CORS } })).status === 401)
 // reconnecting more than 3 times in an hour warns the admins
-for (let i = 0; i < 3; i++) await openWs('/_bridge/energia', KEY)
+for (let i = 0; i < 3; i++) await openWs('/_bridge/tab-a', KEY)
 me = (await owner.req('GET', '/api/me')).data
-check('bridge reconnect burst alerts the owner', me.alerts.some((a) => a.kind === 'bridge' && a.label === 'energia:Pi ⚡'), me.alerts)
-const moved = await openWs('/_bridge/energia', { ...KEY, 'CF-Connecting-IP': '203.0.113.7' })
+check('bridge reconnect burst alerts the owner', me.alerts.some((a) => a.kind === 'bridge' && a.label === 'tab-a:Pi ⚡'), me.alerts)
+const moved = await openWs('/_bridge/tab-a', { ...KEY, 'CF-Connecting-IP': '203.0.113.7' })
 if (moved.ok) {
   me = (await owner.req('GET', '/api/me')).data
   check('key used from a new IP alerts the owner', me.alerts.some((a) => a.kind === 'bridge_ip'), me.alerts)
@@ -466,16 +466,16 @@ if (moved.ok) {
 rows = (await owner.req('GET', '/api/admin/audit')).data
 check('audit has bridge_connected and bridge_refused', rows.some((a) => a.action === 'bridge_connected') && rows.some((a) => a.action === 'bridge_refused'))
 check('owner revokes the machine key', (await owner.req('DELETE', `/api/admin/machines/${mk.data.id}`)).status === 200)
-check('revoked key = 401', (await upgradeStatus('/_bridge/energia', KEY)) === 401)
+check('revoked key = 401', (await upgradeStatus('/_bridge/tab-a', KEY)) === 401)
 check('tab told to close the revoked bridge', (await tabRevoked()).some((r) => r.machine === mk.data.id))
 
 // changing a person's groups or taking a tab from a group makes the tabs re-check sockets
 check('person groups change', (await owner.req('POST', `/api/admin/people/${residentId}`, { groups: ['residents'] })).status === 200)
 check('tabs told when a person\'s groups change', (await tabRevoked()).some((r) => r.person === residentId))
 const revBefore = (await tabRevoked()).length
-check('group loses energia', (await owner.req('POST', '/api/admin/groups/residents', { tabs: [] })).status === 200)
-check('resident lost the tab at once', (await resident.req('GET', '/energia/echo', undefined, CORS)).status === 403)
-check('group gets energia back', (await owner.req('POST', '/api/admin/groups/residents', { tabs: ['energia'] })).status === 200)
+check('group loses tab-a', (await owner.req('POST', '/api/admin/groups/residents', { tabs: [] })).status === 200)
+check('resident lost the tab at once', (await resident.req('GET', '/tab-a/echo', undefined, CORS)).status === 403)
+check('group gets tab-a back', (await owner.req('POST', '/api/admin/groups/residents', { tabs: ['tab-a'] })).status === 200)
 const revAfter = await tabRevoked()
 check('tabs told when a group loses a tab', revAfter.length > revBefore && revAfter.slice(revBefore).some((r) => r.person === residentId), revAfter.slice(revBefore))
 
@@ -483,27 +483,30 @@ check('tabs told when a group loses a tab', revAfter.length > revBefore && revAf
 check('/api/tabs signed out = 401', (await anon.req('GET', '/api/tabs')).status === 401)
 check('/api/tabs is GET only', (await owner.req('POST', '/api/tabs', {})).status === 404)
 const t0 = Date.now()
-const ot = await owner.req('GET', '/api/tabs?current=energia')
+const ot = await owner.req('GET', '/api/tabs?current=tab-a')
 const took = Date.now() - t0
-check('owner: every bound tab in binding order, reserved name dropped', ot.status === 200 && ot.data.selector === true && ot.data.tabs.map((t) => t.id).join() === 'energia,jarvis,lento,torto', ot.data)
+check('owner: every bound tab in binding order, reserved name dropped', ot.status === 200 && ot.data.selector === true && ot.data.tabs.map((t) => t.id).join() === 'tab-a,tab-b,tab-slow,tab-odd', ot.data)
 check('owner: account entry at /conta/', ot.data.account && ot.data.account.id === 'conta' && ot.data.account.path === '/conta/', ot.data.account)
-check('current echoed only for a listed tab', ot.data.current === 'energia' && (await owner.req('GET', '/api/tabs?current=nothing')).data.current === null &&
+check('current echoed only for a listed tab', ot.data.current === 'tab-a' && (await owner.req('GET', '/api/tabs?current=nothing')).data.current === null &&
   (await owner.req('GET', '/api/tabs?current=conta')).data.current === 'conta')
 const byId = Object.fromEntries(ot.data.tabs.map((t) => [t.id, t]))
-check('badge comes from the tab', byId.energia.badge === 3 && byId.jarvis.badge === 3, byId)
-check('slow badge: no number, and the answer does not wait for it', byId.lento.badge === null && took < 1500, [byId.lento, took])
-check('badge that is not a count: no number', byId.torto.badge === null, byId.torto)
-check('entry kind per tab', byId.jarvis.entry === 'passkey' && byId.energia.entry === 'session')
-check('list carries id, path, badge and entry only', ot.data.tabs.every((t) => Object.keys(t).sort().join() === 'badge,entry,id,path'), ot.data.tabs)
-let calls = (await resident.req('GET', '/energia/badges', undefined, CORS)).data
+check('badge comes from the tab', byId['tab-a'].badge === 3 && byId['tab-b'].badge === 3, byId)
+check('slow badge: no number, and the answer does not wait for it', byId['tab-slow'].badge === null && took < 1500, [byId['tab-slow'], took])
+check('badge that is not a count: no number', byId['tab-odd'].badge === null, byId['tab-odd'])
+check('entry kind per tab', byId['tab-b'].entry === 'passkey' && byId['tab-a'].entry === 'session')
+check('list carries id, path, label, icon, badge and entry only', ot.data.tabs.every((t) => Object.keys(t).sort().join() === 'badge,entry,icon,id,label,path'), ot.data.tabs)
+check('label and icon from the configuration', byId['tab-a'].label === 'Tab A' && byId['tab-a'].icon === 'bolt' && byId['tab-slow'].label === null && byId['tab-slow'].icon === null, byId)
+check('a tab without a written policy is never routed', (await navigate(owner, '/tab-nopolicy/')).status === 404 && (await owner.req('GET', '/tab-nopolicy/echo', undefined, CORS)).status === 404)
+check('a tab with an unknown key is never routed', (await navigate(owner, '/tab-bad/')).status === 404)
+let calls = (await resident.req('GET', '/tab-a/badges', undefined, CORS)).data
 const ownerCall = calls.find((c) => c.person === ownerId)
 check('badge gets the person\'s identity, with no entry and never strong', ownerCall && ownerCall.credential === 'browser' && ownerCall.entered_at === null && ownerCall.entry_until === null && ownerCall.strong === false, ownerCall)
 const nCalls = calls.length
 await owner.req('GET', '/api/tabs')
-check('badge kept for a minute (no new call to the tab)', (await resident.req('GET', '/energia/badges', undefined, CORS)).data.length === nCalls)
-const rt = await resident.req('GET', '/api/tabs?current=energia')
-check('resident: Energia + Conta only', rt.status === 200 && rt.data.selector === true && rt.data.tabs.map((t) => t.id).join() === 'energia' && rt.data.account.path === '/conta/', rt.data)
-calls = (await resident.req('GET', '/energia/badges', undefined, CORS)).data
+check('badge kept for a minute (no new call to the tab)', (await resident.req('GET', '/tab-a/badges', undefined, CORS)).data.length === nCalls)
+const rt = await resident.req('GET', '/api/tabs?current=tab-a')
+check('resident: Tab A + Conta only', rt.status === 200 && rt.data.selector === true && rt.data.tabs.map((t) => t.id).join() === 'tab-a' && rt.data.account.path === '/conta/', rt.data)
+calls = (await resident.req('GET', '/tab-a/badges', undefined, CORS)).data
 check('resident: no count, and the tab is never asked', rt.data.tabs[0].badge === null && !calls.some((c) => c.person === residentId), rt.data)
 check('fixed screen: the tab is never asked for a count', !calls.some((c) => c.credential === 'screen'))
 const sj = await fetch(BASE + '/_shell/tabs.js')

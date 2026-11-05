@@ -1,5 +1,5 @@
 # LOCAL TESTS ONLY. A stand-in tab worker bound by the portal under two tab names
-# (energia, jarvis) so scripts/test_local.mjs can check the router. Never deployed.
+# (tab-a, tab-b) so scripts/test_local.mjs can check the router. Never deployed.
 name = "portal-a5-fake-tab"
 main = "index.ts"
 compatibility_date = "2026-10-01"

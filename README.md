@@ -49,7 +49,7 @@ Every new device of an admin shows a banner on all their devices until it is con
 
 ## Groups and tabs
 
-Two groups to start: `owner` (every tab, admin) and `residents` (the `energia` tab). The owner's number lives in the `OWNER_PHONE` secret and joins `owner` on first sign-in.
+Two groups to start: `owner` (every tab, admin) and `residents` (the tabs the owner gives them, none at first). Which tabs exist and each one's policy are deploy configuration kept out of git (`tabs.example.json` shows the format). The owner's number lives in the `OWNER_PHONE` secret and joins `owner` on first sign-in.
 
 A tab is a private Worker (no public address) that the portal calls over a service binding: `handle(request, identity)` over RPC for plain requests, `fetch` for WebSocket upgrades, `revoke(ref)` when a credential goes away. The portal checks the group and the tab's policy, strips cookies and portal headers on the way in, and on the way out drops cookies and puts its own CSP and per-tab `Permissions-Policy` on the answer, since the tab shares the portal's origin. Tabs can ask Face ID on every entry, write to the portal's audit with an `X-Tab-Audit` header, and receive house bridges at `/_bridge/<tab>` authenticated by a per-machine key. Fixed screens (TV, monitors) get their own accounts, paired by a code the owner approves. There is no home page: `/` opens the last tab used on that device, and every tab's title doubles as the tab selector (a shared script at `/_shell/tabs.js` fed by `GET /api/tabs`, with an optional pending count from each tab's `badge(identity)`). The account pages (devices, people and groups, audit, sign out) live at `/conta/`, listed as the last tab. The full contract is in [docs/TABS.md](docs/TABS.md).
 

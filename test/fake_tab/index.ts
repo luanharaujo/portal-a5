@@ -8,7 +8,7 @@ export class FakeTab extends WorkerEntrypoint {
   async handle(req: Request, identity: Identity): Promise<Response> {
     const url = new URL(req.url)
     const headers = Object.fromEntries(req.headers)
-    const p = url.pathname.replace(/^\/[a-z]+/, '')
+    const p = url.pathname.replace(/^\/[a-z][a-z0-9-]*/, '')
     if (p === '/html') {
       return new Response('<!doctype html><title>x</title><script>alert(1)</script>', {
         headers: {

@@ -8,8 +8,8 @@
 
 import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
 import {
-  RESERVED_TABS, type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
-  policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders,
+  type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
+  policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig,
 } from './tabs'
 
 export type { PortalIdentity } from './tabs'
@@ -957,11 +957,10 @@ async function listAudit(env: Env, url: URL) {
 }
 
 // ------------------------------------------------------------------ tabs
+// Tab name -> binding name, from the TABS configuration (validated in tabs.ts; a tab named like a
+// portal page, or with a bad policy, is dropped).
 function tabBindings(env: Env): Record<string, string> {
-  let all: Record<string, string>
-  try { all = JSON.parse(env.TABS || '{}') } catch { return {} }
-  // a tab named like a portal page would never be reached; drop it instead of half-serving it
-  return Object.fromEntries(Object.entries(all).filter(([t]) => /^[a-z][a-z0-9-]{0,30}$/.test(t) && !RESERVED_TABS.includes(t)))
+  return Object.fromEntries(Object.entries(tabsConfig(env.TABS)).map(([t, c]) => [t, c.binding]))
 }
 
 function tabService(env: Env, tab: string): TabService | null {
@@ -1083,7 +1082,10 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
   return {
     selector,
     current: cur === 'conta' || (cur && tabs.includes(cur)) ? cur : null,
-    tabs: tabs.map((t, i) => ({ id: t, path: `/${t}/`, badge: badges[i], entry: policyOf(t).entry })),
+    tabs: tabs.map((t, i) => {
+      const c = tabsConfig(env.TABS)[t]
+      return { id: t, path: `/${t}/`, label: c?.label ?? null, icon: c?.icon ?? null, badge: badges[i], entry: policyOf(t).entry }
+    }),
     account: { id: 'conta', path: ACCOUNT_PATH },
   }
 }
@@ -1241,6 +1243,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    tabsConfig(env.TABS) // policyOf() reads what this loads
     try {
       return await handle(req, env)
     } catch (e) {

@@ -22,7 +22,7 @@ window.T = {
   title: 'Portal A5',
   // the tab selector (/_shell/tabs.js), also loaded by the tab pages
   shell: {
-    tabNames: { energia: 'Energia', jarvis: 'Jarvis', conta: 'Conta' },
+    tabNames: { conta: 'Conta' }, // the other tabs' names come with the list
     hints: { conta: 'aparelhos, pessoas, auditoria' },
     passkeyHint: 'Face ID',
     switchTab: 'Trocar de aba',
@@ -68,7 +68,7 @@ window.T = {
     title: 'Pontes da casa',
     none: 'Nenhuma chave de ponte.',
     add: 'Nova chave de ponte',
-    label: 'Máquina (ex.: Pi da energia)',
+    label: 'Máquina (ex.: Pi da sala)',
     create: 'Criar chave',
     copyOnce: 'Copie agora: a chave não aparece de novo. Guarde no Keychain da máquina.',
     copy: 'Copiar',
