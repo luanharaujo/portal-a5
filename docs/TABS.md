@@ -246,7 +246,7 @@ Session required (401 otherwise), GET only, `Cache-Control: no-store`.
 async badge(identity: PortalIdentity): Promise<{ count: number }>
 ```
 
-- How many things wait for this person in the tab (Jarvis: decisions waiting; agents: pending items). The tab decides what counts. Only the number leaves the tab, never the content.
+- How many things wait for this person in the tab (for example, decisions waiting for an answer). The tab decides what counts. Only the number leaves the tab, never the content.
 - Called only for a browser session with more than one tab, for each of its tabs. Never for a fixed screen or a person with a single tab.
 - The identity is the person's, with `entered_at` and `entry_until` null: a passkey tab's count shows without Face ID, its content stays behind the entry.
 - The portal waits 300 ms at most, then shows no number. Anything but a non-negative integer is no number; above 99 is shown as 99 (the dot itself shows `9+` above 9). The answer is kept per person and tab for 60 seconds in the portal's isolate.

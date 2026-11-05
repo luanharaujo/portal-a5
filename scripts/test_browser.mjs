@@ -137,7 +137,7 @@ export async function browserChecks({ base, check, owner, resident, screen }) {
 
     // "/" opens the last tab on this device
     await o.go('/')
-    check('browser: "/" opens the last tab (Conta)', await o.waitFor(`location.pathname === '/conta/'`))
+    check('browser: "/" opens the last tab (Conta)', await o.waitFor(`location.pathname === '/conta/' && ${ON}`))
     await o.evaluate(`localStorage.setItem('a5.lastTab', 'energia')`)
     await o.go('/')
     check('browser: "/" opens the last tab (Energia)', await o.waitFor(`location.pathname === '/energia/'`))

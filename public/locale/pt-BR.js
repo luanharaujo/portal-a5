@@ -22,7 +22,7 @@ window.T = {
   title: 'Portal A5',
   // the tab selector (/_shell/tabs.js), also loaded by the tab pages
   shell: {
-    tabNames: { energia: 'Energia', jarvis: 'Jarvis', agentes: 'Agentes', financas: 'Finanças', conta: 'Conta' },
+    tabNames: { energia: 'Energia', jarvis: 'Jarvis', conta: 'Conta' },
     hints: { conta: 'aparelhos, pessoas, auditoria' },
     passkeyHint: 'Face ID',
     switchTab: 'Trocar de aba',
