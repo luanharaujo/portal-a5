@@ -11,3 +11,10 @@
   Cache-Control: no-cache
 /index.html
   Cache-Control: no-cache
+# loaded without a version by the tab pages (their CSP names these exact paths): revalidate each load
+/_shell/tabs.js
+  Cache-Control: no-cache
+/_shell/tabs.css
+  Cache-Control: no-cache
+/locale/pt-BR.js
+  Cache-Control: no-cache
