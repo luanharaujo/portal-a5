@@ -33,6 +33,7 @@ function toast(msg) {
 
 const when = (iso) => iso ? new Date(iso).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }) : ''
 const fmtPhone = (d) => d ? '+' + d : ''
+const groupName = (g) => (T.groupNames && T.groupNames[g.id]) || g.name
 
 class ApiError extends Error { constructor(status, data) { super(T.errors[data.error] || data.error || T.genericError); this.status = status; this.data = data } }
 
@@ -189,7 +190,7 @@ async function adminView() {
     rawApi('GET', '/api/admin/requests'), rawApi('GET', '/api/admin/devices'),
   ])
   const groupBoxes = (selected, name) => el('span', { class: 'boxes' }, groups.map((g) =>
-    el('label', {}, el('input', { type: 'checkbox', name, value: g.id, checked: selected.includes(g.id) }), g.name)))
+    el('label', {}, el('input', { type: 'checkbox', name, value: g.id, checked: selected.includes(g.id) }), groupName(g))))
   const checked = (form, name) => [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((i) => i.value)
 
   const passkeyCard = el('section', { class: 'card' }, el('h2', {}, T.faceId),
@@ -243,9 +244,9 @@ async function adminView() {
 
   const groupsCard = el('section', { class: 'card' }, el('h2', {}, T.groups),
     el('ul', { class: 'rows' }, groups.map((g) => {
-      if (g.is_admin) return el('li', {}, el('strong', {}, g.name), el('span', { class: 'muted' }, T.seesAll))
+      if (g.is_admin) return el('li', {}, el('strong', {}, groupName(g)), el('span', { class: 'muted' }, T.seesAll))
       const tabs = el('input', { value: g.tabs.join(', '), placeholder: T.tabsPlaceholder })
-      return el('li', {}, el('strong', {}, g.name), ' ', tabs,
+      return el('li', {}, el('strong', {}, groupName(g)), ' ', tabs,
         el('button', { onclick: () => guarded(async () => {
           await api('POST', `/api/admin/groups/${g.id}`, { tabs: tabs.value.split(',').map((t) => t.trim()).filter(Boolean) }); toast(T.saved)
         }) }, T.save))

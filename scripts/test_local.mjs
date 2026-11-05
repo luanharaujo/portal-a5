@@ -129,7 +129,7 @@ check('owner 1 per 10 min', o2.robot.data?.reason === 'admin_limit', o2.robot.da
 
 // weak session: reads yes, writes no
 check('weak admin read ok', (await owner.req('GET', '/api/admin/people')).status === 200)
-const w = await owner.req('POST', '/api/admin/people', { name: 'Morador', phone: RESIDENT, groups: ['residents'] })
+const w = await owner.req('POST', '/api/admin/people', { name: 'Resident', phone: RESIDENT, groups: ['residents'] })
 check('weak admin write = 403 passkey', w.status === 403 && w.data.passkey === true, w)
 check('ack alert needs passkey', (await owner.req('POST', `/api/me/alerts/${me.alerts[0].id}/ack`, {})).status === 403)
 check('get options without passkey = 409', (await owner.req('POST', '/api/passkey/get/options', {})).status === 409)
@@ -209,10 +209,10 @@ check('pending tab has no cookie', !victimTab.cookie)
 const reqs = (await owner.req('GET', '/api/admin/requests')).data
 const pend = reqs.find((x) => x.sender_phone === STRANGER)
 check('request listed with sender number', !!pend && pend.typed_phone === RESIDENT, reqs)
-const ap = await owner.req('POST', `/api/admin/requests/${pend.id}/approve`, { name: 'Visita', groups: ['residents'] })
+const ap = await owner.req('POST', `/api/admin/requests/${pend.id}/approve`, { name: 'Visitor', groups: ['residents'] })
 check('approve ok', ap.status === 200 && ap.data.code_valid === true, ap.data)
 const after = await victimTab.req('POST', '/api/login/status', { secret: mm.start.data.secret })
-check('approved tab signs in as the SENDER', after.data.status === 'ok' && after.data.name === 'Visita', after.data)
+check('approved tab signs in as the SENDER', after.data.status === 'ok' && after.data.name === 'Visitor', after.data)
 
 // sender rate limit: 3 per hour
 const spam = client()

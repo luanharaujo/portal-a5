@@ -219,7 +219,7 @@ async function ensureOwner(env: Env, phone: string): Promise<Person | null> {
   const owner = normalizePhone(env.OWNER_PHONE)
   if (!owner || owner !== phone) return null
   const p = await env.DB.prepare(
-    `INSERT INTO people (name, phone, status) VALUES ('Dono', ?, 'active')
+    `INSERT INTO people (name, phone, status) VALUES ('Owner', ?, 'active')
      ON CONFLICT (phone) DO UPDATE SET status = 'active' RETURNING *`,
   ).bind(phone).first<Person>()
   await env.DB.prepare('INSERT OR IGNORE INTO person_groups (person_id, group_id) VALUES (?, ?)').bind(p!.id, OWNER_GROUP).run()

@@ -10,8 +10,8 @@ CREATE TABLE groups (
 );
 
 INSERT INTO groups (id, name, tabs, is_admin) VALUES
-  ('owner', 'Dono', '["*"]', 1),
-  ('residents', 'Moradores', '["energia"]', 0);
+  ('owner', 'Owner', '["*"]', 1),
+  ('residents', 'Residents', '["energia"]', 0);
 
 CREATE TABLE people (
   id INTEGER PRIMARY KEY,

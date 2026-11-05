@@ -54,6 +54,7 @@ window.T = {
   phoneWithArea: 'WhatsApp com DDD',
   add: 'Cadastrar',
   groups: 'Grupos',
+  groupNames: { owner: 'Dono', residents: 'Moradores' },
   seesAll: ' · vê tudo',
   tabsPlaceholder: 'abas, separadas por vírgula',
   allDevices: 'Todos os aparelhos',
