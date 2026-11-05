@@ -15,6 +15,9 @@ not_found_handling = "none"
 [vars]
 # Tab name -> service binding name, e.g. {"energia":"TAB_ENERGIA"}. Empty until tabs exist.
 TABS = "{}"
+# Screen pairing whose request came from another IP than the approving phone: "refuse"
+# (screens are paired on the same network as the phone) or "warn" (red warning only).
+PAIR_OTHER_IP = "refuse"
 
 [[d1_databases]]
 binding = "DB"

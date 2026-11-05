@@ -7,6 +7,12 @@
 //                   Every admin write needs a passkey check from the last 5 minutes.
 
 import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
+import {
+  type PortalIdentity, type RevokeRef, type TabService, isNavigation, isUpgrade, permissionsPolicy, policyOf,
+  readTabAudit, sanitizeTabHeaders, stripRequestHeaders,
+} from './tabs'
+
+export type { PortalIdentity } from './tabs'
 
 export interface Env {
   DB: D1Database
@@ -14,24 +20,21 @@ export interface Env {
   ROBOT_LOGIN_KEY: string
   OWNER_PHONE: string
   TABS?: string
+  // 'refuse' (default): a screen whose request came from another IP than the approving admin
+  // cannot be approved; 'warn': only a red warning.
+  PAIR_OTHER_IP?: string
   [binding: string]: unknown
 }
 
-// What a tab worker receives. Tabs export a WorkerEntrypoint with handle(request, identity)
-// and answer 404 on their default fetch.
-export interface PortalIdentity {
-  person: number
-  name: string
-  groups: string[]
-  session: number
-  credential: 'browser'
-  strong: boolean
-  actions: string[]
-}
-interface TabService { handle(req: Request, who: PortalIdentity): Promise<Response> }
-
 const CODE_MINUTES = 10
 const SESSION_DAYS = 180
+const SCREEN_DAYS = 365
+const PAIR_MINUTES = 5
+const PAIR_PICKUP_GRACE_MS = 5 * 60e3 // an approved pairing can be picked up until expires_at + 5 min
+const ENTRY_GRANT_MS = 60e3
+const MACHINE_KEY_PREFIX = 'pa5_maq_'
+const BRIDGE_ALERT_PER_HOUR = 3 // more reconnections than this in an hour warns the admins
+const BRIDGE_MAX_PER_HOUR = 120
 const SESSION_TOUCH_MS = 5 * 60e3
 const PASSKEY_FRESH_MS = 5 * 60e3
 const CHALLENGE_MS = 5 * 60e3
@@ -41,6 +44,7 @@ const PENDING_DAYS = 7
 const LIMITS = {
   startPerIp: 20, startPerNumber: 5, statusPerIp: 900,
   robotPerSender: 3, robotTotal: 30, // per hour
+  pairPerIp: 10, bridgeFailPerIp: 30,
 }
 const COOKIE = '__Host-a5s'
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O/1/I/L
@@ -55,7 +59,7 @@ const PAGE_HEADERS: Record<string, string> = {
   'Content-Security-Policy': HTML_CSP,
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
-  'Permissions-Policy': 'publickey-credentials-get=(self), publickey-credentials-create=(self)',
+  'Permissions-Policy': permissionsPolicy(),
   'Strict-Transport-Security': 'max-age=31536000',
   'X-Frame-Options': 'DENY',
 }
@@ -66,10 +70,10 @@ const API_HEADERS: Record<string, string> = {
 }
 
 type Row = Record<string, unknown>
-interface Person { id: number; name: string; phone: string; status: string }
+interface Person { id: number; name: string; phone: string; status: string; kind?: string }
 interface Group { id: string; name: string; tabs: string; is_admin: number }
 interface Who {
-  person: Person; sessionId: number; groups: Group[]; admin: boolean; tabs: Set<string>
+  person: Person; sessionId: number; sessionCreatedAt: string; kind: 'browser' | 'screen'; groups: Group[]; admin: boolean; tabs: Set<string>
   passkeyAt: string | null; refreshCookie: string | null
 }
 
@@ -165,8 +169,9 @@ function cookieValue(req: Request, name: string): string | null {
 }
 
 // Lax, not Strict: a link from WhatsApp or a shortcut must arrive signed in.
-const sessionCookie = (token: string) =>
-  `${COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`
+const sessionDays = (kind: string) => (kind === 'screen' ? SCREEN_DAYS : SESSION_DAYS)
+const sessionCookie = (token: string, kind = 'browser') =>
+  `${COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${sessionDays(kind) * 86400}`
 const clearCookie = () => `${COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`
 
 const strength = (who: Who | null) => (who ? (fresh(who) ? 'strong' : 'weak') : null)
@@ -231,20 +236,23 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
   const token = cookieValue(req, COOKIE)
   if (!token || token.length < 40) return null
   const s = await env.DB.prepare(
-    `SELECT s.id AS sid, s.last_used_at, s.passkey_at, p.* FROM sessions s JOIN people p ON p.id = s.person_id
+    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, p.* FROM sessions s JOIN people p ON p.id = s.person_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
   ).bind(await sha256(token), now()).first<Row>()
   if (!s || s.status !== 'active') return null
+  const kind = s.skind === 'screen' ? 'screen' : 'browser'
   let refreshCookie: string | null = null
   if (Date.now() - Date.parse(String(s.last_used_at)) > SESSION_TOUCH_MS) {
     await env.DB.prepare('UPDATE sessions SET last_used_at = ?, expires_at = ? WHERE id = ?')
-      .bind(now(), inMs(SESSION_DAYS * 864e5), s.sid).run()
-    refreshCookie = sessionCookie(token)
+      .bind(now(), inMs(sessionDays(kind) * 864e5), s.sid).run()
+    refreshCookie = sessionCookie(token, kind)
   }
-  const person: Person = { id: Number(s.id), name: String(s.name), phone: String(s.phone), status: String(s.status) }
+  const person: Person = { id: Number(s.id), name: String(s.name), phone: String(s.phone), status: String(s.status), kind: String(s.kind) }
   const groups = await groupsOf(env, person.id)
+  // a screen account is never an admin, whatever its groups say
+  const admin = kind === 'browser' && person.kind !== 'screen' && groups.some((g) => g.is_admin)
   return {
-    person, sessionId: Number(s.sid), groups, admin: groups.some((g) => g.is_admin), tabs: tabsOf(groups),
+    person, sessionId: Number(s.sid), sessionCreatedAt: String(s.screated), kind, groups, admin, tabs: tabsOf(groups),
     passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie,
   }
 }
@@ -261,6 +269,20 @@ function requireStrongAdmin(who: Who) {
   if (!fresh(who)) throw new HttpError(403, 'passkey_required', { passkey: true })
 }
 
+// Every session delete goes through here: the rows tied to the session id go with it, and the
+// tabs close its sockets. (Session ids are AUTOINCREMENT since migration 0004, so an id is never
+// reused; this is the second barrier.)
+async function dropSessions(env: Env, ids: number[]) {
+  for (const id of ids) {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(id),
+      env.DB.prepare('DELETE FROM tab_entries WHERE session_id = ?').bind(id),
+      env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ?').bind(id),
+    ])
+    await notifyTabs(env, { session: id })
+  }
+}
+
 async function createSession(env: Env, req: Request, person: Person, label: string): Promise<string> {
   const groups = await groupsOf(env, person.id)
   const admin = groups.some((g) => g.is_admin)
@@ -268,7 +290,7 @@ async function createSession(env: Env, req: Request, person: Person, label: stri
     // keep the newest MAX_DEVICES - 1, so the new one fits
     const old = await env.DB.prepare('SELECT id FROM sessions WHERE person_id = ? ORDER BY last_used_at DESC LIMIT -1 OFFSET ?')
       .bind(person.id, MAX_DEVICES - 1).all<{ id: number }>()
-    for (const o of old.results) await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(o.id).run()
+    await dropSessions(env, old.results.map((o) => o.id))
   }
   const token = randomToken(32)
   const t = now()
@@ -283,6 +305,170 @@ async function createSession(env: Env, req: Request, person: Person, label: stri
     await env.DB.prepare('INSERT INTO device_alerts (person_id, session_id, label, place, created_at) VALUES (?, ?, ?, ?, ?)')
       .bind(person.id, r!.id, label, place(req), t).run()
   return token
+}
+
+// ------------------------------------------------------------------ fixed screens
+// The screen asks for a code and shows it (and a QR). A strong admin types the code and picks
+// the screen account. The screen's poll then gets a 1-year session, renewed on use. A screen
+// account has one live session: pairing again replaces the old one.
+function newPairCode(): string {
+  const b = crypto.getRandomValues(new Uint8Array(6))
+  return [...b].map((x) => CODE_ALPHABET[x % CODE_ALPHABET.length]).join('')
+}
+const normPairCode = (v: unknown) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12)
+
+async function pairStart(req: Request, env: Env, url: URL) {
+  if (!(await underLimit(env, `pair-ip:${clientIp(req)}`, LIMITS.pairPerIp))) throw new HttpError(429, 'too_many_attempts')
+  await env.DB.prepare('DELETE FROM screen_pairings WHERE expires_at < ?').bind(inMs(-864e5)).run()
+  const code = newPairCode()
+  const secret = randomToken(24)
+  const expires = inMs(PAIR_MINUTES * 60e3)
+  await env.DB.prepare('INSERT INTO screen_pairings (code_hash, secret_hash, label, ip, place, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .bind(await sha256(code), await sha256(secret), deviceLabel(req.headers.get('User-Agent'), null), clientIp(req), place(req), now(), expires).run()
+  return json({ code: `${code.slice(0, 3)}-${code.slice(3)}`, secret, expires_at: expires, pair_url: `${url.origin}/?pair=${code}` }, 201)
+}
+
+async function pairStatus(req: Request, env: Env) {
+  if (!(await underLimit(env, `status-ip:${clientIp(req)}`, LIMITS.statusPerIp))) throw new HttpError(429, 'too_many_polls')
+  const b = await body(req)
+  const secret = String(b.secret ?? '')
+  if (secret.length < 30) throw new HttpError(400, 'missing_secret')
+  const p = await env.DB.prepare('SELECT * FROM screen_pairings WHERE secret_hash = ?').bind(await sha256(secret)).first<Row>()
+  if (!p) throw new HttpError(404, 'code_not_found')
+  const state = String(p.state)
+  if (state === 'used' || state === 'refused') return json({ status: state })
+  if (state === 'waiting') return json(String(p.expires_at) < now() ? { status: 'expired' } : { status: 'waiting', expires_at: p.expires_at })
+  // approved: burn it and hand out the session exactly once, if picked up in time
+  if (Date.parse(String(p.expires_at)) + PAIR_PICKUP_GRACE_MS < Date.now()) {
+    await env.DB.prepare(`UPDATE screen_pairings SET state = 'refused' WHERE id = ? AND state = 'approved'`).bind(p.id).run()
+    return json({ status: 'expired' })
+  }
+  const r = await env.DB.prepare(`UPDATE screen_pairings SET state = 'used' WHERE id = ? AND state = 'approved'`).bind(p.id).run()
+  if (!r.meta.changes) return json({ status: 'used' })
+  const screen = await env.DB.prepare(`SELECT * FROM people WHERE id = ? AND kind = 'screen' AND status = 'active'`).bind(p.person_id).first<Person>()
+  if (!screen) return json({ status: 'refused' })
+  const old = await env.DB.prepare('SELECT id FROM sessions WHERE person_id = ?').bind(screen.id).all<{ id: number }>()
+  const token = randomToken(32)
+  const t = now()
+  const s = await env.DB.prepare(
+    `INSERT INTO sessions (person_id, token_hash, kind, label, ip, place, created_at, last_used_at, expires_at)
+     VALUES (?, ?, 'screen', ?, ?, ?, ?, ?, ?) RETURNING id`,
+  ).bind(screen.id, await sha256(token), String(p.label ?? ''), clientIp(req), place(req), t, t, inMs(SCREEN_DAYS * 864e5)).first<{ id: number }>()
+  await dropSessions(env, old.results.map((o) => o.id))
+  await env.DB.prepare('INSERT INTO audit (at, person_id, session_id, strength, action, target, ip, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(t, screen.id, s!.id, 'screen', 'screen_signed_in', String(p.label ?? ''), clientIp(req), place(req)).run()
+  return json({ status: 'ok', name: screen.name }, 200, { 'Set-Cookie': sessionCookie(token, 'screen') })
+}
+
+const refuseOtherIp = (env: Env) => env.PAIR_OTHER_IP !== 'warn'
+
+// What the admin sees before approving: who is asking and whether it came from the same
+// network as the admin's phone (the "device code" scam sends a code made somewhere else).
+async function pairLookup(req: Request, env: Env, url: URL) {
+  const code = normPairCode(url.searchParams.get('code'))
+  const p = await env.DB.prepare(`SELECT label, place, ip, created_at, expires_at FROM screen_pairings WHERE code_hash = ? AND expires_at > ? AND state = 'waiting'`)
+    .bind(await sha256(code), now()).first<Row>()
+  if (!p) throw new HttpError(404, 'pair_code_not_found')
+  return { ...p, same_ip: p.ip === clientIp(req), admin_ip: clientIp(req), other_ip_refused: refuseOtherIp(env) }
+}
+
+async function pairApprove(env: Env, req: Request, who: Who) {
+  const b = await body(req)
+  const code = normPairCode(b.code)
+  const p = await env.DB.prepare(`SELECT * FROM screen_pairings WHERE code_hash = ? AND expires_at > ? AND state = 'waiting'`)
+    .bind(await sha256(code), now()).first<Row>()
+  if (!p) throw new HttpError(404, 'pair_code_not_found')
+  const sameIp = p.ip === clientIp(req)
+  if (!sameIp && refuseOtherIp(env)) {
+    await audit(env, req, { who, action: 'screen_pair_refused', detail: { reason: 'other_ip', ip: p.ip, label: p.label } })
+    throw new HttpError(409, 'pair_other_network')
+  }
+  let screen: Person | null
+  if (b.screen != null) {
+    screen = await env.DB.prepare(`SELECT * FROM people WHERE id = ? AND kind = 'screen'`).bind(Number(b.screen)).first<Person>()
+    if (!screen) throw new HttpError(404, 'screen_not_found')
+    if (screen.status !== 'active') throw new HttpError(409, 'screen_blocked')
+  } else {
+    const name = text(b.name, 40)
+    if (!name) throw new HttpError(400, 'name_required')
+    screen = await env.DB.prepare(`INSERT INTO people (name, phone, status, kind, created_by) VALUES (?, ?, 'active', 'screen', ?) RETURNING *`)
+      .bind(name, `screen:${randomToken(9)}`, who.person.id).first<Person>()
+    await env.DB.prepare(`INSERT INTO person_groups (person_id, group_id) VALUES (?, 'residents')`).bind(screen!.id).run()
+  }
+  const r = await env.DB.prepare(`UPDATE screen_pairings SET state = 'approved', person_id = ?, approved_by = ?, approved_at = ? WHERE id = ? AND state = 'waiting'`)
+    .bind(screen!.id, who.person.id, now(), p.id).run()
+  if (!r.meta.changes) throw new HttpError(404, 'pair_code_not_found')
+  await audit(env, req, { who, action: 'screen_paired', target: screen!.name, detail: { screen: screen!.id, label: p.label, place: p.place, ip: p.ip, same_ip: sameIp } })
+  return { ok: true, screen: screen!.id }
+}
+
+// ------------------------------------------------------------------ machine keys (bridges)
+async function listMachines(env: Env) {
+  const r = await env.DB.prepare('SELECT id, tab, label, created_at, last_used_at, last_ip, revoked_at FROM machine_keys ORDER BY id DESC LIMIT 100').all<Row>()
+  return r.results
+}
+
+async function addMachine(env: Env, req: Request, who: Who) {
+  const b = await body(req)
+  const tab = String(b.tab ?? '')
+  if (!tabBindings(env)[tab]) throw new HttpError(400, 'unknown_tab')
+  if (!policyOf(tab).credentials.includes('machine')) throw new HttpError(409, 'tab_takes_no_machine')
+  const label = text(b.label, 40)
+  if (!label) throw new HttpError(400, 'name_required')
+  const key = MACHINE_KEY_PREFIX + randomToken(32)
+  const r = await env.DB.prepare('INSERT INTO machine_keys (tab, label, key_hash, created_at, created_by) VALUES (?, ?, ?, ?, ?) RETURNING id')
+    .bind(tab, label, await sha256(key), now(), who.person.id).first<{ id: number }>()
+  await audit(env, req, { who, action: 'machine_key_created', target: `${tab}:${label}`, detail: { id: r!.id } })
+  // shown once; only the hash stays
+  return { id: r!.id, tab, label, key }
+}
+
+async function revokeMachine(env: Env, req: Request, who: Who, id: number) {
+  const m = await env.DB.prepare('UPDATE machine_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING tab, label').bind(now(), id).first<Row>()
+  if (!m) throw new HttpError(404, 'machine_not_found')
+  await notifyTabs(env, { machine: id }, String(m.tab))
+  await audit(env, req, { who, action: 'machine_key_revoked', target: `${m.tab}:${m.label}` })
+}
+
+// GET /_bridge/<tab> with Upgrade: websocket and X-A5-Machine-Key. The key opens one tab only.
+async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
+  const service = tabService(env, tab)
+  if (!service || !policyOf(tab).credentials.includes('machine')) throw new HttpError(404, 'not_found')
+  if (req.method !== 'GET' || !isUpgrade(req)) throw new HttpError(426, 'websocket_required')
+  const key = req.headers.get('X-A5-Machine-Key') ?? ''
+  const refuse = async (reason: string) => {
+    if (!(await underLimit(env, `bridge-fail-ip:${clientIp(req)}`, LIMITS.bridgeFailPerIp))) throw new HttpError(429, 'too_many_attempts')
+    await audit(env, req, { strength: 'machine', action: 'bridge_refused', target: tab, detail: { reason } })
+    throw new HttpError(401, 'bad_key')
+  }
+  if (!key.startsWith(MACHINE_KEY_PREFIX) || key.length < 40 || key.length > 80) return refuse('format')
+  // looked up by hash (unique index); the hash itself is the constant-time part
+  const m = await env.DB.prepare('SELECT id, tab, label, revoked_at, last_ip FROM machine_keys WHERE key_hash = ?').bind(await sha256(key)).first<Row>()
+  if (!m) return refuse('unknown')
+  if (m.revoked_at) return refuse('revoked')
+  if (m.tab !== tab) return refuse('other_tab')
+  const id = Number(m.id)
+  const hour = now().slice(0, 13)
+  if (!(await underLimit(env, `bridge:${id}`, BRIDGE_MAX_PER_HOUR, hour))) throw new HttpError(429, 'too_many_attempts')
+  const n = (await env.DB.prepare('SELECT n FROM rate_limits WHERE bucket = ? AND hour = ?').bind(`bridge:${id}`, hour).first<{ n: number }>())?.n ?? 1
+  await env.DB.prepare('UPDATE machine_keys SET last_used_at = ?, last_ip = ? WHERE id = ?').bind(now(), clientIp(req), id).run()
+  const newIp = !!m.last_ip && m.last_ip !== clientIp(req)
+  await audit(env, req, { strength: 'machine', action: newIp ? 'bridge_new_ip' : 'bridge_connected', target: `${tab}:${m.label}`, detail: { machine: id, n, ...(newIp ? { previous_ip: m.last_ip } : {}) } })
+  const alertAdmins = async (kind: string) => {
+    const admins = await env.DB.prepare(`SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1`).all<{ person_id: number }>()
+    for (const a of admins.results)
+      await env.DB.prepare(`INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, ?, ?, ?)`)
+        .bind(a.person_id, `${tab}:${m.label}`, `${clientIp(req)}${place(req) ? ', ' + place(req) : ''}`, now(), kind).run()
+  }
+  // a new bridge replacing the old one more than 3 times in an hour, or a key used from a new
+  // address: tell every admin
+  if (n === BRIDGE_ALERT_PER_HOUR + 1) await alertAdmins('bridge')
+  if (newIp) await alertAdmins('bridge_ip')
+  const identity: PortalIdentity = {
+    credential: 'machine', person: null, name: String(m.label), groups: [], session: null, machine: id,
+    strong: false, entered_at: null, entry_until: null, actions: [],
+  }
+  return forwardSocket(env, req, service, tab, identity, null)
 }
 
 // ------------------------------------------------------------------ login (browser side)
@@ -418,21 +604,30 @@ async function passkeyCount(env: Env, personId: number) {
   return (await env.DB.prepare('SELECT COUNT(*) AS n FROM passkeys WHERE person_id = ?').bind(personId).first<{ n: number }>())?.n ?? 0
 }
 
-async function newChallenge(env: Env, who: Who, kind: 'create' | 'get') {
+async function newChallenge(env: Env, who: Who, kind: 'create' | 'get', purpose: string | null = null) {
   const challenge = randomToken(32)
   await env.DB.batch([
     env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ?').bind(who.sessionId, kind),
-    env.DB.prepare('INSERT INTO passkey_challenges (session_id, kind, challenge, expires_at) VALUES (?, ?, ?, ?)')
-      .bind(who.sessionId, kind, challenge, inMs(CHALLENGE_MS)),
+    env.DB.prepare('INSERT INTO passkey_challenges (session_id, kind, challenge, expires_at, purpose) VALUES (?, ?, ?, ?, ?)')
+      .bind(who.sessionId, kind, challenge, inMs(CHALLENGE_MS), purpose),
   ])
   return challenge
 }
 
-async function takeChallenge(env: Env, who: Who, kind: 'create' | 'get'): Promise<string> {
-  const c = await env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ? AND expires_at > ? RETURNING challenge')
-    .bind(who.sessionId, kind, now()).first<{ challenge: string }>()
+async function takeChallenge(env: Env, who: Who, kind: 'create' | 'get'): Promise<{ challenge: string; purpose: string | null }> {
+  const c = await env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ? AND expires_at > ? RETURNING challenge, purpose')
+    .bind(who.sessionId, kind, now()).first<{ challenge: string; purpose: string | null }>()
   if (!c) throw new HttpError(400, 'challenge_expired')
-  return c.challenge
+  return c
+}
+
+// 'entry:<tab>' for a tab this session can open whose policy asks a passkey on entry.
+function entryPurpose(env: Env, who: Who, raw: unknown): string | null {
+  if (raw == null) return null
+  const m = /^entry:([a-z][a-z0-9-]{0,30})$/.exec(String(raw))
+  const tab = m?.[1]
+  if (!tab || !tabService(env, tab) || policyOf(tab).entry !== 'passkey' || !canOpen(who, tab)) throw new HttpError(400, 'bad_purpose')
+  return `entry:${tab}`
 }
 
 // From a weak session a passkey can be added only (a) when the portal has no passkey at all,
@@ -477,7 +672,7 @@ async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
   const invite = await canAddPasskey(env, who)
   const b = await body(req)
   const rp = rpOf(url)
-  const challenge = await takeChallenge(env, who, 'create')
+  const { challenge } = await takeChallenge(env, who, 'create')
   let reg
   try {
     reg = await verifyRegistration({
@@ -497,11 +692,12 @@ async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
   return { ok: true }
 }
 
-async function passkeyGetOptions(env: Env, url: URL, who: Who) {
+async function passkeyGetOptions(req: Request, env: Env, url: URL, who: Who) {
+  const purpose = entryPurpose(env, who, (await body(req)).purpose)
   const creds = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE person_id = ?').bind(who.person.id).all<{ credential_id: string }>()
   if (!creds.results.length) throw new HttpError(409, 'no_passkey', { no_passkey: true })
   return {
-    challenge: await newChallenge(env, who, 'get'),
+    challenge: await newChallenge(env, who, 'get', purpose),
     rpId: rpOf(url).id,
     allowCredentials: creds.results.map((c) => ({ type: 'public-key', id: c.credential_id })),
     userVerification: 'required',
@@ -512,7 +708,7 @@ async function passkeyGetOptions(env: Env, url: URL, who: Who) {
 async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
   const b = await body(req)
   const rp = rpOf(url)
-  const challenge = await takeChallenge(env, who, 'get')
+  const { challenge, purpose } = await takeChallenge(env, who, 'get')
   const key = await env.DB.prepare('SELECT * FROM passkeys WHERE credential_id = ? AND person_id = ?')
     .bind(String(b.id ?? ''), who.person.id).first<Row>()
   if (!key) throw new HttpError(400, 'unknown_passkey')
@@ -534,6 +730,15 @@ async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
     env.DB.prepare('UPDATE passkeys SET sign_count = ?, last_used_at = ? WHERE id = ?').bind(count, now(), key.id),
     env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId),
   ])
+  if (purpose?.startsWith('entry:')) {
+    const tab = purpose.slice(6)
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM tab_entries WHERE granted_at < ?').bind(inMs(-2 * 864e5)),
+      env.DB.prepare('INSERT INTO tab_entries (session_id, tab, granted_at) VALUES (?, ?, ?)').bind(who.sessionId, tab, now()),
+    ])
+    await audit(env, req, { who, strength: 'strong', action: 'tab_entry_granted', target: tab })
+    return { ok: true, next: `/${tab}/` }
+  }
   await audit(env, req, { who, strength: 'strong', action: 'passkey_ok' })
   return { ok: true }
 }
@@ -542,7 +747,7 @@ async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
 async function alertsOf(env: Env, who: Who) {
   if (!who.admin) return []
   const r = await env.DB.prepare(
-    `SELECT a.id, a.session_id, a.label, a.place, a.created_at, s.id IS NOT NULL AS live
+    `SELECT a.id, a.kind, a.session_id, a.label, a.place, a.created_at, s.id IS NOT NULL AS live
        FROM device_alerts a LEFT JOIN sessions s ON s.id = a.session_id
       WHERE a.person_id = ? AND a.ack_at IS NULL ORDER BY a.id`,
   ).bind(who.person.id).all<Row>()
@@ -554,8 +759,10 @@ async function me(env: Env, who: Who) {
     person: { id: who.person.id, name: who.person.name },
     groups: who.groups.map((g) => ({ id: g.id, name: g.name })),
     admin: who.admin,
-    tabs: [...who.tabs],
+    tabs: who.tabs.has('*') ? Object.keys(tabBindings(env)) : [...who.tabs],
+    all_tabs: who.admin ? Object.keys(tabBindings(env)) : [],
     session_id: who.sessionId,
+    credential: who.kind,
     strong: fresh(who),
     passkeys: who.admin ? await passkeyCount(env, who.person.id) : 0,
     alerts: await alertsOf(env, who),
@@ -571,7 +778,7 @@ async function myDevices(env: Env, who: Who) {
 async function revokeSession(env: Env, req: Request, who: Who, id: number, anyPerson: boolean) {
   const s = await env.DB.prepare('SELECT id, person_id, label FROM sessions WHERE id = ?').bind(id).first<Row>()
   if (!s || (!anyPerson && Number(s.person_id) !== who.person.id)) throw new HttpError(404, 'device_not_found')
-  await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(id).run()
+  await dropSessions(env, [id])
   await audit(env, req, { who, action: 'device_revoked', target: `${s.person_id}:${s.label ?? ''}` })
 }
 
@@ -593,11 +800,12 @@ function masked<T extends Row>(rows: T[], who: Who, cols: string[]): T[] {
 }
 
 async function listPeople(env: Env) {
-  const people = await env.DB.prepare('SELECT id, name, phone, status, created_at FROM people ORDER BY name').all<Row>()
+  const people = await env.DB.prepare('SELECT id, name, phone, status, kind, created_at FROM people ORDER BY name').all<Row>()
   const links = await env.DB.prepare('SELECT person_id, group_id FROM person_groups').all<Row>()
   const devices = await env.DB.prepare('SELECT person_id, COUNT(*) AS n FROM sessions WHERE expires_at > ? GROUP BY person_id').bind(now()).all<Row>()
   return people.results.map((p) => ({
     ...p,
+    phone: p.kind === 'screen' ? null : p.phone,
     groups: links.results.filter((l) => l.person_id === p.id).map((l) => l.group_id),
     devices: Number(devices.results.find((d) => d.person_id === p.id)?.n ?? 0),
   }))
@@ -639,15 +847,27 @@ async function editPerson(env: Env, req: Request, who: Who, id: number) {
   const status = b.status == null ? undefined : String(b.status)
   if (status && !['active', 'blocked'].includes(status)) throw new HttpError(400, 'bad_status')
   await guardOwner(env, id, { status, groups: b.groups })
-  const exists = await env.DB.prepare('SELECT id FROM people WHERE id = ?').bind(id).first()
+  const exists = await env.DB.prepare('SELECT id, kind FROM people WHERE id = ?').bind(id).first<Row>()
   if (!exists) throw new HttpError(404, 'person_not_found')
+  if (exists.kind === 'screen' && Array.isArray(b.groups)) {
+    const admins = (await env.DB.prepare('SELECT id FROM groups WHERE is_admin = 1').all<{ id: string }>()).results.map((g) => g.id)
+    if (b.groups.some((g) => admins.includes(String(g)))) throw new HttpError(409, 'screen_not_admin')
+  }
   const name = text(b.name, 40)
   if (name) await env.DB.prepare('UPDATE people SET name = ? WHERE id = ?').bind(name, id).run()
   if (status) {
     await env.DB.prepare('UPDATE people SET status = ? WHERE id = ?').bind(status, id).run()
-    if (status === 'blocked') await env.DB.prepare('DELETE FROM sessions WHERE person_id = ?').bind(id).run()
+    if (status === 'blocked') {
+      const ids = await env.DB.prepare('SELECT id FROM sessions WHERE person_id = ?').bind(id).all<{ id: number }>()
+      await dropSessions(env, ids.results.map((x) => x.id))
+      await notifyTabs(env, { person: id })
+    }
   }
-  if (b.groups !== undefined) await setGroups(env, id, b.groups)
+  if (b.groups !== undefined) {
+    await setGroups(env, id, b.groups)
+    // the tabs re-check this person's open sockets (a tab may have been taken away)
+    await notifyTabs(env, { person: id })
+  }
   await audit(env, req, { who, action: 'person_changed', target: String(id), detail: { name, status, groups: b.groups } })
 }
 
@@ -661,8 +881,17 @@ async function editGroup(env: Env, req: Request, who: Who, id: string) {
   const b = await body(req)
   if (!Array.isArray(b.tabs)) throw new HttpError(400, 'bad_tabs')
   const tabs = [...new Set(b.tabs.map((t) => String(t).toLowerCase()).filter((t) => /^[a-z][a-z0-9-]{0,30}$/.test(t)))]
-  const r = await env.DB.prepare('UPDATE groups SET tabs = ? WHERE id = ?').bind(JSON.stringify(tabs), id).run()
-  if (!r.meta.changes) throw new HttpError(404, 'group_not_found')
+  const before = await env.DB.prepare('SELECT tabs FROM groups WHERE id = ?').bind(id).first<{ tabs: string }>()
+  if (!before) throw new HttpError(404, 'group_not_found')
+  await env.DB.prepare('UPDATE groups SET tabs = ? WHERE id = ?').bind(JSON.stringify(tabs), id).run()
+  let old: string[] = []
+  try { old = JSON.parse(before.tabs) } catch { /* bad JSON = no tabs */ }
+  const removed = old.filter((t) => !tabs.includes(t))
+  if (removed.length) {
+    // members lose those tabs now: the tabs close their sockets
+    const members = await env.DB.prepare('SELECT person_id FROM person_groups WHERE group_id = ?').bind(id).all<{ person_id: number }>()
+    for (const m of members.results) for (const t of removed.includes('*') ? Object.keys(tabBindings(env)) : removed) await notifyTabs(env, { person: m.person_id }, t)
+  }
   await audit(env, req, { who, action: 'group_changed', target: id, detail: { tabs } })
 }
 
@@ -729,34 +958,109 @@ function tabBindings(env: Env): Record<string, string> {
   try { return JSON.parse(env.TABS || '{}') } catch { return {} }
 }
 
-async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<Response | null> {
+function tabService(env: Env, tab: string): TabService | null {
   const binding = tabBindings(env)[tab]
-  const service = binding ? (env[binding] as TabService | undefined) : undefined
+  return binding ? ((env[binding] as TabService | undefined) ?? null) : null
+}
+
+const canOpen = (who: Who, tab: string) => who.tabs.has('*') || who.tabs.has(tab)
+
+// Tell every tab (or one) that a credential is gone, so it closes that credential's sockets.
+// Best effort: a tab without revoke() or a failing tab must not block the revocation itself.
+async function notifyTabs(env: Env, ref: RevokeRef, only?: string) {
+  const names = only ? [only] : Object.keys(tabBindings(env))
+  await Promise.allSettled(names.map(async (t) => {
+    const s = tabService(env, t)
+    if (s) await s.revoke?.(ref)
+  }))
+}
+
+const stepUpUrl = (tab: string, next: string) => `/?step_up=${tab}&next=${encodeURIComponent(next)}`
+
+// Face ID on entry: a navigation burns a grant left by a passkey check made for this entry (60 s); anything
+// else inside the tab needs an entry from the last entryHours. Returns when the session entered.
+async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: string): Promise<string | Response> {
+  const policy = policyOf(tab)
+  if (isNavigation(req) && !isUpgrade(req)) {
+    const t = now()
+    const r = await env.DB.prepare('UPDATE tab_entries SET used_at = ? WHERE session_id = ? AND tab = ? AND used_at IS NULL AND granted_at > ? AND granted_at >= ?')
+      .bind(t, who.sessionId, tab, inMs(-ENTRY_GRANT_MS), who.sessionCreatedAt).run()
+    if (r.meta.changes) {
+      await audit(env, req, { who, strength: 'strong', action: 'tab_entered', target: tab })
+      return t
+    }
+    return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, url.pathname), ...API_HEADERS } })
+  }
+  const e = await env.DB.prepare('SELECT used_at FROM tab_entries WHERE session_id = ? AND tab = ? AND used_at > ? AND granted_at >= ? ORDER BY used_at DESC LIMIT 1')
+    .bind(who.sessionId, tab, inMs(-policy.entryHours * 3600e3), who.sessionCreatedAt).first<{ used_at: string }>()
+  if (e) return e.used_at
+  throw new HttpError(401, 'entry_required', { step_up: stepUpUrl(tab, `/${tab}/`) })
+}
+
+async function recordTabAudit(env: Env, req: Request, tab: string, h: Headers, who: Who | null, identity: PortalIdentity) {
+  const a = readTabAudit(h)
+  if (!a) return
+  const ok = a !== 'invalid'
+  await audit(env, req, {
+    who, person: identity.person, strength: who ? strength(who) : identity.credential,
+    action: ok ? `${tab}.${a.action}` : `${tab}.invalid_audit`,
+    target: ok ? a.target : null,
+    detail: ok ? { ...(a.detail as object ?? {}), credential: identity.credential, ...(identity.machine ? { machine: identity.machine } : {}) } : null,
+  })
+}
+
+// Long-lived connection: authenticated here, then the upgrade goes to the tab's fetch() with
+// the identity in X-A5-Identity. The 101 answer goes back as is, minus every header.
+async function forwardSocket(env: Env, req: Request, service: TabService, tab: string, identity: PortalIdentity, who: Who | null): Promise<Response> {
+  const headers = stripRequestHeaders(req.headers)
+  // base64url of the UTF-8 JSON: a header value cannot carry characters above U+00FF (emoji)
+  headers.set('X-A5-Identity', b64url(new TextEncoder().encode(JSON.stringify(identity))))
+  const res = await service.fetch(new Request(req.url, { method: 'GET', headers }))
+  await recordTabAudit(env, req, tab, res.headers, who, identity)
+  if (res.status !== 101 || !res.webSocket) {
+    const out = new Response(res.body, { status: res.status, headers: res.headers })
+    sanitizeTabHeaders(out.headers, API_HEADERS, tab, null)
+    return out
+  }
+  return new Response(null, { status: 101, webSocket: res.webSocket })
+}
+
+async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<Response | null> {
+  const service = tabService(env, tab)
   if (!service) return null
   const who = await currentSession(req, env)
   if (!who) {
-    if (req.method === 'GET' && (req.headers.get('Accept') ?? '').includes('text/html'))
-      return new Response(null, { status: 302, headers: { Location: `/?next=${encodeURIComponent(url.pathname)}` } })
+    if (isNavigation(req)) return new Response(null, { status: 302, headers: { Location: `/?next=${encodeURIComponent(url.pathname)}`, ...API_HEADERS } })
     throw new HttpError(401, 'signed_out')
   }
-  if (!who.tabs.has('*') && !who.tabs.has(tab)) throw new HttpError(403, 'no_tab_access')
+  if (!canOpen(who, tab)) throw new HttpError(403, 'no_tab_access')
+  const policy = policyOf(tab)
+  if (!policy.credentials.includes(who.kind)) throw new HttpError(403, 'no_tab_access')
   requireSameOrigin(req, url)
-  // The tab never sees the session cookie, client auth headers or spoofed portal headers.
-  const headers = new Headers(req.headers)
-  for (const k of [...headers.keys()]) {
-    const l = k.toLowerCase()
-    if (l === 'cookie' || l === 'authorization' || l.startsWith('x-portal') || l.startsWith('x-a5-')) headers.delete(k)
+  // a page socket carries the cookie, so it must come from the portal's own pages
+  if (isUpgrade(req) && req.headers.get('Origin') !== url.origin) throw new HttpError(403, 'bad_origin')
+  // a service worker could serve the tab's pages from cache and skip the entry check
+  if (!policy.serviceWorker && req.headers.get('Service-Worker') === 'script') throw new HttpError(403, 'no_service_worker')
+
+  let enteredAt: string | null = null
+  if (policy.entry === 'passkey') {
+    const e = await checkEntry(env, req, url, who, tab)
+    if (e instanceof Response) return e
+    enteredAt = e
   }
-  const forwarded = new Request(req.url, { method: req.method, headers, body: req.body })
   const identity: PortalIdentity = {
-    person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id), session: who.sessionId,
-    credential: 'browser', strong: fresh(who), actions: [], // per-tab actions arrive with the first tab that has commands
+    credential: who.kind, person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id),
+    session: who.sessionId, machine: null, strong: fresh(who), entered_at: enteredAt,
+    entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null, actions: [],
   }
+  if (isUpgrade(req)) return forwardSocket(env, req, service, tab, identity, who)
+
+  const forwarded = new Request(req.url, { method: req.method, headers: stripRequestHeaders(req.headers), body: req.body })
   const res = await service.handle(forwarded, identity)
-  // A tab is same-origin with the portal: it cannot set cookies or loosen the page policy.
+  await recordTabAudit(env, req, tab, res.headers, who, identity)
+  // A tab shares the portal's origin: it cannot set cookies or loosen the page policy.
   const out = new Response(res.body, { status: res.status, statusText: res.statusText, headers: res.headers })
-  out.headers.delete('Set-Cookie')
-  for (const [k, v] of Object.entries(PAGE_HEADERS)) out.headers.set(k, v)
+  sanitizeTabHeaders(out.headers, PAGE_HEADERS, tab, url.origin)
   if (who.refreshCookie) out.headers.append('Set-Cookie', who.refreshCookie)
   return out
 }
@@ -769,15 +1073,20 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
   if (path === '/robo/login' && m === 'POST') return robotLogin(req, env)
   if (path.startsWith('/robo/')) throw new HttpError(404, 'not_found')
+  let mb: RegExpMatchArray | null
+  if ((mb = path.match(/^\/_bridge\/([a-z][a-z0-9-]{0,30})$/))) return bridge(req, env, mb[1])
+  if (path.startsWith('/_bridge')) throw new HttpError(404, 'not_found')
 
   if (path.startsWith('/api/')) {
     requireSameOrigin(req, url)
     if (path === '/api/login/start' && m === 'POST') return loginStart(req, env)
     if (path === '/api/login/status' && m === 'POST') return loginStatus(req, env)
+    if (path === '/api/pair/start' && m === 'POST') return pairStart(req, env, url)
+    if (path === '/api/pair/status' && m === 'POST') return pairStatus(req, env)
     if (path === '/api/logout' && m === 'POST') {
       const who = await currentSession(req, env)
       if (who) {
-        await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(who.sessionId).run()
+        await dropSessions(env, [who.sessionId])
         await audit(env, req, { who, action: 'logout' })
       }
       return json({ ok: true }, 200, { 'Set-Cookie': clearCookie() })
@@ -802,7 +1111,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
     }
     if (path === '/api/passkey/create/options' && m === 'POST') return out(await passkeyCreateOptions(env, url, who))
     if (path === '/api/passkey/create/verify' && m === 'POST') return out(await passkeyCreateVerify(req, env, url, who))
-    if (path === '/api/passkey/get/options' && m === 'POST') return out(await passkeyGetOptions(env, url, who))
+    if (path === '/api/passkey/get/options' && m === 'POST') return out(await passkeyGetOptions(req, env, url, who))
     if (path === '/api/passkey/get/verify' && m === 'POST') return out(await passkeyGetVerify(req, env, url, who))
 
     if (path.startsWith('/api/admin/')) {
@@ -814,6 +1123,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
         if (path === '/api/admin/requests') return out(masked(await listRequests(env), who, ['typed_phone', 'sender_phone']))
         if (path === '/api/admin/devices') return out(await listAllDevices(env))
         if (path === '/api/admin/audit') return out(masked(await listAudit(env, url), who, ['detail']))
+        if (path === '/api/admin/pair') return out(await pairLookup(req, env, url))
+        if (path === '/api/admin/machines') return out(await listMachines(env))
         throw new HttpError(404, 'not_found')
       }
       // writes: passkey in the last 5 minutes
@@ -835,6 +1146,12 @@ async function handle(req: Request, env: Env): Promise<Response> {
         return out(await resolveRequest(env, req, who, Number(mm[1]), mm[2] as 'approve' | 'refuse'))
       if ((mm = path.match(/^\/api\/admin\/devices\/(\d+)$/)) && m === 'DELETE') {
         await revokeSession(env, req, who, Number(mm[1]), true)
+        return out({ ok: true })
+      }
+      if (path === '/api/admin/pair' && m === 'POST') return out(await pairApprove(env, req, who))
+      if (path === '/api/admin/machines' && m === 'POST') return out(await addMachine(env, req, who))
+      if ((mm = path.match(/^\/api\/admin\/machines\/(\d+)$/)) && m === 'DELETE') {
+        await revokeMachine(env, req, who, Number(mm[1]))
         return out({ ok: true })
       }
     }

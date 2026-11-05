@@ -9,3 +9,4 @@ node_modules/
 *.vars
 .wrangler.deploy.toml
 .deploy.local
+.wrangler.test.toml

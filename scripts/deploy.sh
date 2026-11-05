@@ -55,10 +55,24 @@ print(s)
 PY
 
 npx tsc --noEmit
+
+# 4. backup of the remote D1 before any migration. It holds personal data (names, numbers):
+# outside the repository, folder 700, file 600, never printed. The last 5 are kept; older ones
+# go to the macOS Trash. No backup, no deploy.
+BACKUPS="$HOME/Library/Application Support/portal-a5/backups"
+mkdir -p "$BACKUPS" && chmod 700 "$BACKUPS"
+BACKUP="$BACKUPS/portal_a5_$(date -u +%Y%m%dT%H%M%SZ)_${COMMIT:0:7}.sql"
+( umask 077; npx wrangler d1 export portal_a5 --remote --output "$BACKUP" -c "$CFG" >/dev/null 2>&1 ) \
+  || { echo "D1 backup failed; nothing deployed" >&2; exit 1; }
+[ -s "$BACKUP" ] && grep -q 'CREATE TABLE' "$BACKUP" || { echo "D1 backup is empty; nothing deployed" >&2; exit 1; }
+chmod 600 "$BACKUP"
+echo "D1 backup: $BACKUP"
+ls -1t "$BACKUPS"/portal_a5_*.sql | tail -n +6 | while IFS= read -r old; do /usr/bin/trash "$old"; done
+
 npx wrangler d1 migrations apply portal_a5 --remote -c "$CFG"
 npx wrangler deploy -c "$CFG"
 
-# 4. secrets through stdin
+# 5. secrets through stdin
 kc portal-a5-robot-key | grep -q '^pa5_robo_' || { echo "robot key must start with pa5_robo_" >&2; exit 1; }
 kc portal-a5-robot-key | npx wrangler secret put ROBOT_LOGIN_KEY -c "$CFG" >/dev/null
 kc portal-a5-owner-phone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null

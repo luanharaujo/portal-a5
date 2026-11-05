@@ -31,3 +31,7 @@ button.link { background: none; color: var(--accent); padding: 10px 4px; }
 .tabs a { font-size: 1.1rem; }
 .alert { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 12px; padding: 12px 16px; margin: 12px 0; }
 .toast { position: fixed; left: 16px; right: 16px; bottom: 16px; max-width: 600px; margin: 0 auto; background: var(--fg); color: var(--bg); padding: 12px 16px; border-radius: 10px; }
+.pair-code { font: 700 2.4rem ui-monospace, Menlo, monospace; letter-spacing: .12em; margin: 8px 0; }
+.qr { display: block; width: 216px; height: 216px; image-rendering: pixelated; margin: 8px 0; }
+select { width: 100%; padding: 10px 12px; font-size: 1rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); margin: 4px 0 8px; }
+.danger-box { background: var(--danger); color: #fff; border-radius: 8px; padding: 10px 12px; font-weight: 600; }

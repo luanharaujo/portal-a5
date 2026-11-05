@@ -90,13 +90,13 @@ async function passkeyCreate() {
   })
 }
 
-async function passkeyCheck() {
-  const o = await rawApi('POST', '/api/passkey/get/options', {})
+async function passkeyCheck(purpose) {
+  const o = await rawApi('POST', '/api/passkey/get/options', purpose ? { purpose } : {})
   const cred = await navigator.credentials.get({
     publicKey: { ...o, challenge: b64uToBuf(o.challenge), allowCredentials: o.allowCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) })) },
   })
   const r = cred.response
-  await rawApi('POST', '/api/passkey/get/verify', {
+  return rawApi('POST', '/api/passkey/get/verify', {
     id: cred.id,
     clientDataJSON: bufToB64u(r.clientDataJSON),
     authenticatorData: bufToB64u(r.authenticatorData),
@@ -122,7 +122,7 @@ function loginView() {
   input,
   el('button', { type: 'submit' }, T.signIn),
   el('p', { class: 'muted' }, T.signInHint))
-  show(form)
+  show(form, el('p', {}, el('button', { class: 'link', onclick: () => guarded(pairScreenView) }, T.pair.isScreen)))
   input.focus()
 }
 
@@ -147,6 +147,59 @@ async function askCode(phone) {
   pollTimer = setTimeout(poll, 2000)
 }
 
+// ------------------------------------------------------------------ fixed screen pairing (screen side)
+function drawQr(text) {
+  const qr = qrcode(0, 'M')
+  qr.addData(text)
+  qr.make()
+  const n = qr.getModuleCount()
+  const scale = 6
+  const quiet = 4
+  const size = (n + quiet * 2) * scale
+  const c = el('canvas', { width: size, height: size, class: 'qr', 'aria-label': T.pair.qrLabel })
+  const g = c.getContext('2d')
+  g.fillStyle = '#fff'
+  g.fillRect(0, 0, size, size)
+  g.fillStyle = '#000'
+  for (let r = 0; r < n; r++) for (let k = 0; k < n; k++) if (qr.isDark(r, k)) g.fillRect((k + quiet) * scale, (r + quiet) * scale, scale, scale)
+  return c
+}
+
+async function pairScreenView() {
+  clearTimeout(pollTimer)
+  const r = await rawApi('POST', '/api/pair/start', {})
+  const status = el('p', { class: 'muted' }, T.pair.waiting)
+  show(el('div', { class: 'card pair' },
+    el('h2', {}, T.pair.title),
+    el('p', {}, T.pair.howTo),
+    el('p', { class: 'pair-code' }, r.code),
+    drawQr(r.pair_url),
+    status,
+    el('button', { class: 'link', onclick: () => { clearTimeout(pollTimer); loginView() } }, T.back)))
+  const poll = async () => {
+    let s
+    try { s = await rawApi('POST', '/api/pair/status', { secret: r.secret }) } catch (e) { status.textContent = e.message; return }
+    if (s.status === 'ok') { location.href = nextPath() || '/'; return }
+    if (s.status === 'expired') return pairScreenView() // a fresh code, the screen stays unattended
+    status.textContent = T.pair.status[s.status] || s.status
+    if (s.status === 'waiting') pollTimer = setTimeout(poll, 3000)
+  }
+  pollTimer = setTimeout(poll, 3000)
+}
+
+// ------------------------------------------------------------------ Face ID before entering a tab (D9)
+function stepUpView(tab) {
+  const next = nextPath() || `/${tab}/`
+  show(el('div', { class: 'card' },
+    el('h2', {}, T.stepUp.title(tab)),
+    el('p', {}, T.stepUp.why),
+    el('button', { onclick: () => guarded(async () => {
+      const r = await passkeyCheck(`entry:${tab}`)
+      location.href = next.startsWith(`/${tab}/`) ? next : r.next
+    }) }, T.stepUp.confirm),
+    el('button', { class: 'link', onclick: () => { history.replaceState(null, '', '/'); homeView() } }, T.back)))
+}
+
 // ------------------------------------------------------------------ home
 function nav() {
   return el('nav', { class: 'nav' },
@@ -159,10 +212,10 @@ function nav() {
 function renderAlerts() {
   const list = ME.alerts || []
   $alerts.replaceChildren(...list.map((a) => el('div', { class: 'alert' },
-    el('strong', {}, T.newDevice(ME.person.name)),
+    el('strong', {}, a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : T.newDevice(ME.person.name)),
     `${a.label || T.device}, ${when(a.created_at)}${a.place ? ', ' + a.place : ''}${a.current ? T.thisDevice : ''}. `,
     el('button', { onclick: () => guarded(async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await start() }) }, T.itWasMe),
-    a.current || !a.live ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await start() }) }, T.revoke))))
+    a.current || !a.live || a.kind !== 'device' ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await start() }) }, T.revoke))))
 }
 
 function homeView() {
@@ -185,10 +238,13 @@ async function devicesView() {
 
 // ------------------------------------------------------------------ admin
 async function adminView() {
-  const [people, groups, requests, devices] = await Promise.all([
+  const [allPeople, groups, requests, devices, machines] = await Promise.all([
     rawApi('GET', '/api/admin/people'), rawApi('GET', '/api/admin/groups'),
     rawApi('GET', '/api/admin/requests'), rawApi('GET', '/api/admin/devices'),
+    rawApi('GET', '/api/admin/machines'),
   ])
+  const people = allPeople.filter((p) => p.kind !== 'screen')
+  const screens = allPeople.filter((p) => p.kind === 'screen')
   const groupBoxes = (selected, name) => el('span', { class: 'boxes' }, groups.map((g) =>
     el('label', {}, el('input', { type: 'checkbox', name, value: g.id, checked: selected.includes(g.id) }), groupName(g))))
   const checked = (form, name) => [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((i) => i.value)
@@ -254,7 +310,7 @@ async function adminView() {
 
   const devicesCard = el('section', { class: 'card' }, el('h2', {}, T.allDevices),
     el('ul', { class: 'rows' }, devices.map((d) => el('li', {},
-      el('div', {}, el('strong', {}, d.name), ` · ${d.label || ''}`),
+      el('div', {}, el('strong', {}, d.name), ` · ${d.label || ''}`, d.kind === 'screen' ? T.pair.screenTag : ''),
       el('div', { class: 'muted' }, T.devLine(when(d.created_at), d.place, when(d.last_used_at))),
       d.id === ME.session_id ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/admin/devices/${d.id}`); adminView() }) }, T.disconnect)))))
 
@@ -265,7 +321,56 @@ async function adminView() {
         el('li', {}, `${when(a.at)} · ${a.name || '-'} · ${a.strength || ''} · ${a.action}${a.target ? ' · ' + a.target : ''}${a.place ? ' · ' + a.place : ''}`))))
     }) }, T.showAudit))
 
-  show(nav(), passkeyCard, reqCard, peopleCard, groupsCard, devicesCard, auditCard)
+  // fixed screens: type the code shown on the screen (or arrive here from its QR)
+  const pairCode = el('input', { placeholder: T.pair.codePlaceholder, maxlength: 12, value: adminView.pairCode || '', autocapitalize: 'characters' })
+  adminView.pairCode = ''
+  const pairInfo = el('div')
+  const screenSel = el('select', {}, el('option', { value: '' }, T.pair.newScreen), screens.map((s) => el('option', { value: s.id }, s.name)))
+  const screenName = el('input', { placeholder: T.pair.screenName, maxlength: 40 })
+  screenSel.addEventListener('change', () => { screenName.hidden = !!screenSel.value })
+  const lookup = async () => {
+    const code = pairCode.value.trim()
+    if (!code) return
+    try {
+      const p = await rawApi('GET', `/api/admin/pair?code=${encodeURIComponent(code)}`)
+      pairInfo.replaceChildren(
+        el('p', { class: 'muted' }, T.pair.asking(p.label || T.device, p.place, when(p.created_at), p.ip)),
+        p.same_ip ? null : el('p', { class: 'danger-box' }, p.other_ip_refused ? T.pair.otherIpRefused(p.ip, p.admin_ip) : T.pair.otherIp(p.ip, p.admin_ip)))
+    } catch (e) { pairInfo.replaceChildren(el('p', { class: 'muted' }, e.message)) }
+  }
+  pairCode.addEventListener('change', () => guarded(lookup))
+  if (pairCode.value) guarded(lookup)
+  const screensCard = el('section', { class: 'card' }, el('h2', {}, T.pair.screens),
+    screens.length ? el('ul', { class: 'rows' }, screens.map((s) => el('li', {},
+      el('strong', {}, s.name), T.devicesCount(s.devices), s.status === 'blocked' ? T.blocked : '',
+      el('button', { class: s.status === 'blocked' ? '' : 'danger', onclick: () => guarded(async () => {
+        await api('POST', `/api/admin/people/${s.id}`, { status: s.status === 'blocked' ? 'active' : 'blocked' }); adminView()
+      }) }, s.status === 'blocked' ? T.unblock : T.block)))) : el('p', { class: 'muted' }, T.pair.noScreens),
+    el('h3', {}, T.pair.pairTitle),
+    pairCode, pairInfo, screenSel, screenName,
+    el('button', { onclick: () => guarded(async () => {
+      await api('POST', '/api/admin/pair', screenSel.value ? { code: pairCode.value, screen: Number(screenSel.value) } : { code: pairCode.value, name: screenName.value })
+      toast(T.pair.approved); adminView()
+    }) }, T.pair.approve))
+
+  // machine bridges: one key per machine and tab, shown once
+  const tabNames = ME.all_tabs || []
+  const mTab = el('select', {}, tabNames.map((t) => el('option', { value: t }, t)))
+  const mLabel = el('input', { placeholder: T.bridges.label, maxlength: 40 })
+  const newKey = el('div')
+  const bridgesCard = el('section', { class: 'card' }, el('h2', {}, T.bridges.title),
+    machines.length ? el('ul', { class: 'rows' }, machines.map((m) => el('li', {},
+      el('div', {}, el('strong', {}, `${m.tab} · ${m.label}`), m.revoked_at ? T.bridges.revoked : ''),
+      el('div', { class: 'muted' }, T.bridges.line(when(m.created_at), when(m.last_used_at), m.last_ip)),
+      m.revoked_at ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/admin/machines/${m.id}`); adminView() }) }, T.revoke)))) : el('p', { class: 'muted' }, T.bridges.none),
+    tabNames.length ? [el('h3', {}, T.bridges.add), mTab, mLabel,
+      el('button', { onclick: () => guarded(async () => {
+        const r = await api('POST', '/api/admin/machines', { tab: mTab.value, label: mLabel.value })
+        newKey.replaceChildren(el('p', {}, T.bridges.copyOnce), el('p', { class: 'code' }, r.key),
+          el('button', { onclick: () => navigator.clipboard.writeText(r.key).then(() => toast(T.bridges.copied)) }, T.bridges.copy))
+      }) }, T.bridges.create), newKey] : null)
+
+  show(nav(), passkeyCard, reqCard, screensCard, peopleCard, groupsCard, devicesCard, bridgesCard, auditCard)
 }
 
 // ------------------------------------------------------------------ boot
@@ -275,12 +380,25 @@ async function start() {
     ME = await rawApi('GET', '/api/me')
   } catch (e) {
     ME = null
-    if (e instanceof ApiError && e.status === 401) return loginView()
+    if (e instanceof ApiError && e.status === 401) {
+      if (new URLSearchParams(location.search).get('screen') === '1') return guarded(pairScreenView)
+      return loginView()
+    }
     show(el('p', { class: 'card' }, T.offline))
     return
   }
   $who.textContent = ME.person.name
   renderAlerts()
+  const q = new URLSearchParams(location.search)
+  const stepUp = q.get('step_up')
+  if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return stepUpView(stepUp)
+  if (q.get('pair') && ME.admin) {
+    adminView.pairCode = q.get('pair').slice(0, 12)
+    history.replaceState(null, '', '/')
+    return guarded(adminView)
+  }
+  const n = nextPath()
+  if (n && ME.credential === 'screen') { location.href = n; return }
   homeView()
 }
 
