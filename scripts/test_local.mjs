@@ -520,7 +520,7 @@ check('/_shell/tabs.css served', (await fetch(BASE + '/_shell/tabs.css')).status
 check('locale exposes the selector texts under A5_TEXT', /window\.A5_TEXT = window\.T/.test(await (await fetch(BASE + '/locale/pt-BR.js')).text()))
 check('portal page loads the selector', /\/_shell\/tabs\.js/.test(home.data) && /\/_shell\/tabs\.css/.test(home.data))
 const acc = await navigate(owner, '/conta/')
-check('account page: the portal page with the portal CSP', acc.status === 200 && /id="title"/.test(acc.data) && acc.headers.get('content-security-policy') === ownerCsp, [acc.status, acc.headers.get('content-security-policy')])
+check('account page: the portal page with the portal CSP', acc.status === 200 && /id="toast"/.test(acc.data) && /\/visual\.css/.test(acc.data) && acc.headers.get('content-security-policy') === ownerCsp, [acc.status, acc.headers.get('content-security-policy')])
 check('account page answers signed out too (sign-in screen)', (await navigate(anon, '/conta/')).status === 200)
 check('/conta redirects to /conta/', (await navigate(owner, '/conta')).status === 301)
 check('reserved name: /conta/* never reaches a tab', (await navigate(owner, '/conta/echo')).status === 404)

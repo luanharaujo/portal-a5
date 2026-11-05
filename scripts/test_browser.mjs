@@ -132,16 +132,21 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     await o.evaluate(`document.querySelector('[data-a5-tabs]').focus()`)
     await press(o, 'Enter'); await press(o, 'End'); await press(o, 'Enter')
     check('browser: choosing Conta opens /conta/', await o.waitFor(`location.pathname === '/conta/' && ${ON}`))
+    await o.waitFor(`!!document.querySelector('.index .profile')`)
     const c = await o.evaluate(`({ title: document.querySelector('[data-a5-tabs]').firstChild.textContent, last: localStorage.getItem('a5.lastTab'),
-      devices: !!document.querySelector('main .card') })`)
+      devices: !!document.querySelector('.index .profile') && !!document.querySelector('.index a.row[href="#aparelhos"]') })`)
     check('browser: Conta has the selector in its title and lists the devices', c.title === 'Conta' && c.devices, c)
     check('browser: Conta is remembered as the last tab', c.last === 'conta', c)
     check('browser: no CSP violation on the account page', !o.log.some((x) => /Content Security Policy|exception/i.test(x)), o.log)
-    // the admin view: brake and Shortcuts keys cards, keys listed without the key itself
-    await o.evaluate(`[...document.querySelectorAll('nav button, button')].find((b) => b.textContent === T.nav.admin).click()`)
-    const adm = await o.waitFor(`[...document.querySelectorAll('main h2')].some((h) => h.textContent === T.shortcuts.title) && [...document.querySelectorAll('main h2')].some((h) => h.textContent === T.commands.title)`)
-    check('browser: admin view shows the brake and the Shortcuts keys', adm)
-    check('browser: admin view lists keys but never a key value', await o.evaluate(`!document.body.textContent.includes('pa5_atl_') && document.body.textContent.includes('tab-a · tv')`))
+    // the account index opens each part: the brake and the Shortcuts keys, keys listed without the key itself
+    await o.evaluate(`document.querySelector('.index a.row[href="#comandos"]').click()`)
+    const brake = await o.waitFor(`document.querySelector('.pane h1')?.textContent === T.commands.title`)
+    await o.evaluate(`document.querySelector('.index a.row[href="#atalhos"]')?.click() ?? (location.hash = '#atalhos')`)
+    const keys = await o.waitFor(`document.querySelector('.pane h1')?.textContent === T.shortcuts.title`)
+    check('browser: account parts show the brake and the Shortcuts keys', brake && keys)
+    check('browser: Shortcuts part lists keys but never a key value', await o.evaluate(`!document.body.textContent.includes('pa5_atl_') && document.querySelector('.pane').textContent.includes('tab-a · tv')`))
+    await o.evaluate(`location.hash = ''`)
+    check('browser: back to the index from a part', await o.waitFor(`!!document.querySelector('.index .profile') && getComputedStyle(document.querySelector('.side')).display !== 'none'`))
     check('browser: no error on the admin view', !o.log.some((x) => /Content Security Policy|exception/i.test(x)), o.log)
 
     // "/" opens the last tab on this device
@@ -181,10 +186,10 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
       await p.go('/?screen=1&next=%2Ftab-a%2F%3Fview%3Dlandscape')
       check('browser: pairing page shows a code', await p.waitFor(`!!document.querySelector('.pair-code')`))
       await sleep(7000) // at least one status poll has answered "waiting"
-      const waitingText = await p.evaluate(`document.querySelector('.pair .muted').textContent`)
+      const waitingText = await p.evaluate(`document.querySelector('.pair .status').textContent`)
       check('browser: pairing status is translated while waiting', waitingText === await p.evaluate('A5_TEXT.pair.waiting'), waitingText)
       await approve(await p.evaluate(`document.querySelector('.pair-code').textContent`))
-      check('browser: paired screen lands on next, query kept', await p.waitFor(`location.pathname + location.search === '/tab-a/?view=landscape'`, 8000), [await p.evaluate('location.href'), await p.evaluate(`document.querySelector('.pair .muted')?.textContent`), p.log])
+      check('browser: paired screen lands on next, query kept', await p.waitFor(`location.pathname + location.search === '/tab-a/?view=landscape'`, 8000), [await p.evaluate('location.href'), await p.evaluate(`document.querySelector('.pair .status')?.textContent`), p.log])
     }
 
     // signed out: "/" and /conta/ show the sign-in page, title without a selector
@@ -206,19 +211,17 @@ export async function agentPairChecks({ base, check, owner, prepare, approve }) 
     const req = await prepare()
     const sp = await page(b, base, null)
     await sp.go(new URL(req.screen_url).pathname + new URL(req.screen_url).hash)
-    check('browser: agent link shows the screen name and waits', await sp.waitFor(`document.querySelector('.pair h2')?.textContent === ${JSON.stringify(req.name)}`))
+    check('browser: agent link shows the screen name and waits', await sp.waitFor(`document.querySelector('.pair h1')?.textContent === ${JSON.stringify(req.name)}`))
     check('browser: ticket leaves the address bar', await sp.evaluate(`!location.href.includes('screen_ticket')`))
     const o = await page(b, base, owner)
     await o.go(new URL(req.approve_url).pathname + new URL(req.approve_url).search)
     check('browser: approval page shows the request with an enabled Face ID button',
-      await o.waitFor(`(() => { const h = document.querySelector('main h2'); const btn = [...document.querySelectorAll('main button')].find((x) => x.textContent === A5_TEXT.agentReq.approve); return h && h.textContent === A5_TEXT.agentReq.pairTitle(${JSON.stringify(req.name)}) && btn && !btn.disabled })()`),
+      await o.waitFor(`(() => { const h = document.querySelector('.pane h1'); const btn = [...document.querySelectorAll('main button')].find((x) => x.textContent === A5_TEXT.agentReq.approve); return h && h.textContent === A5_TEXT.agentReq.pairTitle(${JSON.stringify(req.name)}) && btn && !btn.disabled })()`),
       [await o.evaluate(`document.querySelector('main')?.textContent`), o.log])
     check('browser: approval page has no error', !o.log.some((t) => /Content Security Policy|exception/i.test(t)), o.log)
     await approve(req.id)
     // G6: "Bloquear" asks twice; the first tap only changes the label
-    await o.go('/conta/')
-    await o.waitFor(`[...document.querySelectorAll('nav button')].some((x) => x.textContent === A5_TEXT.nav.admin)`)
-    await o.evaluate(`[...document.querySelectorAll('nav button')].find((x) => x.textContent === A5_TEXT.nav.admin).click()`)
+    await o.go('/conta/#telas')
     const armed = await o.waitFor(`(() => { const b = [...document.querySelectorAll('main button')].find((x) => x.textContent === A5_TEXT.block); if (!b) return false; b.click(); return b.textContent === A5_TEXT.confirmBlock })()`)
     await new Promise((r) => setTimeout(r, 500))
     check('browser: first tap on Bloquear only asks again', armed && await o.evaluate(`!document.querySelector('main').textContent.includes(A5_TEXT.unblock)`), o.log)

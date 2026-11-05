@@ -234,6 +234,8 @@ There is no home page. `/` opens the last tab used on that device (`localStorage
 <meta name="apple-mobile-web-app-title" content="Portal A5">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0d1117">
+<link rel="apple-touch-startup-image" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/splash/splash-1179x2556.png">
+<!-- ...one line per iPhone size: copy all ten from the portal's public/index.html -->
 <link rel="stylesheet" href="/_shell/tabs.css">
 <script src="/locale/pt-BR.js" defer></script>
 <script src="/_shell/tabs.js" defer></script>
@@ -241,7 +243,7 @@ There is no home page. `/` opens the last tab used on that device (`localStorage
 <h1><button type="button" data-a5-tabs>Notes</button></h1>
 ```
 
-- The first nine lines make the whole portal one home-screen app (one manifest, scope `/`, same icon and name). Without them, a page saved to the iPhone home screen from inside a tab gets no icon. The files live on the portal; the tab CSP's `default-src 'self'` already allows them. With `black-translucent` the page runs under the status bar: pad the top with `env(safe-area-inset-top)`.
+- The first nine lines make the whole portal one home-screen app (one manifest, scope `/`, same icon and name). Without them, a page saved to the iPhone home screen from inside a tab gets no icon. The files live on the portal; the tab CSP's `default-src 'self'` already allows them. With `black-translucent` the page runs under the status bar: pad the top with `env(safe-area-inset-top)`. The `apple-touch-startup-image` lines (ten, in the portal's `public/index.html`) give the iPhone app its launch screen, the house at night; without them a home-screen launch from the tab starts on a blank page.
 - The script asks `GET /api/tabs?current=<tab>`, adds an SVG arrow and the dot to the marked title and turns it into a menu button. With no selector (fixed screens, signed out, any error) the title stays a plain title, and `tabs.css` keeps a marked `<button>` looking like the title around it.
 - The list opens on tap, click, Enter, Space or arrow down; closes on Esc, a tap outside or the title again. Arrow keys, Home and End move, Enter or Space picks (TV remotes and keyboards: nothing needs hover). Focus stays in the list while it is open. Picking is a full page navigation (`location.assign`), never an iframe, and records `a5.lastTab`. The tab page also records itself on load.
 - Counts come back when the page loads, when the list opens and when the page becomes visible again (`visibilitychange`). No polling.
