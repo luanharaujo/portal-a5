@@ -212,7 +212,7 @@ The tab never says who did it: the portal fills that in. Events with no request 
 - Sockets: Hibernation API; one bridge per machine; check `identity.credential`.
 - Commands: section 6 rules, and a security review of the tab and its bridge before they are switched on.
 - Ask the portal for its policy line (features, entry, credentials) and binding.
-- Title marked with `data-a5-tabs` and the selector's files loaded (section 9); `badge` if something waits for people there.
+- Title marked with `data-a5-tabs`, the selector's files and the home-screen app lines in `<head>` (section 9); `badge` if something waits for people there.
 
 ## 9. Tab selector and pending counts
 
@@ -221,6 +221,15 @@ There is no home page. `/` opens the last tab used on that device (`localStorage
 ### In the tab page
 
 ```html
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Portal A5">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1117">
 <link rel="stylesheet" href="/_shell/tabs.css">
 <script src="/locale/pt-BR.js" defer></script>
 <script src="/_shell/tabs.js" defer></script>
@@ -228,6 +237,7 @@ There is no home page. `/` opens the last tab used on that device (`localStorage
 <h1><button type="button" data-a5-tabs>Notes</button></h1>
 ```
 
+- The first nine lines make the whole portal one home-screen app (one manifest, scope `/`, same icon and name). Without them, a page saved to the iPhone home screen from inside a tab gets no icon. The files live on the portal; the tab CSP's `default-src 'self'` already allows them. With `black-translucent` the page runs under the status bar: pad the top with `env(safe-area-inset-top)`.
 - The script asks `GET /api/tabs?current=<tab>`, adds an SVG arrow and the dot to the marked title and turns it into a menu button. With no selector (fixed screens, signed out, any error) the title stays a plain title, and `tabs.css` keeps a marked `<button>` looking like the title around it.
 - The list opens on tap, click, Enter, Space or arrow down; closes on Esc, a tap outside or the title again. Arrow keys, Home and End move, Enter or Space picks (TV remotes and keyboards: nothing needs hover). Focus stays in the list while it is open. Picking is a full page navigation (`location.assign`), never an iframe, and records `a5.lastTab`. The tab page also records itself on load.
 - Counts come back when the page loads, when the list opens and when the page becomes visible again (`visibilitychange`). No polling.
