@@ -15,15 +15,29 @@ KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 # The portal plus a fake tab worker bound as several tabs (test/fake_tab), written through the
 # same generator as a deploy. tab-a: session entry, screens allowed. tab-b: Face ID on entry.
 # tab-slow and tab-odd: badges that are slow or malformed. The portal must drop conta (a
-# reserved name), tab-bad (an unknown key) and tab-nopolicy (no policy written out).
+# reserved name), tab-bad (an unknown key), tab-nopolicy (no policy written out) and tab-badcmd
+# (one malformed command). tab-a carries the commands of the stage 3 tests.
+node scripts/test_commands.mjs >/dev/null || { node scripts/test_commands.mjs | grep -v "^ok"; exit 1; }
+echo "ok   unit checks of src/commands.ts"
 TESTCFG=".wrangler.test.toml"
 cat > "$STATE/tabs.json" <<'EOF2'
 {
   "tab-a": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab A", "icon": "bolt",
-            "allow": ["screen-wake-lock"], "entry": "session", "credentials": ["browser", "screen", "machine"]},
+            "allow": ["screen-wake-lock"], "entry": "session", "credentials": ["browser", "screen", "machine"],
+            "commands": {
+              "tv": {"level": "common", "params": {"mode": {"enum": ["on", "off", "globo"]}}, "perHour": 5, "screens": true, "returns": ["state"]},
+              "ac": {"level": "common", "params": {"unit": {"enum": ["a", "b"]}}, "gap": {"seconds": 180, "by": "unit"}},
+              "light": {"level": "common", "perHour": 100},
+              "slow": {"level": "common"},
+              "boom": {"level": "common"},
+              "presence": {"level": "admin", "params": {"state": {"enum": ["out", "home"]}}, "perHour": 30},
+              "wipe": {"level": "sensitive"}
+            }},
   "tab-b": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab B", "icon": "mic",
             "allow": ["microphone", "screen-wake-lock"], "entry": "passkey", "entryHours": 4,
-            "credentials": ["browser", "machine"], "serviceWorker": false},
+            "credentials": ["browser", "machine"], "serviceWorker": false, "commands": {"ping": {"level": "common"}}},
+  "tab-badcmd": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "allow": [], "entry": "session", "credentials": ["browser"],
+            "commands": {"tv": {"level": "common"}, "rm": {"level": "root"}}},
   "tab-slow": {"service": "portal-a5-fake-tab", "entrypoint": "SlowTab", "allow": [], "entry": "session", "credentials": ["browser"]},
   "tab-odd": {"service": "portal-a5-fake-tab", "entrypoint": "OddTab", "label": "Odd", "allow": [], "entry": "session", "credentials": ["browser"]},
   "conta": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "allow": [], "entry": "session", "credentials": ["browser"]},
@@ -42,7 +56,7 @@ PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -rf "$STATE" "$TESTCFG"' EXIT
 for _ in $(seq 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.5; done
 
-BASE="http://127.0.0.1:$PORT" ROBO_KEY="$KEY" OWNER=5561900000001 node scripts/test_local.mjs
+STATE="$STATE" BASE="http://127.0.0.1:$PORT" ROBO_KEY="$KEY" OWNER=5561900000001 node scripts/test_local.mjs
 
 # an admin new-device warning survives the revocation of that session
 left="$(npx wrangler d1 execute portal_a5 --local --persist-to "$STATE" --json --command \

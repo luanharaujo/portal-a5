@@ -30,6 +30,7 @@ Which tabs exist, and each one's policy, label and icon, live outside the code: 
 | `fetch(request)` | only WebSocket upgrades: live pages and machine bridges | `X-A5-Identity` request header, set by the portal: base64url of the UTF-8 JSON (names may hold emoji, which a raw header cannot carry) |
 | `revoke(ref)` (RPC, optional but expected) | a session, screen or machine key was revoked, or a person blocked | `ref = {session?, machine?, person?}`; close every socket opened with that credential |
 | `badge(identity)` (RPC, optional) | `GET /api/tabs`, for a person with more than one tab | typed argument; answers `{count}` (section 9) |
+| `command(cmd, identity)` (RPC, optional) | a page button or a Shortcuts key sent a command the portal checked | typed argument; see `COMMANDS.md` |
 
 `fetch` exists only because a 101 answer cannot cross an RPC call. The entrypoint's `fetch` is reachable only through a service binding; the public address stays off. The tab's `fetch` answers 401 when `X-A5-Identity` is missing or does not decode to JSON, 404 to anything that is not an upgrade, and never passes the header on.
 
@@ -48,14 +49,15 @@ interface PortalIdentity {
   strong: boolean            // passkey checked on this session in the last 5 minutes
   entered_at: string | null  // tabs with entry 'passkey': when this session entered with Face ID
   entry_until: string | null // ...and when that entry ends
-  actions: string[]          // stage 3 (commands); empty for now
+  shortcut: number | null    // Shortcuts key id; only for shortcuts
+  actions: string[]          // commands this identity may send in the tab (COMMANDS.md)
 }
 ```
 
 - `browser`: a person signed in through WhatsApp (weak) or with a fresh passkey (strong).
 - `screen`: a fixed display paired by code (section 5). Always in `residents`, never admin, never strong.
 - `machine`: a house bridge (section 6). No person, no groups.
-- `shortcut`: reserved for Shortcuts keys (`pa5_atl_`), not built yet.
+- `shortcut`: an Apple Shortcuts key (`pa5_atl_`). Reaches only `command()`, never `handle()`, `fetch()` or `badge()` (COMMANDS.md).
 
 The tab trusts this object and nothing in the request that claims to be identity. A tab may still apply its own rules on top (for example, only the owner group).
 
@@ -65,6 +67,7 @@ Before the call:
 - session cookie checked; signed out: navigation gets 302 to `/?next=<path and query>` (query dropped above 512 characters), anything else 401 `signed_out`;
 - group must include the tab (`*` = all), and the tab policy must accept the credential (section 4), else 403 `no_tab_access`;
 - non-GET needs `Origin` equal to the portal origin and `X-Portal: 1` (403 otherwise). GET must never change state;
+- `/<tab>/_cmd/*` is the portal's: commands from the tab's pages, answered by the portal and handed to `command()` only after its checks. It never reaches `handle()`;
 - WebSocket upgrades from pages also need that exact `Origin` (cross-site socket hijacking);
 - a tab whose policy says `serviceWorker: false` gets 403 on a request with `Service-Worker: script`;
 - removed from the request: `Cookie`, `Authorization`, every `X-Portal-*` and `X-A5-*` (the portal then sets its own `X-A5-Identity` on upgrades).
@@ -110,6 +113,7 @@ One entry per tab in the tab configuration (section 1):
 | `serviceWorker` | `false` refuses service worker registration; always `false` with `passkey` | no (true) |
 | `label` | the tab's name in the selector (up to 40 characters) | no (the tab id) |
 | `icon` | one of the selector's drawings: `bolt`, `mic`, `terminal`, `coin`, `grid` | no (none) |
+| `commands` | the actions the tab takes, with level, parameters and limits (`COMMANDS.md` section 2); one malformed action drops the tab | no (none) |
 
 Fail closed: there is no default policy. A tab whose entry misses `allow`, `entry` or `credentials`, has an unknown key or a value out of range is not bound at all (its path answers 404) and the portal logs `tab config refused`. After a deploy, check `GET /api/tabs` (a passkey tab must say `"entry": "passkey"`).
 

@@ -241,7 +241,7 @@ function nav() {
 function renderAlerts() {
   const list = ME.alerts || []
   $alerts.replaceChildren(...list.map((a) => el('div', { class: 'alert' },
-    el('strong', {}, a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : T.newDevice(ME.person.name)),
+    el('strong', {}, a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : T.newDevice(ME.person.name)),
     `${a.label || T.device}, ${when(a.created_at)}${a.place ? ', ' + a.place : ''}${a.current ? T.thisDevice : ''}. `,
     el('button', { onclick: () => guarded(async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await start() }) }, T.itWasMe),
     a.current || !a.live || a.kind !== 'device' ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await start() }) }, T.revoke))))
@@ -259,10 +259,10 @@ async function devicesView() {
 
 // ------------------------------------------------------------------ admin
 async function adminView() {
-  const [allPeople, groups, requests, devices, machines] = await Promise.all([
+  const [allPeople, groups, requests, devices, machines, shortcuts] = await Promise.all([
     rawApi('GET', '/api/admin/people'), rawApi('GET', '/api/admin/groups'),
     rawApi('GET', '/api/admin/requests'), rawApi('GET', '/api/admin/devices'),
-    rawApi('GET', '/api/admin/machines'),
+    rawApi('GET', '/api/admin/machines'), rawApi('GET', '/api/me/shortcuts'),
   ])
   const people = allPeople.filter((p) => p.kind !== 'screen')
   const screens = allPeople.filter((p) => p.kind === 'screen')
@@ -333,6 +333,9 @@ async function adminView() {
     el('ul', { class: 'rows' }, devices.map((d) => el('li', {},
       el('div', {}, el('strong', {}, d.name), ` · ${d.label || ''}`, d.kind === 'screen' ? T.pair.screenTag : ''),
       el('div', { class: 'muted' }, T.devLine(when(d.created_at), d.place, when(d.last_used_at))),
+      // a new device of a resident sends commands only after 24 h, or once released here
+      d.kind === 'browser' && !d.commands_ok_at && Date.now() - Date.parse(d.created_at) < 864e5
+        ? el('button', { onclick: () => guarded(async () => { await api('POST', `/api/admin/devices/${d.id}/commands`, {}); toast(T.commands.released); adminView() }) }, T.commands.release) : null,
       d.id === ME.session_id ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/admin/devices/${d.id}`); adminView() }) }, T.disconnect)))))
 
   const auditCard = el('section', { class: 'card' }, el('h2', {}, T.audit),
@@ -391,7 +394,32 @@ async function adminView() {
           el('button', { onclick: () => navigator.clipboard.writeText(r.key).then(() => toast(T.bridges.copied)) }, T.bridges.copy))
       }) }, T.bridges.create), newKey] : null)
 
-  show(nav(), passkeyCard, reqCard, screensCard, peopleCard, groupsCard, devicesCard, bridgesCard, auditCard)
+  // commands: the brake, and Shortcuts keys (one per device and shortcut, shown once)
+  const brakeCard = el('section', { class: 'card' }, el('h2', {}, T.commands.title),
+    el('p', { class: ME.commands_off ? 'danger-box' : 'muted' }, ME.commands_off ? T.commands.offNow : T.commands.onNow),
+    el('button', { class: ME.commands_off ? '' : 'danger', onclick: () => guarded(async () => {
+      await api('POST', '/api/admin/commands', { off: !ME.commands_off }); await start(); adminView()
+    }) }, ME.commands_off ? T.commands.turnOn : T.commands.turnOff))
+
+  const kLabel = el('input', { placeholder: T.shortcuts.label, maxlength: 60 })
+  const kBoxes = el('span', { class: 'boxes' }, shortcuts.available.map((a) =>
+    el('label', {}, el('input', { type: 'checkbox', name: 'kscope', value: `${a.tab}/${a.action}` }), `${a.tab} · ${a.action}`)))
+  const kNew = el('div')
+  const shortcutsCard = el('section', { class: 'card' }, el('h2', {}, T.shortcuts.title),
+    shortcuts.keys.length ? el('ul', { class: 'rows' }, shortcuts.keys.map((k) => el('li', {},
+      el('div', {}, el('strong', {}, k.label), k.revoked_at ? T.shortcuts.revoked : ''),
+      el('div', { class: 'muted' }, k.scope.join(', ')),
+      el('div', { class: 'muted' }, T.shortcuts.line(when(k.created_at), when(k.last_used_at), k.last_ip, k.last_place)),
+      k.revoked_at ? null : el('button', { class: 'danger', onclick: () => guarded(async () => { await api('DELETE', `/api/me/shortcuts/${k.id}`); adminView() }) }, T.revoke)))) : el('p', { class: 'muted' }, T.shortcuts.none),
+    shortcuts.available.length ? [el('h3', {}, T.shortcuts.add), kLabel, kBoxes,
+      el('button', { onclick: () => guarded(async () => {
+        const scope = [...kBoxes.querySelectorAll('input[name="kscope"]:checked')].map((i) => i.value)
+        const r = await api('POST', '/api/me/shortcuts', { label: kLabel.value, scope })
+        kNew.replaceChildren(el('p', {}, T.shortcuts.copyOnce), el('p', { class: 'code' }, r.key),
+          el('button', { onclick: () => navigator.clipboard.writeText(r.key).then(() => toast(T.bridges.copied)) }, T.bridges.copy))
+      }) }, T.shortcuts.create), kNew] : el('p', { class: 'muted' }, T.shortcuts.noActions))
+
+  show(nav(), passkeyCard, reqCard, screensCard, peopleCard, groupsCard, devicesCard, brakeCard, shortcutsCard, bridgesCard, auditCard)
 }
 
 // ------------------------------------------------------------------ boot

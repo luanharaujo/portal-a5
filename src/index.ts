@@ -11,6 +11,10 @@ import {
   type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
   policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig,
 } from './tabs'
+import {
+  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, allowedActions, checkParams, checkScope, gapKeyOf,
+  isShortcutKeyShape, pickReturns, readAnswer, refusal,
+} from './commands'
 
 export type { PortalIdentity } from './tabs'
 
@@ -23,6 +27,9 @@ export interface Env {
   // 'refuse' (default): a screen whose request came from another IP than the approving admin
   // cannot be approved; 'warn': only a red warning.
   PAIR_OTHER_IP?: string
+  // how recent this session's passkey check must be for an 'admin' command from a browser:
+  // '<n>m' or '<n>h', or 'session'; wrangler.toml sets '12h'. Missing or malformed = 5 minutes.
+  ADMIN_COMMAND_PASSKEY?: string
   [binding: string]: unknown
 }
 
@@ -55,6 +62,14 @@ const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O/1/I/L
 const LOGIN_PHRASE = 'Entrar no Portal A5: '
 const ROBOT_KEY_PREFIX = 'pa5_robo_'
 const OWNER_GROUP = 'owner'
+// commands (docs/COMMANDS.md)
+const COMMAND_TTL_MS = 60e3
+const COMMAND_WAIT_MS = 8e3
+const DEVICE_COMMAND_HOLD_MS = 24 * 3600e3 // a non-admin browser session waits this long, or an admin lets it
+const SHORTCUT_PER_HOUR = 30
+const SHORTCUT_FAIL_PER_IP = 30
+const TAB_COMMANDS_PER_HOUR = 300
+const MAX_SHORTCUT_KEYS = 30
 
 const HTML_CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
   "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
@@ -77,7 +92,7 @@ interface Person { id: number; name: string; phone: string; status: string; kind
 interface Group { id: string; name: string; tabs: string; is_admin: number }
 interface Who {
   person: Person; sessionId: number; sessionCreatedAt: string; kind: 'browser' | 'screen'; groups: Group[]; admin: boolean; tabs: Set<string>
-  passkeyAt: string | null; refreshCookie: string | null
+  passkeyAt: string | null; refreshCookie: string | null; commandsOkAt: string | null
 }
 
 class HttpError extends Error {
@@ -239,7 +254,7 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
   const token = cookieValue(req, COOKIE)
   if (!token || token.length < 40) return null
   const s = await env.DB.prepare(
-    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, p.* FROM sessions s JOIN people p ON p.id = s.person_id
+    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.commands_ok_at, p.* FROM sessions s JOIN people p ON p.id = s.person_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
   ).bind(await sha256(token), now()).first<Row>()
   if (!s || s.status !== 'active') return null
@@ -256,7 +271,7 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
   const admin = kind === 'browser' && person.kind !== 'screen' && groups.some((g) => g.is_admin)
   return {
     person, sessionId: Number(s.sid), sessionCreatedAt: String(s.screated), kind, groups, admin, tabs: tabsOf(groups),
-    passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie,
+    passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie, commandsOkAt: (s.commands_ok_at as string | null) ?? null,
   }
 }
 
@@ -457,18 +472,12 @@ async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
   await env.DB.prepare('UPDATE machine_keys SET last_used_at = ?, last_ip = ? WHERE id = ?').bind(now(), clientIp(req), id).run()
   const newIp = !!m.last_ip && m.last_ip !== clientIp(req)
   await audit(env, req, { strength: 'machine', action: newIp ? 'bridge_new_ip' : 'bridge_connected', target: `${tab}:${m.label}`, detail: { machine: id, n, ...(newIp ? { previous_ip: m.last_ip } : {}) } })
-  const alertAdmins = async (kind: string) => {
-    const admins = await env.DB.prepare(`SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1`).all<{ person_id: number }>()
-    for (const a of admins.results)
-      await env.DB.prepare(`INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, ?, ?, ?)`)
-        .bind(a.person_id, `${tab}:${m.label}`, `${clientIp(req)}${place(req) ? ', ' + place(req) : ''}`, now(), kind).run()
-  }
   // a new bridge replacing the old one more than 3 times in an hour, or a key used from a new
   // address: tell every admin
-  if (n === BRIDGE_ALERT_PER_HOUR + 1) await alertAdmins('bridge')
-  if (newIp) await alertAdmins('bridge_ip')
+  if (n === BRIDGE_ALERT_PER_HOUR + 1) await alertAdmins(env, req, `${tab}:${m.label}`, 'bridge')
+  if (newIp) await alertAdmins(env, req, `${tab}:${m.label}`, 'bridge_ip')
   const identity: PortalIdentity = {
-    credential: 'machine', person: null, name: String(m.label), groups: [], session: null, machine: id,
+    credential: 'machine', person: null, name: String(m.label), groups: [], session: null, machine: id, shortcut: null,
     strong: false, entered_at: null, entry_until: null, actions: [],
   }
   return forwardSocket(env, req, service, tab, identity, null)
@@ -769,6 +778,7 @@ async function me(env: Env, who: Who) {
     strong: fresh(who),
     passkeys: who.admin ? await passkeyCount(env, who.person.id) : 0,
     alerts: await alertsOf(env, who),
+    commands_off: who.admin ? await commandsOff(env) : undefined,
   }
 }
 
@@ -941,7 +951,7 @@ async function resolveRequest(env: Env, req: Request, who: Who, id: number, acti
 
 async function listAllDevices(env: Env) {
   const r = await env.DB.prepare(
-    `SELECT s.id, s.person_id, p.name, s.kind, s.label, s.place, s.created_at, s.last_used_at FROM sessions s JOIN people p ON p.id = s.person_id
+    `SELECT s.id, s.person_id, p.name, s.kind, s.label, s.place, s.created_at, s.last_used_at, s.commands_ok_at FROM sessions s JOIN people p ON p.id = s.person_id
       WHERE s.expires_at > ? ORDER BY s.last_used_at DESC LIMIT 200`,
   ).bind(now()).all<Row>()
   return r.results
@@ -1032,11 +1042,12 @@ async function forwardSocket(env: Env, req: Request, service: TabService, tab: s
   return new Response(null, { status: 101, webSocket: res.webSocket })
 }
 
-function identityOf(who: Who, policy: TabPolicy, enteredAt: string | null): PortalIdentity {
+function identityOf(env: Env, tab: string, who: Who, policy: TabPolicy, enteredAt: string | null): PortalIdentity {
   return {
     credential: who.kind, person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id),
-    session: who.sessionId, machine: null, strong: fresh(who), entered_at: enteredAt,
-    entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null, actions: [],
+    session: who.sessionId, machine: null, shortcut: null, strong: fresh(who), entered_at: enteredAt,
+    entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null,
+    actions: allowedActions(tab, catalogOf(env, tab), callerOf(env, who)),
   }
 }
 
@@ -1060,7 +1071,7 @@ async function badgeOf(env: Env, who: Who, tab: string): Promise<number | null> 
     const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), BADGE_TIMEOUT_MS) })
     try {
       // no entry and never strong here: the badge is a count, never the tab's content or an action
-      const r = await Promise.race([Promise.resolve(service.badge?.({ ...identityOf(who, policyOf(tab), null), strong: false })), late])
+      const r = await Promise.race([Promise.resolve(service.badge?.({ ...identityOf(env, tab, who, policyOf(tab), null), strong: false })), late])
       const n = (r as { count?: unknown } | null | undefined)?.count
       if (typeof n === 'number' && Number.isInteger(n) && n >= 0) count = Math.min(n, 99)
     } catch { /* no badge() or a failing tab: no number */ }
@@ -1126,7 +1137,18 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
     if (e instanceof Response) return e
     enteredAt = e
   }
-  const identity = identityOf(who, policy, enteredAt)
+  // commands from the tab's own pages: answered by the portal, never handed to handle()
+  const cmdPath = url.pathname.slice(tab.length + 1)
+  if (cmdPath === '/_cmd' || cmdPath.startsWith('/_cmd/')) {
+    const a = /^\/_cmd\/([a-z][a-z0-9_]{0,39})$/.exec(cmdPath)
+    if (!a) throw new HttpError(404, 'not_found')
+    if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed')
+    const res = await runCommand(env, req, tab, a[1], { who, key: null, enteredAt })
+    if (who.refreshCookie) res.headers.append('Set-Cookie', who.refreshCookie)
+    return res
+  }
+
+  const identity = identityOf(env, tab, who, policy, enteredAt)
   if (isUpgrade(req)) return forwardSocket(env, req, service, tab, identity, who)
 
   const forwarded = new Request(req.url, { method: req.method, headers: stripRequestHeaders(req.headers), body: req.body })
@@ -1137,6 +1159,249 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
   sanitizeTabHeaders(out.headers, PAGE_HEADERS, tab, url.origin)
   if (who.refreshCookie) out.headers.append('Set-Cookie', who.refreshCookie)
   return out
+}
+
+// ------------------------------------------------------------------ commands (docs/COMMANDS.md)
+// The tab's actions, from its configuration (validated in tabs.ts; a bad catalog drops the tab).
+const catalogOf = (env: Env, tab: string): Catalog => tabsConfig(env.TABS)[tab]?.commands ?? {}
+
+// identity.actions and every command use the same rule: this session's own passkey_at.
+function callerOf(env: Env, who: Who): Caller {
+  return { credential: who.kind, admin: who.admin, strong: fresh(who), adminFresh: adminWindowOk(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY), scope: null }
+}
+
+interface ShortcutKey { id: number; person: Person; groups: Group[]; admin: boolean; tabs: Set<string>; label: string; scope: string[] }
+
+async function commandsOff(env: Env): Promise<boolean> {
+  const r = await env.DB.prepare("SELECT value FROM settings WHERE key = 'commands_off'").first<{ value: string }>()
+  return r?.value === '1'
+}
+
+const COMMAND_HTTP: Record<string, number> = { done: 200, queued: 202, sent: 202, refused: 409, failed: 502, offline: 503 }
+
+// Every command, from a page or a Shortcuts key, goes through here. Order: action, parameters,
+// tab access, level, device, brake, limits, interval; only then the tab is called.
+async function runCommand(env: Env, req: Request, tab: string, action: string,
+  c: { who: Who | null; key: ShortcutKey | null; enteredAt: string | null }): Promise<Response> {
+  const service = tabService(env, tab)
+  if (!service) throw new HttpError(404, 'not_found')
+  const credential = c.key ? 'shortcut' : c.who!.kind
+  const person = c.key ? c.key.person : c.who!.person
+  const actor = c.key
+    ? { person: person.id, strength: 'shortcut' }
+    : { who: c.who }
+  const target = `${tab}/${action}`
+  const refuse = async (status: number, code: string, extra: Row = {}): Promise<never> => {
+    await audit(env, req, { ...actor, action: 'command_refused', target, detail: { reason: code, credential, ...(c.key ? { shortcut: c.key.id } : {}) } })
+    throw new HttpError(status, code, extra)
+  }
+
+  const spec = catalogOf(env, tab)[action]
+  if (!spec) return refuse(404, 'unknown_action')
+  const b = await body(req)
+  if (Object.keys(b).some((k) => k !== 'params')) return refuse(400, 'bad_params')
+  const p = checkParams(spec, b.params)
+  if ('error' in p) return refuse(400, p.error)
+
+  const policy = policyOf(tab)
+  const groupsOk = c.key ? (c.key.tabs.has('*') || c.key.tabs.has(tab)) : canOpen(c.who!, tab)
+  if (!groupsOk) return refuse(403, 'no_tab_access')
+  // a key never stands in for Face ID on entry
+  if (c.key && policy.entry === 'passkey') return refuse(403, 'not_for_shortcuts')
+  const caller: Caller = c.key
+    ? { credential: 'shortcut', admin: c.key.admin, strong: false, adminFresh: false, scope: c.key.scope }
+    : callerOf(env, c.who!)
+  const why = refusal(tab, action, spec, caller)
+  if (why) return refuse(403, why)
+  // a borrowed WhatsApp sign-in cannot act at once (Security B4c)
+  if (c.who && c.who.kind === 'browser' && !c.who.admin && !c.who.commandsOkAt &&
+    Date.now() - Date.parse(c.who.sessionCreatedAt) < DEVICE_COMMAND_HOLD_MS) return refuse(403, 'device_too_new')
+  if (await commandsOff(env)) return refuse(503, 'commands_off')
+
+  const callerId = c.key ? `k${c.key.id}` : `p${person.id}`
+  if (c.key && !(await underLimit(env, `cmd-key:${c.key.id}`, SHORTCUT_PER_HOUR))) return refuse(429, 'too_many_commands')
+  if (!(await underLimit(env, `cmd:${target}:${callerId}`, spec.perHour))) return refuse(429, 'too_many_commands')
+  if (!(await underLimit(env, `cmd-tab:${tab}`, TAB_COMMANDS_PER_HOUR))) return refuse(429, 'too_many_commands')
+  const gapKey = gapKeyOf(spec, p.params)
+  if (gapKey && spec.gap) {
+    const last = await env.DB.prepare(
+      "SELECT at FROM commands WHERE tab = ? AND gap_key = ? AND at > ? AND status IN ('sent', 'queued', 'done') ORDER BY at DESC LIMIT 1",
+    ).bind(tab, gapKey, inMs(-spec.gap.seconds * 1e3)).first<{ at: string }>()
+    if (last) {
+      const wait = Math.max(1, Math.ceil((Date.parse(last.at) + spec.gap.seconds * 1e3 - Date.now()) / 1e3))
+      return refuse(429, 'too_soon', { retry_after: wait })
+    }
+  }
+
+  const id = crypto.randomUUID()
+  const at = now()
+  const cmd = { id, action, params: { ...p.params }, expires_at: inMs(COMMAND_TTL_MS) }
+  await env.DB.prepare(
+    `INSERT INTO commands (id, at, tab, action, params, credential, person_id, session_id, shortcut_id, gap_key, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent')`,
+  ).bind(id, at, tab, action, JSON.stringify(cmd.params), credential, person.id, c.who?.sessionId ?? null, c.key?.id ?? null, gapKey).run()
+
+  const identity: PortalIdentity = c.key
+    ? {
+      credential: 'shortcut', person: person.id, name: person.name, groups: c.key.groups.map((g) => g.id), session: null,
+      machine: null, shortcut: c.key.id, strong: false, entered_at: null, entry_until: null,
+      actions: allowedActions(tab, catalogOf(env, tab), caller),
+    }
+    : identityOf(env, tab, c.who!, policy, c.enteredAt)
+
+  let status: string
+  let result: unknown
+  let error: string | undefined
+  if (typeof service.command !== 'function') {
+    status = 'failed'; error = 'tab_takes_no_commands'
+  } else {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), COMMAND_WAIT_MS) })
+    try {
+      const r = await Promise.race([service.command(cmd, identity), late])
+      if (r === 'late') status = 'sent'
+      else ({ status, result, error } = readAnswer(r))
+    } catch {
+      status = 'failed'; error = 'tab_error'
+    }
+    if (timer !== undefined) clearTimeout(timer)
+  }
+  await env.DB.prepare('UPDATE commands SET status = ?, finished_at = ? WHERE id = ?').bind(status, now(), id).run()
+  await audit(env, req, {
+    ...actor, action: 'command', target,
+    detail: { id, params: cmd.params, credential, status, ...(error ? { error } : {}), ...(c.key ? { shortcut: c.key.id } : {}) },
+  })
+  const out: Row = { id, status, ok: status === 'done' }
+  const ret = pickReturns(spec, result)
+  if (ret) out.result = ret
+  if (error) out.error = error
+  return json(out, COMMAND_HTTP[status] ?? 502)
+}
+
+// City and network of a request, the unit for "never seen from here".
+function placeKey(req: Request): string {
+  const cf = (req as unknown as { cf?: Row }).cf
+  return `${String(cf?.city ?? '?')}|AS${String(cf?.asn ?? '?')}`.slice(0, 120)
+}
+
+// A warning on every admin's account page (device_alerts, session 0 = not a session).
+async function alertAdmins(env: Env, req: Request, label: string, kind: string) {
+  const admins = await env.DB.prepare('SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
+  for (const a of admins.results)
+    await env.DB.prepare('INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, ?, ?, ?)')
+      .bind(a.person_id, label, `${clientIp(req)}${place(req) ? ', ' + place(req) : ''}`, now(), kind).run()
+}
+
+// POST /_cmd/<tab>/<action> with Authorization: Bearer pa5_atl_... (Apple Shortcuts). No cookie,
+// no session; a browser on another site cannot send it (Authorization needs a CORS preflight,
+// and the portal answers none).
+async function shortcutCommand(req: Request, env: Env, tab: string, action: string): Promise<Response> {
+  if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed')
+  // the key is checked before anything about the tab, so no key, no hint of which tabs exist
+  const raw = /^Bearer (\S+)$/.exec(req.headers.get('Authorization') ?? '')?.[1] ?? ''
+  const refuse = async (reason: string, person: number | null = null): Promise<never> => {
+    if (!(await underLimit(env, `atl-fail-ip:${clientIp(req)}`, SHORTCUT_FAIL_PER_IP))) throw new HttpError(429, 'too_many_attempts')
+    await audit(env, req, { person, strength: 'shortcut', action: 'shortcut_refused', target: `${tab}/${action}`, detail: { reason } })
+    throw new HttpError(401, 'bad_key')
+  }
+  if (!isShortcutKeyShape(raw)) return refuse('format')
+  // looked up by hash (unique index); the hash is the constant-time part
+  const k = await env.DB.prepare(
+    `SELECT k.id, k.label, k.scope, k.revoked_at, k.seen_places, p.id AS pid, p.name, p.phone, p.status, p.kind
+       FROM shortcut_keys k JOIN people p ON p.id = k.person_id WHERE k.key_hash = ?`,
+  ).bind(await sha256(raw)).first<Row>()
+  if (!k) return refuse('unknown')
+  if (k.revoked_at) return refuse('revoked', Number(k.pid))
+  if (k.status !== 'active' || k.kind === 'screen') return refuse('person_blocked', Number(k.pid))
+  // a key used from a city/network it never used before warns every admin (Security R1)
+  const where = placeKey(req)
+  let seen: string[] = []
+  try { seen = (JSON.parse(String(k.seen_places)) as unknown[]).filter((x): x is string => typeof x === 'string') } catch { /* none */ }
+  const newPlace = !seen.includes(where)
+  if (newPlace) seen = [...seen, where].slice(-20)
+  await env.DB.prepare('UPDATE shortcut_keys SET last_used_at = ?, last_ip = ?, last_place = ?, seen_places = ? WHERE id = ?')
+    .bind(now(), clientIp(req), place(req), JSON.stringify(seen), k.id).run()
+  if (newPlace) {
+    await audit(env, req, { person: Number(k.pid), strength: 'shortcut', action: 'shortcut_new_place', target: String(k.label), detail: { shortcut: Number(k.id) } })
+    await alertAdmins(env, req, String(k.label), 'shortcut_place')
+  }
+  const person: Person = { id: Number(k.pid), name: String(k.name), phone: String(k.phone), status: String(k.status) }
+  const groups = await groupsOf(env, person.id)
+  let scope: string[] = []
+  try { scope = (JSON.parse(String(k.scope)) as unknown[]).filter((x): x is string => typeof x === 'string') } catch { /* no scope */ }
+  const key: ShortcutKey = {
+    id: Number(k.id), person, groups, admin: groups.some((g) => g.is_admin), tabs: tabsOf(groups), label: String(k.label), scope,
+  }
+  return runCommand(env, req, tab, action, { who: null, key, enteredAt: null })
+}
+
+// Actions an admin may put in a key: tabs without Face ID on entry, actions allowed in keys.
+function keyCatalogs(env: Env, who: Who): Record<string, Catalog> {
+  const out: Record<string, Catalog> = {}
+  for (const t of Object.keys(tabBindings(env))) if (canOpen(who, t) && policyOf(t).entry === 'session') out[t] = catalogOf(env, t)
+  return out
+}
+
+async function listShortcutKeys(env: Env, who: Who) {
+  if (!who.admin) throw new HttpError(403, 'admin_only')
+  const keys = await env.DB.prepare(
+    'SELECT id, label, scope, created_at, last_used_at, last_ip, last_place, revoked_at FROM shortcut_keys WHERE person_id = ? ORDER BY id DESC LIMIT 100',
+  ).bind(who.person.id).all<Row>()
+  const available: { tab: string; action: string; level: string }[] = []
+  for (const [t, cat] of Object.entries(keyCatalogs(env, who)))
+    for (const [a, s] of Object.entries(cat)) if (checkScope([`${t}/${a}`], { [t]: cat }, who.admin)) available.push({ tab: t, action: a, level: s.level })
+  return {
+    keys: keys.results.map((k) => ({ ...k, scope: (() => { try { return JSON.parse(String(k.scope)) } catch { return [] } })() })),
+    available,
+  }
+}
+
+async function addShortcutKey(env: Env, req: Request, who: Who) {
+  requireStrongAdmin(who)
+  const b = await body(req)
+  const label = text(b.label, 60)
+  if (!label) throw new HttpError(400, 'name_required')
+  const scope = checkScope(b.scope, keyCatalogs(env, who), who.admin)
+  if (!scope) throw new HttpError(400, 'bad_scope')
+  const live = await env.DB.prepare('SELECT COUNT(*) AS n FROM shortcut_keys WHERE person_id = ? AND revoked_at IS NULL').bind(who.person.id).first<{ n: number }>()
+  if ((live?.n ?? 0) >= MAX_SHORTCUT_KEYS) throw new HttpError(409, 'too_many_keys')
+  const key = SHORTCUT_KEY_PREFIX + randomToken(32)
+  const r = await env.DB.prepare(
+    'INSERT INTO shortcut_keys (person_id, label, key_hash, scope, created_at, created_session) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+  ).bind(who.person.id, label, await sha256(key), JSON.stringify(scope), now(), who.sessionId).first<{ id: number }>()
+  await audit(env, req, { who, action: 'shortcut_key_created', target: label, detail: { id: r!.id, scope } })
+  // shown once; only the hash stays
+  return { id: r!.id, label, scope, key }
+}
+
+// Taking access away never needs Face ID: any session of the key's owner revokes it.
+async function revokeShortcutKey(env: Env, req: Request, who: Who, id: number) {
+  const k = await env.DB.prepare('UPDATE shortcut_keys SET revoked_at = ? WHERE id = ? AND person_id = ? AND revoked_at IS NULL RETURNING label')
+    .bind(now(), id, who.person.id).first<{ label: string }>()
+  if (!k) throw new HttpError(404, 'key_not_found')
+  await audit(env, req, { who, action: 'shortcut_key_revoked', target: k.label, detail: { id } })
+}
+
+// The brake: any admin session stops commands; turning them back on needs a passkey check.
+async function setBrake(env: Env, req: Request, who: Who) {
+  if (!who.admin) throw new HttpError(403, 'admin_only')
+  const b = await body(req)
+  if (typeof b.off !== 'boolean') throw new HttpError(400, 'bad_value')
+  if (!b.off) requireStrongAdmin(who)
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at, updated_by) VALUES ('commands_off', ?, ?, ?)
+     ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+  ).bind(b.off ? '1' : '0', now(), who.person.id).run()
+  await audit(env, req, { who, action: b.off ? 'commands_off' : 'commands_on' })
+  return { ok: true, commands_off: b.off }
+}
+
+// An admin lets a new non-admin device send commands before its 24 hours.
+async function allowDeviceCommands(env: Env, req: Request, who: Who, id: number) {
+  const s = await env.DB.prepare('UPDATE sessions SET commands_ok_at = ? WHERE id = ? AND expires_at > ? RETURNING person_id, label')
+    .bind(now(), id, now()).first<Row>()
+  if (!s) throw new HttpError(404, 'device_not_found')
+  await audit(env, req, { who, action: 'device_commands_allowed', target: `${s.person_id}:${s.label ?? ''}` })
 }
 
 // ------------------------------------------------------------------ router
@@ -1150,6 +1415,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
   let mb: RegExpMatchArray | null
   if ((mb = path.match(/^\/_bridge\/([a-z][a-z0-9-]{0,30})$/))) return bridge(req, env, mb[1])
   if (path.startsWith('/_bridge')) throw new HttpError(404, 'not_found')
+  if ((mb = path.match(/^\/_cmd\/([a-z][a-z0-9-]{0,30})\/([a-z][a-z0-9_]{0,39})$/))) return shortcutCommand(req, env, mb[1], mb[2])
+  if (path.startsWith('/_cmd')) throw new HttpError(404, 'not_found')
 
   if (path.startsWith('/api/')) {
     requireSameOrigin(req, url)
@@ -1180,6 +1447,12 @@ async function handle(req: Request, env: Env): Promise<Response> {
       await revokeSession(env, req, who, Number(mm[1]), false)
       return out({ ok: true })
     }
+    if (path === '/api/me/shortcuts' && m === 'GET') return out(await listShortcutKeys(env, who))
+    if (path === '/api/me/shortcuts' && m === 'POST') return out(await addShortcutKey(env, req, who))
+    if ((mm = path.match(/^\/api\/me\/shortcuts\/(\d+)$/)) && m === 'DELETE') {
+      await revokeShortcutKey(env, req, who, Number(mm[1]))
+      return out({ ok: true })
+    }
     if ((mm = path.match(/^\/api\/me\/alerts\/(\d+)\/ack$/)) && m === 'POST') {
       await ackAlert(env, req, who, Number(mm[1]))
       return out({ ok: true })
@@ -1202,6 +1475,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
         if (path === '/api/admin/machines') return out(await listMachines(env))
         throw new HttpError(404, 'not_found')
       }
+      // the brake: stopping commands takes any admin session (setBrake asks a passkey to restart)
+      if (path === '/api/admin/commands' && m === 'POST') return out(await setBrake(env, req, who))
       // writes: passkey in the last 5 minutes
       requireStrongAdmin(who)
       if (path === '/api/admin/people' && m === 'POST') return out(await addPerson(env, req, who))
@@ -1221,6 +1496,10 @@ async function handle(req: Request, env: Env): Promise<Response> {
         return out(await resolveRequest(env, req, who, Number(mm[1]), mm[2] as 'approve' | 'refuse'))
       if ((mm = path.match(/^\/api\/admin\/devices\/(\d+)$/)) && m === 'DELETE') {
         await revokeSession(env, req, who, Number(mm[1]), true)
+        return out({ ok: true })
+      }
+      if ((mm = path.match(/^\/api\/admin\/devices\/(\d+)\/commands$/)) && m === 'POST') {
+        await allowDeviceCommands(env, req, who, Number(mm[1]))
         return out({ ok: true })
       }
       if (path === '/api/admin/pair' && m === 'POST') return out(await pairApprove(env, req, who))

@@ -9,6 +9,9 @@
 //                              key is revoked, so the tab closes that credential's sockets
 //   badge(identity)            optional; how many things wait for this person in the tab
 //                              ({count}), shown next to the tab selector. Only the number leaves.
+//   command(cmd, identity)     optional; one checked command for the house (docs/COMMANDS.md)
+
+import { type Catalog, type Command, parseCatalogStrict } from './commands'
 
 export type Credential = 'browser' | 'screen' | 'machine' | 'shortcut'
 
@@ -17,12 +20,13 @@ export interface PortalIdentity {
   person: number | null      // null for machines
   name: string               // person or screen name, or the machine key label
   groups: string[]           // empty for machines
-  session: number | null     // browser or screen session id; null for machines
+  session: number | null     // browser or screen session id; null for machines and shortcuts
   machine: number | null     // machine key id; only for machines
+  shortcut: number | null    // Shortcuts key id; only for shortcuts
   strong: boolean            // passkey checked on this session in the last 5 minutes
   entered_at: string | null  // tabs with entry 'passkey': when this session entered with Face ID
   entry_until: string | null // ...and when that entry ends: close this session's sockets then
-  actions: string[]          // reserved for stage 3 (commands); empty for now
+  actions: string[]          // commands this identity may send in the tab (docs/COMMANDS.md)
 }
 
 export interface RevokeRef { session?: number; machine?: number; person?: number }
@@ -32,6 +36,7 @@ export interface TabService {
   fetch(req: Request): Promise<Response>
   revoke?(ref: RevokeRef): Promise<void>
   badge?(who: PortalIdentity): Promise<{ count: number }>
+  command?(cmd: Command, who: PortalIdentity): Promise<unknown>
 }
 
 // Names a tab can never take: portal pages and routes living at /<name>/.
@@ -66,6 +71,8 @@ export interface TabConfig extends TabPolicy {
   binding: string
   label: string | null
   icon: string | null
+  // actions the tab takes (docs/COMMANDS.md); empty = the tab takes no commands
+  commands: Catalog
 }
 
 // The TABS variable is generated at deploy time from a file kept out of git (scripts/deploy.sh):
@@ -93,7 +100,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(tab) || RESERVED_TABS.includes(tab)) return null
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   const o = v as Record<string, unknown>
-  const known = ['binding', 'label', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker']
+  const known = ['binding', 'label', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands']
   if (Object.keys(o).some((k) => !known.includes(k))) return null
   if (typeof o.binding !== 'string' || !/^[A-Z][A-Z0-9_]{0,40}$/.test(o.binding)) return null
   if (o.label != null && (typeof o.label !== 'string' || !o.label.trim() || o.label.length > 40 || /[\u0000-\u001f<>]/.test(o.label))) return null
@@ -106,6 +113,9 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   const hours = o.entryHours ?? 0
   if (typeof hours !== 'number' || !Number.isFinite(hours) || hours < 0 || hours > 24) return null
   if (entry === 'passkey' && hours <= 0) return null
+  // one malformed action refuses the whole tab, like any other bad field
+  const commands = parseCatalogStrict(o.commands ?? {})
+  if (!commands) return null
   return {
     binding: o.binding, label: (o.label as string | undefined)?.trim() ?? null, icon: (o.icon as string | undefined) ?? null,
     allow: [...new Set(o.allow as string[])],
@@ -114,6 +124,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
     credentials: [...new Set(o.credentials as Credential[])],
     // a cached page would skip the Face ID check on entry
     serviceWorker: entry === 'passkey' ? false : ((o.serviceWorker as boolean | undefined) ?? true),
+    commands,
   }
 }
 

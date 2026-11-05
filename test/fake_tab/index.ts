@@ -31,6 +31,7 @@ export class FakeTab extends WorkerEntrypoint {
     }
     if (p === '/revoked') return Response.json(revoked)
     if (p === '/badges') return Response.json(badgeCalls)
+    if (p === '/commands') return Response.json(commandLog)
     if (p === '/page') {
       // a tab page using the shared selector, for the browser test
       return new Response('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>tab</title>' +
@@ -80,9 +81,19 @@ export class FakeTab extends WorkerEntrypoint {
     badgeCalls.push(identity)
     return { count: 3 }
   }
+
+  // One checked command (docs/COMMANDS.md). Logs what arrived; 'slow' answers after the portal
+  // stopped waiting, 'boom' throws. The result carries fields the portal must not pass on.
+  async command(cmd: { id: string; action: string; params: unknown; expires_at: string }, identity: Identity): Promise<unknown> {
+    commandLog.push({ cmd, identity })
+    if (cmd.action === 'slow') await new Promise((r) => setTimeout(r, 10000))
+    if (cmd.action === 'boom') throw new Error('boom')
+    return { status: 'done', result: { state: 'on', secret: 'leak', nested: { a: 1 } } }
+  }
 }
 const revoked: unknown[] = []
 const badgeCalls: unknown[] = []
+const commandLog: unknown[] = []
 
 // A tab whose badge never answers in time, and one that answers garbage: neither may slow
 // down or break the selector.

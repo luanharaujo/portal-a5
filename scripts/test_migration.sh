@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the session-table rebuild (migration 0004) on a throwaway local D1 that looks like
+# Checks the session-table rebuild (migration 0004, then the later ones) on a throwaway local D1 that looks like
 # production before it: one owner, one live session, one passkey.
 #   1. the migration is all-or-nothing: a copy of it that fails on its last line leaves the old
 #      table untouched;
@@ -67,6 +67,12 @@ npx wrangler d1 migrations apply portal_a5 --local --persist-to "$B/state" -c "$
 [ "$(q "$B/state" "SELECT passkey_at FROM sessions WHERE id = 7")" = "2026-11-05T12:10:00.000Z" ] || fail "session fields changed"
 [ "$(q "$B/state" "SELECT COUNT(*) FROM tab_entries")" = 0 ] || fail "orphan tab entry kept"
 echo "ok   session row and passkey kept by 0004; orphan rows removed"
+
+# the migrations after 0004 (commands, Shortcuts keys) go on top before the worker starts
+for f in migrations/*.sql; do case "$(basename "$f")" in 000[1-4]_*) ;; *) cp "$f" "$B/m/" ;; esac; done
+npx wrangler d1 migrations apply portal_a5 --local --persist-to "$B/state" -c "$B/wrangler.toml" >/dev/null
+[ "$(q "$B/state" "SELECT COUNT(*) FROM sessions WHERE id = 7 AND commands_ok_at IS NULL")" = 1 ] || fail "session lost by the later migrations"
+echo "ok   later migrations keep the session"
 
 printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=%s\n' "$(openssl rand -hex 32)" "$OWNER" > "$B/test.vars"
 npx wrangler dev -c "$B/wrangler.toml" --local --ip 127.0.0.1 --port "$PORT" --persist-to "$B/state" --env-file "$B/test.vars" >"$B/wrangler.log" 2>&1 &

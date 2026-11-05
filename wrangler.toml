@@ -20,6 +20,10 @@ TABS = "{}"
 # Screen pairing whose request came from another IP than the approving phone: "refuse"
 # (screens are paired on the same network as the phone) or "warn" (red warning only).
 PAIR_OTHER_IP = "refuse"
+# Passkey needed for an 'admin' command from a browser (docs/COMMANDS.md section 3):
+# "12h" (one Face ID a day, the owner's choice), "<n>m" / "<n>h", or "session".
+# Missing or malformed: 5 minutes.
+ADMIN_COMMAND_PASSKEY = "12h"
 
 [[d1_databases]]
 binding = "DB"

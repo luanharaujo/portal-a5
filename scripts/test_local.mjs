@@ -2,6 +2,7 @@
 // reader (POST /robo/login) and a software passkey. Run through scripts/test_local.sh.
 import { webcrypto as wc } from 'node:crypto'
 import http from 'node:http'
+import { execFileSync } from 'node:child_process'
 import { browserChecks } from './test_browser.mjs'
 
 const BASE = process.env.BASE
@@ -524,6 +525,192 @@ check('account page answers signed out too (sign-in screen)', (await navigate(an
 check('/conta redirects to /conta/', (await navigate(owner, '/conta')).status === 301)
 check('reserved name: /conta/* never reaches a tab', (await navigate(owner, '/conta/echo')).status === 404)
 check('reserved name: no machine key for it', (await owner.req('POST', '/api/admin/machines', { tab: 'conta', label: 'x' })).status === 400)
+
+// ------------------------------------------------------------------ stage 3: commands and Shortcuts keys
+// tab-a carries a test catalog (scripts/test_local.sh); the fake tab logs every command() call.
+const freshen = async (c, a) => { const g = await c.req('POST', '/api/passkey/get/options', {}); return (await c.req('POST', '/api/passkey/get/verify', await a.get(g.data))).status === 200 }
+const cmdLog = async () => (await owner.req('GET', '/tab-a/commands', undefined, CORS)).data
+const cmd = (c, tab, action, params, headers) => c.req('POST', `/${tab}/_cmd/${action}`, params === undefined ? {} : { params }, headers)
+// writes to the local D1 the wrangler dev is serving (scripts/test_local.sh passes STATE)
+const d1 = (sql) => { try { execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--command', sql], { stdio: 'ignore' }); return true } catch { return false } }
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+check('C01 a tab with one malformed command is never routed', (await owner.req('GET', '/tab-badcmd/echo', undefined, CORS)).status === 404)
+const rEcho = (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
+check('identity.actions: resident gets common actions only (no presence, no sensitive)', rEcho.actions.join() === 'tv,ac,light,slow,boom', rEcho.actions)
+check('identity.shortcut is null for a page', rEcho.shortcut === null)
+check('freshen owner', await freshen(owner, auth))
+const oEcho = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
+check('identity.actions: owner with Face ID gets admin and sensitive actions', ['presence', 'wipe'].every((a) => oEcho.actions.includes(a)), oEcho.actions)
+
+// C08: a new non-admin device waits 24 h or the owner's release
+let n0 = (await cmdLog()).length
+const young = await cmd(resident, 'tab-a', 'tv', { mode: 'on' })
+check('C08 new resident device: first command held', young.status === 403 && young.data.error === 'device_too_new', young)
+const resSid = (await resident.req('GET', '/api/me')).data.session_id
+check('owner releases the resident device', (await owner.req('POST', `/api/admin/devices/${resSid}/commands`, {})).status === 200)
+check('resident cannot release devices', (await resident.req('POST', `/api/admin/devices/${resSid}/commands`, {})).status === 403)
+
+const tv1 = await cmd(resident, 'tab-a', 'tv', { mode: 'on' })
+check('resident common command = 200 done', tv1.status === 200 && tv1.data.status === 'done' && tv1.data.ok === true && UUID.test(tv1.data.id), tv1)
+check('only declared result fields come back', JSON.stringify(tv1.data.result) === '{"state":"on"}', tv1.data)
+let log = await cmdLog()
+const got = log[log.length - 1]
+check('tab gets id, action, exact params and a 60 s expiry', got.cmd.id === tv1.data.id && got.cmd.action === 'tv' && JSON.stringify(got.cmd.params) === '{"mode":"on"}' &&
+  Math.abs(Date.parse(got.cmd.expires_at) - Date.now() - 60e3) < 15e3, got.cmd)
+check('tab gets the resident identity with its actions', got.identity.credential === 'browser' && got.identity.person === residentId && got.identity.actions.includes('tv') && !got.identity.actions.includes('presence'), got.identity)
+check('held command never reached the tab', log.length === n0 + 1)
+
+// C07: levels
+n0 = (await cmdLog()).length
+const rp = await cmd(resident, 'tab-a', 'presence', { state: 'out' })
+check('C07 resident: admin action (presence) = 403', rp.status === 403 && rp.data.error === 'admin_only', rp)
+check('C07 resident: sensitive action = 403', (await cmd(resident, 'tab-a', 'wipe')).data.error === 'admin_only')
+
+// C01: action and parameters
+check('C01 unknown action = 404', (await cmd(resident, 'tab-a', 'shell', {})).data.error === 'unknown_action')
+check('C01 param outside the enum = 400', (await cmd(resident, 'tab-a', 'tv', { mode: 'rm -rf' })).data.error === 'bad_param')
+check('C01 extra param = 400', (await cmd(resident, 'tab-a', 'tv', { mode: 'on', url: 'http://x' })).data.error === 'unknown_param')
+check('C01 missing param = 400', (await cmd(resident, 'tab-a', 'tv', {})).data.error === 'missing_param')
+check('C01 wrong type = 400', (await cmd(resident, 'tab-a', 'tv', { mode: 1 })).data.error === 'bad_param')
+check('C01 extra top-level field = 400', (await resident.req('POST', '/tab-a/_cmd/tv', { params: { mode: 'on' }, exec: 'x' })).data.error === 'bad_params')
+check('C01 params not an object = 400', (await resident.req('POST', '/tab-a/_cmd/tv', { params: ['on'] })).data.error === 'bad_params')
+check('C01 bad JSON = 400', (await fetch(BASE + '/tab-a/_cmd/tv', { method: 'POST', headers: { Cookie: resident.cookie, Origin: BASE, 'X-Portal': '1', 'Content-Type': 'application/json' }, body: '{' })).status === 400)
+check('no refused command reached the tab', (await cmdLog()).length === n0)
+check('GET on a command = 405', (await resident.req('GET', '/tab-a/_cmd/tv', undefined, CORS)).status === 405)
+check('/_cmd paths never reach the tab', (await resident.req('GET', '/tab-a/_cmd', undefined, CORS)).status === 404 && (await resident.req('POST', '/tab-a/_cmd/tv/x', {})).status === 404)
+check('page command without X-Portal = 403', (await cmd(resident, 'tab-a', 'tv', { mode: 'on' }, { 'X-Portal': undefined })).status === 403)
+check('page command from another origin = 403', (await cmd(resident, 'tab-a', 'tv', { mode: 'on' }, { Origin: 'https://evil.example' })).status === 403)
+check('page command signed out = 401', (await cmd(anon, 'tab-a', 'tv', { mode: 'on' })).status === 401)
+check('page command on a tab the person lacks = 403', (await cmd(resident, 'tab-b', 'ping')).status === 403)
+
+// limits and intervals
+let tvl
+for (let i = 0; i < 5; i++) tvl = await cmd(resident, 'tab-a', 'tv', { mode: 'off' })
+check('perHour per caller (tv 5/h) = 429', tvl.status === 429 && tvl.data.error === 'too_many_commands', tvl)
+const ac1 = await cmd(resident, 'tab-a', 'ac', { unit: 'a' })
+const ac2 = await cmd(owner, 'tab-a', 'ac', { unit: 'a' })
+check('gap: same unit within 180 s = 429 for anyone, with retry_after', ac1.status === 200 && ac2.status === 429 && ac2.data.error === 'too_soon' && ac2.data.retry_after > 100, [ac1.data, ac2.data])
+check('gap is per unit', (await cmd(owner, 'tab-a', 'ac', { unit: 'b' })).status === 200)
+const sl = await cmd(owner, 'tab-a', 'slow')
+check('bridge not answering in time = 202 sent', sl.status === 202 && sl.data.status === 'sent' && sl.data.ok === false, sl)
+const bm = await cmd(owner, 'tab-a', 'boom')
+check('tab error = 502 failed, no stack', bm.status === 502 && bm.data.status === 'failed' && bm.data.error === 'tab_error' && !JSON.stringify(bm.data).includes('boom'), bm)
+
+// fixed screens: only common actions marked for screens
+const tvc = client()
+const psc = await tvc.req('POST', '/api/pair/start', {})
+await owner.req('POST', '/api/admin/pair', { code: psc.data.code, name: 'TV commands' })
+await tvc.req('POST', '/api/pair/status', { secret: psc.data.secret })
+check('screen: common action for screens = 200', (await cmd(tvc, 'tab-a', 'tv', { mode: 'globo' })).status === 200)
+check('screen: common action not for screens = 403', (await cmd(tvc, 'tab-a', 'light')).data.error === 'not_for_screens')
+check('screen: admin action = 403', (await cmd(tvc, 'tab-a', 'presence', { state: 'home' })).status === 403)
+
+// C07: an admin session that never did a passkey check is weak for admin actions
+const ADMIN3 = '5561900000005'
+check('owner adds a third admin', (await owner.req('POST', '/api/admin/people', { name: 'Admin3', phone: ADMIN3, groups: ['owner'] })).status === 200)
+const admin3 = client()
+await signIn(admin3, ADMIN3, ADMIN3)
+const pe = await cmd(admin3, 'tab-b', 'ping')
+check('Face ID tab: a command needs the entry too', pe.status === 401 && pe.data.error === 'entry_required', pe)
+check('Face ID tab: a command inside a live entry is fine', (await cmd(owner, 'tab-b', 'ping')).status === 200)
+const wp = await cmd(admin3, 'tab-a', 'presence', { state: 'out' })
+check('C07 weak admin session: admin action = 403 passkey_required', wp.status === 403 && wp.data.error === 'passkey_required', wp)
+// owner's decision (05/11): admin commands from a browser need this session's passkey in the last 12 h
+const a3sid = (await admin3.req('GET', '/api/me')).data.session_id
+const setPasskeyAt = (ms) => d1(`UPDATE sessions SET passkey_at = '${new Date(Date.now() - ms).toISOString()}' WHERE id = ${a3sid}`)
+if (setPasskeyAt(12 * 3600e3 + 60e3)) {
+  const old = await cmd(admin3, 'tab-a', 'presence', { state: 'out' })
+  check('B2 passkey 12 h 1 min ago: admin action = 403 passkey_required', old.status === 403 && old.data.error === 'passkey_required', old)
+  check('B2 ... and identity.actions leaves it out', !(await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.actions.includes('presence'))
+  setPasskeyAt(12 * 3600e3 - 60e3)
+  check('B2 passkey 11 h 59 min ago: admin action ok', (await cmd(admin3, 'tab-a', 'presence', { state: 'home' })).status === 200)
+  check('B2 ... and identity.actions lists it; sensitive still needs 5 min', (await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.actions.includes('presence') &&
+    (await cmd(admin3, 'tab-a', 'wipe')).data.error === 'passkey_required')
+  d1(`UPDATE sessions SET passkey_at = NULL WHERE id = ${a3sid}`)
+} else check('B2 local D1 reachable from the test', false)
+check('weak admin session: common action ok (admins are not held)', (await cmd(admin3, 'tab-a', 'light')).status === 200)
+const op = await cmd(owner, 'tab-a', 'presence', { state: 'out' })
+check('owner device with passkey: admin action ok, nothing read back', op.status === 200 && op.data.result === undefined, op)
+check('owner with fresh Face ID: sensitive ok', (await freshen(owner, auth)) && (await cmd(owner, 'tab-a', 'wipe')).status === 200)
+
+// C06: Shortcuts keys
+check('resident cannot list or create keys', (await resident.req('GET', '/api/me/shortcuts')).status === 403 &&
+  (await resident.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-a/tv'] })).status === 403)
+const wk = await admin3.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-a/tv'] })
+check('C06 creating a key from a weak session = 403 passkey', wk.status === 403 && wk.data.passkey === true, wk)
+check('freshen owner (keys)', await freshen(owner, auth))
+check('key scope with a sensitive action = 400', (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-a/wipe'] })).data.error === 'bad_scope')
+check('key scope on a Face ID tab = 400', (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-b/ping'] })).data.error === 'bad_scope')
+check('key scope with an unknown action = 400', (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-a/nope'] })).data.error === 'bad_scope')
+check('key without a label = 400', (await owner.req('POST', '/api/me/shortcuts', { scope: ['tab-a/tv'] })).status === 400)
+const k1 = await owner.req('POST', '/api/me/shortcuts', { label: 'iPhone · <b>TV</b>', scope: ['tab-a/tv', 'tab-a/presence', 'tab-a/light'] })
+check('key created once with pa5_atl_ prefix', k1.status === 200 && /^pa5_atl_[A-Za-z0-9_-]{43}$/.test(k1.data.key) && !/[<>]/.test(k1.data.label), k1.data)
+const KEYH = (k) => ({ Authorization: `Bearer ${k}` })
+const sc = (path, params, headers = KEYH(k1.data.key), method = 'POST') => fetch(BASE + path, { method, headers: { 'Content-Type': 'application/json', ...headers }, body: method === 'POST' ? JSON.stringify(params === undefined ? {} : { params }) : undefined })
+  .then(async (r) => ({ status: r.status, data: await r.json().catch(() => null), headers: r.headers }))
+
+const s1 = await sc('/_cmd/tab-a/presence', { state: 'home' })
+check('shortcut: admin action in scope = 200, nothing read back', s1.status === 200 && s1.data.status === 'done' && s1.data.result === undefined, s1)
+log = await cmdLog()
+const sid1 = log[log.length - 1].identity
+check('shortcut identity: credential shortcut, key id, no session, never strong', sid1.credential === 'shortcut' && sid1.shortcut === k1.data.id && sid1.session === null && sid1.strong === false && sid1.person === ownerId, sid1)
+me = (await owner.req('GET', '/api/me')).data
+const placeAlerts = me.alerts.filter((x) => x.kind === 'shortcut_place')
+check('R1 first use of a key from a new place warns the admins', placeAlerts.length === 1 && placeAlerts[0].label.includes('iPhone'), me.alerts)
+await sc('/_cmd/tab-a/light')
+check('R1 same place again: no new warning', (await owner.req('GET', '/api/me')).data.alerts.filter((x) => x.kind === 'shortcut_place').length === 1)
+check('shortcut answers carry no cookie', !(await sc('/_cmd/tab-a/light')).headers.get('set-cookie'))
+check('C06 shortcut: action out of scope = 403', (await sc('/_cmd/tab-a/ac', { unit: 'b' })).data?.error === 'out_of_scope')
+check('C06 shortcut: sensitive action = 403', (await sc('/_cmd/tab-a/wipe')).data?.error === 'not_for_shortcuts')
+check('C06 shortcut: Face ID tab = 403', (await sc('/_cmd/tab-b/ping')).data?.error === 'not_for_shortcuts')
+check('shortcut: wrong key = 401', (await sc('/_cmd/tab-a/light', undefined, KEYH('pa5_atl_' + 'A'.repeat(43)))).status === 401)
+check('shortcut: one byte changed = 401', (await sc('/_cmd/tab-a/light', undefined, KEYH(k1.data.key.slice(0, -1) + (k1.data.key.endsWith('A') ? 'B' : 'A')))).status === 401)
+check('shortcut: no key = 401', (await sc('/_cmd/tab-a/light', undefined, {})).status === 401)
+check('shortcut: machine or robot key = 401', (await sc('/_cmd/tab-a/light', undefined, KEYH('pa5_maq_' + 'A'.repeat(43)))).status === 401 && (await sc('/_cmd/tab-a/light', undefined, KEYH(ROBO_KEY))).status === 401)
+check('shortcut: session cookie alone = 401', (await sc('/_cmd/tab-a/light', undefined, { Cookie: owner.cookie, Origin: BASE, 'X-Portal': '1' })).status === 401)
+check('shortcut: GET = 405', (await sc('/_cmd/tab-a/light', undefined, KEYH(k1.data.key), 'GET')).status === 405)
+check('shortcut: unknown tab or bad path = 404', (await sc('/_cmd/nothing/light')).status === 404 && (await sc('/_cmd/tab-a')).status === 404)
+check('shortcut key opens nothing else: /api/me, a tab page, a bridge', (await fetch(BASE + '/api/me', { headers: KEYH(k1.data.key) })).status === 401 &&
+  (await fetch(BASE + '/tab-a/echo', { headers: { ...KEYH(k1.data.key), ...CORS } })).status === 401 &&
+  (await upgradeStatus('/_bridge/tab-a', { 'X-A5-Machine-Key': k1.data.key })) === 401)
+const kl = (await owner.req('GET', '/api/me/shortcuts')).data
+const kRow = kl.keys.find((k) => k.id === k1.data.id)
+check('key list: last use and place, never the key or its hash', kRow && !!kRow.last_used_at && !!kRow.last_ip && !JSON.stringify(kl).includes(k1.data.key) && !('key_hash' in kRow), kRow)
+check('key list offers keyable actions only (no sensitive, no Face ID tab)', kl.available.some((a) => a.tab === 'tab-a' && a.action === 'tv') && !kl.available.some((a) => a.action === 'wipe' || a.tab === 'tab-b'), kl.available)
+// 30 an hour per key
+let kl30
+for (let i = 0; i < 30; i++) kl30 = await sc('/_cmd/tab-a/light')
+check('shortcut: 30/h per key = 429', kl30.status === 429 && kl30.data.error === 'too_many_commands', kl30)
+check('resident cannot revoke the owner key', (await resident.req('DELETE', `/api/me/shortcuts/${k1.data.id}`)).status === 404)
+const k2 = await owner.req('POST', '/api/me/shortcuts', { label: 'Watch', scope: ['tab-a/light'] })
+check('second key', k2.status === 200)
+check('another admin cannot revoke someone else\'s key', (await admin3.req('DELETE', `/api/me/shortcuts/${k2.data.id}`)).status === 404)
+check('owner revokes the key', (await owner.req('DELETE', `/api/me/shortcuts/${k2.data.id}`)).status === 200)
+check('revoked key = 401', (await sc('/_cmd/tab-a/light', undefined, KEYH(k2.data.key))).status === 401)
+
+// the brake
+check('weak admin pulls the brake', (await admin3.req('POST', '/api/admin/commands', { off: true })).status === 200)
+check('brake shown to admins', (await owner.req('GET', '/api/me')).data.commands_off === true && (await resident.req('GET', '/api/me')).data.commands_off === undefined)
+const br = await cmd(resident, 'tab-a', 'light')
+check('brake: page command = 503 commands_off', br.status === 503 && br.data.error === 'commands_off', br)
+const k3 = await owner.req('POST', '/api/me/shortcuts', { label: 'brake test', scope: ['tab-a/light'] })
+check('brake: shortcut = 503', (await sc('/_cmd/tab-a/light', undefined, KEYH(k3.data.key))).status === 503)
+check('resident cannot touch the brake', (await resident.req('POST', '/api/admin/commands', { off: false })).status === 403)
+const rel = await admin3.req('POST', '/api/admin/commands', { off: false })
+check('releasing the brake needs Face ID', rel.status === 403 && rel.data.passkey === true, rel)
+check('brake value must be a boolean', (await owner.req('POST', '/api/admin/commands', { off: 'no' })).status === 400)
+check('owner with Face ID releases the brake', (await freshen(owner, auth)) && (await owner.req('POST', '/api/admin/commands', { off: false })).status === 200)
+check('commands work again', (await cmd(resident, 'tab-a', 'light')).status === 200)
+
+// audit
+rows = (await owner.req('GET', '/api/admin/audit')).data
+for (const a of ['command', 'command_refused', 'shortcut_key_created', 'shortcut_key_revoked', 'shortcut_refused', 'commands_off', 'commands_on', 'device_commands_allowed'])
+  check(`audit has ${a}`, rows.some((r) => r.action === a))
+const shRow = rows.find((r) => r.action === 'command' && r.strength === 'shortcut')
+check('shortcut command audited with the key id and person, never the key', shRow && shRow.person_id === ownerId && JSON.parse(shRow.detail).shortcut > 0 && !rows.some((r) => String(r.detail).includes('pa5_atl_')), shRow)
+const refRow = rows.find((r) => r.action === 'command_refused' && JSON.parse(r.detail).reason === 'device_too_new')
+check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv', refRow)
 
 // the selector in a real browser (owner, resident and a freshly paired screen)
 const g5 = await owner.req('POST', '/api/passkey/get/options', {})

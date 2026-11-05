@@ -137,6 +137,12 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     check('browser: Conta has the selector in its title and lists the devices', c.title === 'Conta' && c.devices, c)
     check('browser: Conta is remembered as the last tab', c.last === 'conta', c)
     check('browser: no CSP violation on the account page', !o.log.some((x) => /Content Security Policy|exception/i.test(x)), o.log)
+    // the admin view: brake and Shortcuts keys cards, keys listed without the key itself
+    await o.evaluate(`[...document.querySelectorAll('nav button, button')].find((b) => b.textContent === T.nav.admin).click()`)
+    const adm = await o.waitFor(`[...document.querySelectorAll('main h2')].some((h) => h.textContent === T.shortcuts.title) && [...document.querySelectorAll('main h2')].some((h) => h.textContent === T.commands.title)`)
+    check('browser: admin view shows the brake and the Shortcuts keys', adm)
+    check('browser: admin view lists keys but never a key value', await o.evaluate(`!document.body.textContent.includes('pa5_atl_') && document.body.textContent.includes('tab-a · tv')`))
+    check('browser: no error on the admin view', !o.log.some((x) => /Content Security Policy|exception/i.test(x)), o.log)
 
     // "/" opens the last tab on this device
     await o.go('/')
