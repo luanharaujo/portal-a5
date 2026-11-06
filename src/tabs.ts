@@ -27,6 +27,8 @@ export interface PortalIdentity {
   entered_at: string | null  // tabs with entry 'passkey': when this session entered with Face ID
   entry_until: string | null // ...and when that entry ends: close this session's sockets then
   actions: string[]          // commands this identity may send in the tab (docs/COMMANDS.md)
+  admin_until: string | null // admin commands from this browser session need no new Face ID until
+                             // then (ADMIN_COMMAND_PASSKEY window); null = ask (docs/COMMANDS.md)
   rehearsal?: true          // an admin rehearsing as a resident ("see as"): commands come back
                              // simulated; show the made-up resident (T.rehearsal.name), not name
 }
@@ -66,12 +68,13 @@ export interface TabPolicy {
 const CLOSED_POLICY: TabPolicy = { allow: [], entry: 'passkey', entryHours: 0, credentials: [], serviceWorker: false }
 
 // Drawings the selector knows (public/_shell/tabs.js). A tab picks one by name.
-export const TAB_ICONS = ['bolt', 'mic', 'terminal', 'coin', 'grid']
+export const TAB_ICONS = ['bolt', 'power', 'mic', 'terminal', 'coin', 'grid']
 
 // One tab as configured outside the code: the binding, how the selector shows it, and its policy.
 export interface TabConfig extends TabPolicy {
   binding: string
   label: string | null
+  hint: string | null       // second line under the name in the selector
   icon: string | null
   // actions the tab takes (docs/COMMANDS.md); empty = the tab takes no commands
   commands: Catalog
@@ -102,10 +105,11 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(tab) || RESERVED_TABS.includes(tab)) return null
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   const o = v as Record<string, unknown>
-  const known = ['binding', 'label', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands']
+  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands']
   if (Object.keys(o).some((k) => !known.includes(k))) return null
   if (typeof o.binding !== 'string' || !/^[A-Z][A-Z0-9_]{0,40}$/.test(o.binding)) return null
   if (o.label != null && (typeof o.label !== 'string' || !o.label.trim() || o.label.length > 40 || /[\u0000-\u001f<>]/.test(o.label))) return null
+  if (o.hint != null && (typeof o.hint !== 'string' || !o.hint.trim() || o.hint.length > 40 || /[\u0000-\u001f<>]/.test(o.hint))) return null
   if (o.icon != null && (typeof o.icon !== 'string' || !TAB_ICONS.includes(o.icon))) return null
   if (!isList(o.allow, FEATURES)) return null
   if (o.entry !== 'session' && o.entry !== 'passkey') return null
@@ -119,7 +123,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   const commands = parseCatalogStrict(o.commands ?? {})
   if (!commands) return null
   return {
-    binding: o.binding, label: (o.label as string | undefined)?.trim() ?? null, icon: (o.icon as string | undefined) ?? null,
+    binding: o.binding, label: (o.label as string | undefined)?.trim() ?? null, hint: (o.hint as string | undefined)?.trim() ?? null, icon: (o.icon as string | undefined) ?? null,
     allow: [...new Set(o.allow as string[])],
     entry,
     entryHours: entry === 'passkey' ? hours : 0,

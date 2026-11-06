@@ -51,6 +51,7 @@ interface PortalIdentity {
   entry_until: string | null // ...and when that entry ends
   shortcut: number | null    // Shortcuts key id; only for shortcuts
   actions: string[]          // commands this identity may send in the tab (COMMANDS.md)
+  admin_until: string | null // when this session's window for admin commands closes, or null (COMMANDS.md)
 }
 ```
 
@@ -112,7 +113,8 @@ One entry per tab in the tab configuration (section 1):
 | `credentials` | which of `browser`, `screen`, `machine` may reach the tab, at least one | yes |
 | `serviceWorker` | `false` refuses service worker registration; always `false` with `passkey` | no (true) |
 | `label` | the tab's name in the selector (up to 40 characters) | no (the tab id) |
-| `icon` | one of the selector's drawings: `bolt`, `mic`, `terminal`, `coin`, `grid` | no (none) |
+| `hint` | the second line under the name in the selector (up to 40 characters) | no (none; "Face ID" for a passkey tab) |
+| `icon` | one of the selector's drawings: `bolt`, `power`, `mic`, `terminal`, `coin`, `grid`; it also picks the tile's color | no (a gray tile) |
 | `commands` | the actions the tab takes, with level, parameters and limits (`COMMANDS.md` section 2); one malformed action drops the tab | no (none) |
 
 Fail closed: there is no default policy. A tab whose entry misses `allow`, `entry` or `credentials`, has an unknown key or a value out of range is not bound at all (its path answers 404) and the portal logs `tab config refused`. After a deploy, check `GET /api/tabs` (a passkey tab must say `"entry": "passkey"`).
@@ -258,7 +260,7 @@ The home-screen app has no reload button, so `tabs.js` reloads the page when a s
 
 An admin's list also offers "see as <group>" (`A5_TEXT.shell.seeAs`) for every non-admin group, above the line before Conta. Picking one sends `POST /api/tabs {"view_as": "<group>"}` and, from then on, that session (that device only) is that group and no admin: `/api/tabs`, `/<tab>/*`, the identity every tab gets (`groups`, `actions` with the group's level), commands and the account pages. Nothing to change in a tab: it shows exactly what that group sees. The title carries a "seeing as ..." mark (`seeingAs`) and the list starts with "back to owner mode" (`backToOwner`, sends `{"view_as": null}`). Going in asks for nothing (the mode only takes power away). Coming back asks for Face ID made after going in: turning the mode on clears the session's last check, and `{"view_as": null}` answers 403 `passkey_required` without a fresh one. A tab page cannot run that check (its CSP), so the selector's "back to owner mode" opens `/conta/?owner=1&next=<this page>`, which asks for Face ID and then comes back. No counts while it is on. Audit: `view_as_on` and `view_as_off`, target the group, and every other audit row written while it is on carries `view_as` in its detail.
 
-It is also a rehearsal with a made-up resident (`A5_TEXT.rehearsal.name`): the identity a tab gets has `rehearsal: true` (show that name instead of `name` if the tab shows one), and a command sent from it passes every check a resident meets and then stops at the portal: nothing reaches `command()`, the answer is `200 {"id", "status": "done", "ok": true, "simulated": true}` and the audit row has `simulated: true`. A tab that sees `simulated` says nothing was sent (`A5_TEXT.rehearsal.nothingSent` is there for that). Signing out of the rehearsal happens on the portal page only: it draws the signed-out pages (sign in, message, waiting for approval, screen pairing) with made-up data and calls none of the sign-in, pairing or passkey routes; `POST /api/logout` answers 403 `view_as_active` while the mode is on, so the owner's session never drops.
+It is also a rehearsal with a made-up resident (`A5_TEXT.rehearsal.name`): the identity a tab gets has `rehearsal: true` (show that name instead of `name` if the tab shows one), and a command sent from it passes every check a resident meets and then stops at the portal: nothing reaches `command()`, the answer is `200 {"id", "status": "done", "ok": true, "simulated": true}` and the audit row has `simulated: true`. A tab that sees `simulated` says nothing was sent (`A5_TEXT.rehearsal.nothingSent` is there for that). Every page of it shows a yellow bar on top (`.a5-rehearsal`, `<html data-a5-rehearsal>`, `--a5-bar` is its height, 42 px): `tabs.js` draws it on a tab page, `app.js` on the portal's own pages. The bar is fixed over the top of the page: a tab moves its own top down while it is on, for example `html[data-a5-rehearsal] .my-header { padding-top: calc(env(safe-area-inset-top) + var(--a5-bar)) }`. While it is on, the list shows only "back to owner mode", that group's tabs and Conta. The list also has a rehearsal row (the made-up name, flask icon) that turns on "see as" the residents and starts from the signed-out pages. Signing out of the rehearsal happens on the portal page only: it draws the signed-out pages (sign in, message, waiting for approval, screen pairing) with made-up data and calls none of the sign-in, pairing or passkey routes; `POST /api/logout` answers 403 `view_as_active` while the mode is on, so the owner's session never drops.
 
 "See as" is a view, not a security boundary: the page still runs with the admin's own session, and any script on it can turn the mode off. Never use it to try out a tab you do not trust.
 
@@ -271,19 +273,21 @@ Session required (401 otherwise), GET only, `Cache-Control: no-store`.
   "selector": true,
   "current": "notes",
   "tabs": [
-    {"id": "notes", "path": "/notes/", "label": "Notes", "icon": "grid", "badge": null, "entry": "session"},
-    {"id": "voice", "path": "/voice/", "label": "Voice", "icon": "mic", "badge": 2, "entry": "passkey"}
+    {"id": "notes", "path": "/notes/", "label": "Notes", "hint": null, "icon": "grid", "badge": null, "entry": "session"},
+    {"id": "voice", "path": "/voice/", "label": "Voice", "hint": "talk to the house", "icon": "mic", "badge": 2, "entry": "passkey"}
   ],
+  "who": {"name": "Owner", "group": "owner"},
   "account": {"id": "conta", "path": "/conta/"},
   "view_as": null,
   "view_options": [{"id": "residents", "name": "Residents"}]
 }
 ```
 
+- `who`: the header line of the list, the session's own name and group id (an admin group first); `name` is null while seeing as someone else; null for a fixed screen. Nothing about anyone else.
 - `view_as`: the group this session is seen as (`{id, name}`), or null. `view_options`: the groups an admin can see the portal as (empty for everyone else).
 - `POST /api/tabs` with `{"view_as": "<group>" | null}` (same origin, `X-Portal: 1`) turns "see as" on or off and answers the new list. Admin browser sessions only (403); an admin group is refused (400 `view_as_admin_group`).
 
-- `tabs`: the tabs this session can open (group and the tab's `credentials` policy, the same rule as `/<tab>/*`), in configuration order, with the configured `label` and `icon` (or null). The account's name comes from the locale.
+- `tabs`: the tabs this session can open (group and the tab's `credentials` policy, the same rule as `/<tab>/*`), in configuration order, with the configured `label`, `hint` and `icon` (or null). The account's name comes from the locale.
 - `selector` is `false` for a fixed screen (`credential: 'screen'`): plain title, no counts.
 - `current` is the `current` query echoed back only when it is `conta` or a listed tab.
 - `entry: "passkey"` shows "Face ID" next to the tab in the list.

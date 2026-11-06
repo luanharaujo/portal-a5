@@ -514,7 +514,8 @@ check('badge comes from the tab', byId['tab-a'].badge === 3 && byId['tab-b'].bad
 check('slow badge: no number, and the answer does not wait for it', byId['tab-slow'].badge === null && took < 1500, [byId['tab-slow'], took])
 check('badge that is not a count: no number', byId['tab-odd'].badge === null, byId['tab-odd'])
 check('entry kind per tab', byId['tab-b'].entry === 'passkey' && byId['tab-a'].entry === 'session')
-check('list carries id, path, label, icon, badge and entry only', ot.data.tabs.every((t) => Object.keys(t).sort().join() === 'badge,entry,icon,id,label,path'), ot.data.tabs)
+check('list carries id, path, label, hint, icon, badge and entry only', ot.data.tabs.every((t) => Object.keys(t).sort().join() === 'badge,entry,hint,icon,id,label,path'), ot.data.tabs)
+check('who: only the own name and the admin group', ot.data.who && Object.keys(ot.data.who).sort().join() === 'group,name' && ot.data.who.group === 'owner' && typeof ot.data.who.name === 'string' && ot.data.who.name.length > 0, ot.data.who)
 check('label and icon from the configuration', byId['tab-a'].label === 'Tab A' && byId['tab-a'].icon === 'bolt' && byId['tab-slow'].label === null && byId['tab-slow'].icon === null, byId)
 check('a tab without a written policy is never routed', (await navigate(owner, '/tab-nopolicy/')).status === 404 && (await owner.req('GET', '/tab-nopolicy/echo', undefined, CORS)).status === 404)
 check('a tab with an unknown key is never routed', (await navigate(owner, '/tab-bad/')).status === 404)
@@ -632,6 +633,20 @@ check('Face ID tab: a command needs the entry too', pe.status === 401 && pe.data
 check('Face ID tab: a command inside a live entry is fine', (await cmd(owner, 'tab-b', 'ping')).status === 200)
 const wp = await cmd(admin3, 'tab-a', 'presence', { state: 'out' })
 check('C07 weak admin session: admin action = 403 passkey_required', wp.status === 403 && wp.data.error === 'passkey_required', wp)
+check('passkey_required on a page points to the portal Face ID for commands', wp.data.step_up === '/?step_up=tab-a&purpose=command&next=%2Ftab-a%2F', wp.data)
+check('identity.admin_until: null without a passkey check', (await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.admin_until === null)
+{
+  const ro = await resident.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
+  check('command Face ID: refused to a resident', ro.status === 403, ro)
+  const so = await owner.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-slow' })
+  check('command Face ID: refused for a tab without owner commands', so.status === 400 && so.data.error === 'bad_purpose', so)
+  const co = await owner.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
+  const cv = await owner.req('POST', '/api/passkey/get/verify', await auth.get(co.data))
+  check('command Face ID: ok, back to the tab', co.status === 200 && cv.status === 200 && cv.data.next === '/tab-a/', [co.status, cv])
+  const until = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.admin_until
+  const left = Date.parse(until) - Date.now()
+  check('identity.admin_until: about 12 h after the Face ID', left > 11.9 * 3600e3 && left <= 12 * 3600e3, until)
+}
 // owner's decision (05/11): admin commands from a browser need this session's passkey in the last 12 h
 const a3sid = (await admin3.req('GET', '/api/me')).data.session_id
 const setPasskeyAt = (ms) => d1(`UPDATE sessions SET passkey_at = '${new Date(Date.now() - ms).toISOString()}' WHERE id = ${a3sid}`)

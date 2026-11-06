@@ -12,7 +12,7 @@ import {
   policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig,
 } from './tabs'
 import {
-  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, allowedActions, checkParams, checkScope, gapKeyOf,
+  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, adminWindowUntil, allowedActions, checkParams, checkScope, gapKeyOf,
   isShortcutKeyShape, pickReturns, readAnswer, refusal,
 } from './commands'
 
@@ -506,7 +506,7 @@ async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
   if (newIp) await alertAdmins(env, req, `${tab}:${m.label}`, 'bridge_ip')
   const identity: PortalIdentity = {
     credential: 'machine', person: null, name: String(m.label), groups: [], session: null, machine: id, shortcut: null,
-    strong: false, entered_at: null, entry_until: null, actions: [],
+    strong: false, entered_at: null, entry_until: null, admin_until: null, actions: [],
   }
   return forwardSocket(env, req, service, tab, identity, null)
 }
@@ -676,7 +676,19 @@ async function checkPurpose(env: Env, who: Who, raw: unknown): Promise<string | 
     await pendingAgentRequest(env, Number(pm[1]), true)
     return `agent:${Number(pm[1])}`
   }
+  const cm = /^command:([a-z][a-z0-9-]{0,30})$/.exec(String(raw ?? ''))
+  if (cm) return commandPurpose(env, who, cm[1])
   return entryPurpose(env, who, raw)
+}
+
+// 'command:<tab>': the Face ID a tab page asks for before an owner's command (the tab pages
+// cannot run WebAuthn). It only opens the session's window for admin commands (passkey_at, as any
+// passkey check does) and is audited; the tab never resends a command on its own afterwards.
+function commandPurpose(env: Env, who: Who, tab: string): string {
+  if (!who.admin || who.kind !== 'browser') throw new HttpError(403, 'admin_only')
+  const catalog = catalogOf(env, tab)
+  if (!tabService(env, tab) || !canOpen(who, tab) || !Object.values(catalog).some((c) => c.level !== 'common')) throw new HttpError(400, 'bad_purpose')
+  return `command:${tab}`
 }
 
 function entryPurpose(env: Env, who: Who, raw: unknown): string | null {
@@ -788,6 +800,11 @@ async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
     env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId),
   ])
   if (purpose?.startsWith('agent:')) return approveAgentRequest(env, req, who, Number(purpose.slice(6)))
+  if (purpose?.startsWith('command:')) {
+    const tab = purpose.slice(8)
+    await audit(env, req, { who, strength: 'strong', action: 'command_passkey_ok', target: tab })
+    return { ok: true, next: `/${tab}/` }
+  }
   if (purpose?.startsWith('entry:')) {
     const tab = purpose.slice(6)
     await env.DB.batch([
@@ -1119,6 +1136,8 @@ function identityOf(env: Env, tab: string, who: Who, policy: TabPolicy, enteredA
     credential: who.kind, person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id),
     session: who.sessionId, machine: null, shortcut: null, strong: fresh(who), entered_at: enteredAt,
     entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null,
+    // same rule as the commands (callerOf): only a browser session of an admin, never while seeing as
+    admin_until: who.kind === 'browser' && who.admin ? adminWindowUntil(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY) : null,
     actions: allowedActions(tab, catalogOf(env, tab), callerOf(env, who)),
     ...(who.viewAs ? { rehearsal: true } : {}),
   }
@@ -1171,8 +1190,11 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
     current: cur === 'conta' || (cur && tabs.includes(cur)) ? cur : null,
     tabs: tabs.map((t, i) => {
       const c = tabsConfig(env.TABS)[t]
-      return { id: t, path: `/${t}/`, label: c?.label ?? null, icon: c?.icon ?? null, badge: badges[i], entry: policyOf(t).entry }
+      return { id: t, path: `/${t}/`, label: c?.label ?? null, hint: c?.hint ?? null, icon: c?.icon ?? null, badge: badges[i], entry: policyOf(t).entry }
     }),
+    // the header line of the list: this person's own name and group, nothing about anyone else;
+    // no name while seeing as someone else (the page shows the made-up resident)
+    who: selector ? { name: who.viewAs ? null : who.person.name, group: (who.groups.find((g) => g.is_admin) ?? who.groups[0])?.id ?? null } : null,
     account: { id: 'conta', path: ACCOUNT_PATH },
     view_as: who.viewAs,
     view_options: selector && who.realAdmin ? await viewOptions(env) : [],
@@ -1326,6 +1348,10 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     ? { credential: 'shortcut', admin: c.key.admin, strong: false, adminFresh: false, scope: c.key.scope }
     : callerOf(env, c.who!)
   const why = refusal(tab, action, spec, caller)
+  // an owner on a page: where the portal asks the Face ID (the tab page cannot), coming back to the tab
+  if (why === 'passkey_required' && c.who?.admin && c.who.kind === 'browser') {
+    return refuse(403, why, { step_up: `/?step_up=${tab}&purpose=command&next=${encodeURIComponent(`/${tab}/`)}` })
+  }
   if (why) return refuse(403, why)
   // a borrowed WhatsApp sign-in cannot act at once (Security B4c)
   // (an admin seeing as a resident is still the admin's own device: no hold)
@@ -1368,7 +1394,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   const identity: PortalIdentity = c.key
     ? {
       credential: 'shortcut', person: person.id, name: person.name, groups: c.key.groups.map((g) => g.id), session: null,
-      machine: null, shortcut: c.key.id, strong: false, entered_at: null, entry_until: null,
+      machine: null, shortcut: c.key.id, strong: false, entered_at: null, entry_until: null, admin_until: null,
       actions: allowedActions(tab, catalogOf(env, tab), caller),
     }
     : identityOf(env, tab, c.who!, policy, c.enteredAt)

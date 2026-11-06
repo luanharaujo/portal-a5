@@ -55,7 +55,15 @@ Action names: `^[a-z][a-z0-9_]{0,39}$`, at most 40 per tab. A malformed action i
 
 On top of the level, the person's groups must still give the tab, at the moment of the command (a key loses an action as soon as its person loses it). Data that only an admin may see (presence) goes in `admin` actions, never `common`.
 
-`identity.actions` (TABS.md section 2) lists the actions this identity may run in the tab, so a page shows only the buttons that will work. It is a hint for the page; the portal checks again on every command.
+`identity.actions` (TABS.md section 2) lists the actions this identity may run in the tab, so a page shows only the buttons that will work. It is a hint for the page; the portal checks again on every command. `identity.admin_until` says when this session's window for `admin` actions closes (ISO), or null when it is not open (no recent check, not an admin, a fixed screen, "see as"); a page can ask for Face ID before the tap instead of after a refusal.
+
+### Face ID for an owner's command
+
+A tab page cannot run WebAuthn (its CSP). It sends the person to the portal, full page:
+
+`/?step_up=<tab>&purpose=command&next=<path>` (`next` must start with `/<tab>/`; a `#` in it comes back intact)
+
+The portal page asks for Face ID with the purpose `command:<tab>` (admin browser sessions only, not while seeing as; the tab must exist, be open to the person and have an `admin` or `sensitive` action, otherwise 400 `bad_purpose`). The check sets the session's passkey time, which opens the `admin` window (and, for 5 minutes, `sensitive`), audits `command_passkey_ok` with the tab as target and goes back to `next`. "Not now" goes back too. Nothing is resent on the way back: the person taps the command again. A page command refused with `passkey_required` for an admin's browser session carries that address as `step_up` (`next` = `/<tab>/`).
 
 ## 4. Routes
 

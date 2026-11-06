@@ -17,6 +17,13 @@ const store = {
   set: (on) => { try { if (on) sessionStorage.setItem(OUT_KEY, '1'); else sessionStorage.removeItem(OUT_KEY) } catch { /* private mode: the rehearsal just ends */ } },
 }
 let REHEARSAL = false
+// per device: a passkey of this person was created or used here; the welcome was shown here
+const flag = (key) => ({
+  get: () => { try { return localStorage.getItem(key) === '1' } catch { return false } },
+  set: () => { try { localStorage.setItem(key, '1') } catch { /* private mode: asked again next time */ } },
+})
+const PASSKEY_HERE = flag('a5.passkeyHere')
+const WELCOMED = flag('a5.welcomed')
 
 // ------------------------------------------------------------------ helpers
 function el(tag, attrs, ...kids) {
@@ -82,9 +89,13 @@ function houseArt(wide) {
 // replaceChildren with nested lists and empty slots, like el()
 const fill = (node, ...kids) => node.replaceChildren(...kids.flat(Infinity).filter((k) => k != null && k !== false))
 
+// the rehearsal's yellow bar: 'out' on its signed-out pages, 'in' once the made-up resident is in
+let BAND = null
 function setPage(cls, ...nodes) {
   document.body.className = cls
   document.body.replaceChildren(...nodes, $toast)
+  document.documentElement.toggleAttribute('data-a5-rehearsal', !!BAND)
+  if (BAND) document.body.prepend(rehearsalBar(BAND))
 }
 
 let toastTimer
@@ -164,6 +175,7 @@ async function passkeyCreate() {
     publicKey: bufToB64u(r.getPublicKey()),
     publicKeyAlgorithm: r.getPublicKeyAlgorithm(),
   })
+  PASSKEY_HERE.set()
 }
 
 async function passkeyCheck(purpose) {
@@ -172,12 +184,26 @@ async function passkeyCheck(purpose) {
     publicKey: { ...o, challenge: b64uToBuf(o.challenge), allowCredentials: o.allowCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) })) },
   })
   const r = cred.response
-  return rawApi('POST', '/api/passkey/get/verify', {
+  const out = await rawApi('POST', '/api/passkey/get/verify', {
     id: cred.id,
     clientDataJSON: bufToB64u(r.clientDataJSON),
     authenticatorData: bufToB64u(r.authenticatorData),
     signature: bufToB64u(r.signature),
   })
+  PASSKEY_HERE.set()
+  return out
+}
+
+// A passkey for this device: the first one goes straight in; after that the server asks a Face ID
+// with one the person has (a passkey synced to this device answers it, and then nothing new is made:
+// the device refuses a second one, InvalidStateError, which means it is already here).
+async function passkeyHere() {
+  try {
+    await passkeyCreate().catch(async (e) => { if (!(e instanceof ApiError && e.data.passkey)) throw e; await passkeyCheck(); await passkeyCreate() })
+  } catch (e) {
+    if (e && e.name === 'InvalidStateError') { PASSKEY_HERE.set(); return }
+    throw e
+  }
 }
 
 // ------------------------------------------------------------------ small pieces
@@ -223,7 +249,8 @@ const keyOnce = (text, key) => el('div', { class: 'key-once' }, el('p', {}, text
 
 // ------------------------------------------------------------------ cover: sign-in, pairing, Face ID
 function cover(kids, pair, noBand) {
-  const sheet = el('main', { class: 'sheet' }, REHEARSAL && !noBand ? rehearsalBand() : null, kids)
+  BAND = REHEARSAL && !noBand ? (store.get() ? 'out' : 'in') : null
+  const sheet = el('main', { class: 'sheet' }, kids)
   setPage(pair ? 'cover pair' : 'cover',
     el('div', { class: 'scene' }, houseArt(true)),
     el('a', { class: 'brand', href: '/' }, el('img', { src: '/favicon.svg', alt: '' }), el('b', {}, T.title)),
@@ -231,8 +258,8 @@ function cover(kids, pair, noBand) {
   return sheet
 }
 
-function steps(now) {
-  const names = [T.steps.number, T.steps.message, T.steps.approval].slice(0, Math.max(2, now))
+function steps(now, third) {
+  const names = [T.steps.number, T.steps.message, third || T.steps.approval].slice(0, Math.max(2, now))
   const out = el('div', { class: 'steps' })
   names.forEach((n, i) => {
     if (i) out.append(el('span', { class: 'dash' }))
@@ -300,7 +327,7 @@ async function askCode(phone) {
   const poll = async () => {
     let s
     try { s = await rawApi('POST', '/api/login/status', { secret: r.secret, mode: MODE }) } catch (e) { const n = status(e.message); st.replaceWith(n); st = n; return }
-    if (s.status === 'ok') { const n = nextPath(); if (n) location.href = n; else start(); return }
+    if (s.status === 'ok') return guarded(afterSignIn)
     if (s.status === 'pending' && !pendingShown) { pendingWhy = s.why || ''; pendingView() }
     else if (s.status !== 'waiting' && s.status !== 'pending') { const n = status(T.status[s.status] || s.status); st.replaceWith(n); st = n }
     if (s.status === 'waiting' || s.status === 'pending') pollTimer = setTimeout(poll, 2000)
@@ -309,10 +336,89 @@ async function askCode(phone) {
 }
 
 // ------------------------------------------------------------------ rehearsal (signed out, made up)
-function rehearsalBand() {
-  return el('div', { class: 'rehearsal-band', role: 'note' }, icon('eye'),
-    el('span', {}, el('b', {}, T.rehearsal.band), ' · ', T.rehearsal.name),
-    el('button', { type: 'button', onclick: () => guarded(backToOwner) }, T.rehearsal.back))
+function rehearsalBar(state) {
+  const b = T.shell.band
+  const g = ME && ME.view_as ? (T.shell.groupNames[ME.view_as.id] || ME.view_as.name) : ''
+  return el('div', { class: 'a5-rehearsal', role: 'status' }, el('b', {}, b.label),
+    el('span', {}, state === 'out' || !g ? b.out : b.state(ME.view_as.id, g)),
+    el('button', { type: 'button', onclick: () => guarded(backToOwner) }, b.back))
+}
+
+// ------------------------------------------------------------------ after signing in on a device
+// The owner on a device without a passkey: step 3, Face ID here. Then, once per device, the welcome.
+async function afterSignIn() {
+  ME = await rawApi('GET', '/api/me')
+  if (ME.admin && ME.credential === 'browser' && !PASSKEY_HERE.get()) return ownerFaceIdView()
+  return welcomeOrGo()
+}
+
+function welcomeOrGo() {
+  const n = nextPath()
+  if (n) { location.href = n; return }
+  if (WELCOMED.get()) return start()
+  return welcomeView(ME.person.name)
+}
+
+function ownerFaceIdView() {
+  cover([
+    steps(3, T.steps.faceId),
+    el('div', { class: 'faceid-mark' }, icon('faceid')),
+    el('h1', {}, T.ownerFaceId.title),
+    el('p', { class: 'sub' }, T.ownerFaceId.why),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => { await passkeyHere(); toast(T.passkeyAdded); welcomeOrGo() }) },
+      icon('faceid'), el('span', {}, T.ownerFaceId.add)),
+    el('button', { type: 'button', class: 'back', onclick: welcomeOrGo }, T.ownerFaceId.later),
+  ])
+}
+
+// the title of a tab as it looks on top of the page: name and arrow
+function miniTitle(name) {
+  const s = document.createElementNS(SVGNS, 'svg')
+  s.setAttribute('viewBox', '0 0 12 12')
+  s.setAttribute('class', 'a5-tabs-arrow')
+  s.setAttribute('aria-hidden', 'true')
+  const p = document.createElementNS(SVGNS, 'path')
+  p.setAttribute('d', 'M2 4l4 4 4-4')
+  p.setAttribute('fill', 'none')
+  p.setAttribute('stroke', 'currentColor')
+  p.setAttribute('stroke-width', '2')
+  s.append(p)
+  return el('span', { class: 'mini-title', 'aria-hidden': 'true' }, name, s)
+}
+
+async function welcomeView(fullName) {
+  const target = await lastTabTarget().catch(() => null)
+  const tab = target && target.id !== 'conta' ? target : null
+  const name = tab ? tab.label || tab.id : T.account
+  // the made-up resident keeps the whole name (its first word alone reads as a group)
+  const first = REHEARSAL ? fullName : String(fullName || '').trim().split(/\s+/)[0]
+  const w = T.welcome
+  cover([
+    el('div', { class: 'done-mark' }, icon('check')),
+    el('h1', {}, w.title(first)),
+    el('p', { class: 'sub' }, w.sub),
+    el('p', { class: 'tip' }, miniTitle(name), el('span', {}, w.tipBefore, el('b', {}, w.tipBold), w.tipAfter)),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => { if (!REHEARSAL) WELCOMED.set(); location.replace(target ? target.path : ACCOUNT) } },
+      el('span', {}, tab ? w.open(name) : w.openAccount)),
+  ])
+}
+
+// ------------------------------------------------------------------ Face ID for an owner's command
+// The tab pages cannot run WebAuthn (their CSP): a tab sends the person here and gets them back.
+// Nothing is resent on the way back: the person taps the command again.
+function commandStepUpView(tab) {
+  const n = nextPath()
+  const next = n && n.startsWith(`/${tab}/`) ? n : `/${tab}/`
+  cover([
+    el('div', { class: 'faceid-mark' }, icon('faceid')),
+    el('h1', {}, T.commandStepUp.title),
+    el('p', { class: 'sub' }, T.commandStepUp.why),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
+      await passkeyCheck(`command:${tab}`)
+      location.href = next
+    }) }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
+    el('button', { type: 'button', class: 'back', onclick: () => location.assign(next) }, T.commandStepUp.later),
+  ])
 }
 
 // back to the owner: Face ID first (the server asks for one made after going in)
@@ -347,7 +453,10 @@ function rehearsalSignOut() {
 // the end of every rehearsal path: signed in again as the made-up resident
 function rehearsalIn() {
   store.set(false)
-  location.assign(nextPath() || '/')
+  const n = nextPath()
+  if (n) { location.assign(n); return }
+  history.replaceState(null, '', '/')
+  welcomeView(T.rehearsal.name)
 }
 
 const fakeCode = () => 'A5-' + Array.from(crypto.getRandomValues(new Uint8Array(4)), (x) => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[x % 31]).join('')
@@ -518,11 +627,16 @@ function stepUpView(tab) {
 // ------------------------------------------------------------------ opening
 // No home page: "/" opens the last tab used on this device, else the first tab, else the account.
 async function openLastTab() {
+  const tab = await lastTabTarget()
+  location.replace(tab ? tab.path : ACCOUNT)
+}
+
+// the tab "/" opens: the last one used on this device, else the first tab, else the account
+async function lastTabTarget() {
   const data = window.A5Tabs ? await window.A5Tabs.load() : null
-  if (!data) { location.replace(ACCOUNT); return }
+  if (!data) return null
   const last = window.A5Tabs.lastTab()
-  const tab = last === data.account.id ? data.account : data.tabs.find((t) => t.id === last) || data.tabs[0] || data.account
-  location.replace(tab.path)
+  return last === data.account.id ? data.account : data.tabs.find((t) => t.id === last) || data.tabs[0] || data.account
 }
 
 // ------------------------------------------------------------------ the account tab: index + parts
@@ -573,6 +687,7 @@ function accountShell() {
   $title = el('h1', { class: 'account-title' })
   $index = el('nav', { class: 'index', 'aria-label': T.account })
   $pane = el('main', { class: 'pane' })
+  BAND = ME.rehearsal ? 'in' : null
   setPage('account', el('div', { class: 'side' }, el('div', { class: 'account-top' }, houseArt(false), $title), $index), $pane)
   // the title is the tab selector too (Conta + arrow), except on a fixed screen
   if (ME.credential !== 'browser' || !window.A5Tabs) $title.replaceChildren(T.account)
@@ -618,7 +733,7 @@ function renderIndex(current) {
       el('div', { class: 'chips' }, groups.map((g) => el('span', { class: 'chip fill ' + (g.id === 'owner' ? 'sun' : 'ok') }, groupName(g))),
         ME.passkeys ? el('span', { class: 'chip fill ok' }, T.faceId) : null)))
   const rows = (keys) => el('div', { class: 'group' }, keys.filter(allowed).map((k) => indexRow(k, ...summary(k), k === current)))
-  fill($index, ME.rehearsal ? rehearsalBand() : null, profile, WIDE.matches ? null : alerts(),
+  fill($index, profile, WIDE.matches ? null : alerts(),
     el('span', { class: 'section caps' }, T.you), rows(YOU),
     ME.admin ? [el('span', { class: 'section caps' }, T.house), rows(HOUSE)] : null,
     el('button', { type: 'button', class: 'logout', onclick: () => guarded(async () => { if (ME.rehearsal) return rehearsalSignOut(); await rawApi('POST', '/api/logout', {}); start() }) }, icon('logout'), T.nav.logout))
@@ -682,7 +797,7 @@ function partAllDevices(top) {
 
 function partFaceId(top) {
   const add = async () => {
-    await passkeyCreate().catch(async (e) => { if (!(e instanceof ApiError && e.data.passkey)) throw e; await passkeyCheck(); await passkeyCreate() })
+    await passkeyHere()
     toast(T.passkeyAdded); await refresh()
   }
   return [top(T.faceId, ME.passkeys ? T.passkeyCount(ME.passkeys) : T.noPasskey),
@@ -951,7 +1066,7 @@ async function start() {
   if (!REHEARSAL) store.set(false)
   else if (store.get()) return rehearsalLogin()
   const stepUp = q.get('step_up')
-  if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return stepUpView(stepUp)
+  if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return q.get('purpose') === 'command' ? commandStepUpView(stepUp) : stepUpView(stepUp)
   const agentReq = q.get('agent_request')
   if (agentReq && /^\d{1,12}$/.test(agentReq) && ME.admin) {
     if (!onAccount()) { location.replace(`${ACCOUNT}?agent_request=${agentReq}`); return }

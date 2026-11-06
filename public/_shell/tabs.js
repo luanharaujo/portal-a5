@@ -9,12 +9,21 @@
 (() => {
   'use strict'
   const KEY = 'a5.lastTab'
+  // the rehearsal: seeing as this group, starting from the signed-out pages (app.js reads the flag)
+  const REHEARSAL_GROUP = 'residents'
+  const REHEARSAL_OUT = 'a5.rehearsalOut'
+  const SCREEN_GROUP = 'owner-screens'
   const SVG = 'http://www.w3.org/2000/svg'
   const text = () => (window.A5_TEXT && window.A5_TEXT.shell) || {}
+  const madeUp = () => (window.A5_TEXT && window.A5_TEXT.rehearsal && window.A5_TEXT.rehearsal.name) || ''
 
   // localStorage can be missing or throw (private mode, blocked storage): never fatal
   const lastTab = () => { try { return localStorage.getItem(KEY) } catch { return null } }
   const remember = (id) => { try { localStorage.setItem(KEY, id) } catch { /* nothing to keep */ } }
+
+  const backUrl = () => '/conta/?owner=1&next=' + encodeURIComponent(location.pathname + location.search)
+
+  const portalPage = () => location.pathname === '/' || location.pathname === '/conta/'
 
   const pathTab = () => {
     if (location.pathname === '/conta/') return 'conta'
@@ -44,6 +53,7 @@
   // a tab's name comes with the list (portal configuration); the account's from the locale
   const nameOf = (e) => e.label || (text().tabNames && text().tabNames[e.id]) || e.id
   const groupName = (g) => (text().groupNames && text().groupNames[g.id]) || g.name || g.id
+  const viewName = (g) => (text().viewNames && text().viewNames[g.id]) || g.name || g.id
   const shown = (n) => (n > 9 ? '9+' : String(n))
 
   function node(tag, cls, ...kids) {
@@ -75,6 +85,9 @@
     person: [['circle', { cx: 12, cy: 8, r: 4 }], ['path', { d: 'M4 21c1-4 4-6 8-6s7 2 8 6' }]],
     eye: [['path', { d: 'M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z' }], ['circle', { cx: 12, cy: 12, r: 3 }]],
     back: [['path', { d: 'M9 14 4 9l5-5' }], ['path', { d: 'M4 9h10a6 6 0 0 1 0 12h-3' }]],
+    power: [['path', { d: 'M12 3v8' }], ['path', { d: 'M6.3 6.3a8 8 0 1 0 11.4 0' }]],
+    flask: [['path', { d: 'M9 3h6M10 3v6l-5 9a2 2 0 0 0 1.8 3h10.4a2 2 0 0 0 1.8-3l-5-9V3' }], ['path', { d: 'M7.5 15h9' }]],
+    screen: [['rect', { x: 3, y: 4, width: 18, height: 12, rx: 2 }], ['path', { d: 'M8 20h8M12 16v4' }]],
   }
 
   function icon(name) {
@@ -94,6 +107,30 @@
 
   // Sum of what waits in the other tabs (the current one is already on screen).
   const othersTotal = (data) => data.view_as ? 0 : data.tabs.reduce((n, t) => n + (t.id !== data.current && t.badge ? t.badge : 0), 0)
+
+  // the yellow rehearsal bar on a tab page (the portal's own pages draw theirs in app.js)
+  function band(data) {
+    const on = !!data.view_as
+    document.documentElement.toggleAttribute('data-a5-rehearsal', on)
+    const old = document.querySelector('.a5-rehearsal')
+    if (!on) { if (old) old.remove(); return }
+    const b = text().band || {}
+    const go = node('button', null, b.back || '')
+    go.type = 'button'
+    go.addEventListener('click', () => location.assign(backUrl()))
+    const bar = node('div', 'a5-rehearsal', node('b', null, b.label || ''), node('span', null, b.state ? b.state(data.view_as.id, groupName(data.view_as)) : ''), go)
+    bar.setAttribute('role', 'status')
+    if (old) old.replaceWith(bar); else document.body.prepend(bar)
+  }
+
+  // "<first name> · <group>": whoever holds the page
+  function whoLine(data) {
+    const w = data.who
+    if (!w) return null
+    const name = data.view_as ? madeUp() : String(w.name || '').trim().split(/\s+/)[0]
+    const g = data.view_as ? viewName(data.view_as) : ((text().whoGroups || {})[w.group] || '')
+    return [name, g].filter(Boolean).join(' · ')
+  }
 
   async function mount(title) {
     if (!title || title.dataset.a5TabsOn) return
@@ -130,6 +167,7 @@
       mark.hidden = !v
       mark.textContent = v && text().seeingAs ? text().seeingAs(groupName(v)) : ''
       document.documentElement.toggleAttribute('data-a5-viewas', !!v)
+      if (!portalPage()) band(data)
     }
 
     // the account's hint lists what this person finds there: admins see more
@@ -140,30 +178,54 @@
     }
 
     function entries() {
+      const t = text()
       const list = []
-      if (data.view_as) list.push({ id: '_back', label: text().backToOwner, icon: 'back', view: null, top: true })
-      for (const t of data.tabs) list.push({ id: t.id, path: t.path, label: t.label, icon: t.icon, badge: t.badge, hint: t.entry === 'passkey' ? text().passkeyHint : null })
-      for (const g of data.view_options || []) {
-        if (data.view_as && g.id === data.view_as.id) continue
-        list.push({ id: '_view:' + g.id, label: text().seeAs ? text().seeAs(groupName(g)) : g.id, icon: 'eye', view: g.id, hint: text().seeAsHint })
+      if (data.view_as) list.push({ id: '_back', label: t.backToOwner, icon: 'back', view: null, back: true, hint: t.backHint ? t.backHint(groupName(data.view_as)) : null })
+      for (const tab of data.tabs) list.push({ id: tab.id, path: tab.path, label: tab.label, icon: tab.icon, badge: tab.badge, hint: tab.hint || (tab.entry === 'passkey' ? t.passkeyHint : null) })
+      // the residents first, the screens' group after them
+      // while seeing as someone else the list is that group's own: back first, no other view
+      const views = data.view_as ? [] : [...(data.view_options || [])].sort((a, b) => (a.id === SCREEN_GROUP) - (b.id === SCREEN_GROUP))
+      let caps = !!views.length
+      for (const g of views) {
+        list.push({ id: '_view:' + g.id, label: viewName(g), icon: g.id === SCREEN_GROUP ? 'screen' : 'eye', view: g.id, hint: t.seeAsHint, caps })
+        caps = false
       }
+      if (views.some((g) => g.id === REHEARSAL_GROUP)) list.push({ id: '_rehearsal', label: madeUp(), icon: 'flask', view: REHEARSAL_GROUP, out: true, hint: t.rehearsalHint, caps })
       list.push({ id: data.account.id, path: data.account.path, icon: 'person', badge: null, hint: accountHint(), account: true })
       return list
     }
 
+    // the house on top: night when the list is dark (the tabs), day when it follows a light theme
+    function head() {
+      const bg = getComputedStyle(menu).backgroundColor.match(/\d+(\.\d+)?/g) || ['0', '0', '0']
+      const light = (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]) > 140
+      const art = node('img', 'a5-tabs-art')
+      art.alt = ''
+      art.src = `/art/house-${light ? 'day' : 'night'}-wide.svg`
+      const logo = node('img')
+      logo.alt = ''
+      logo.src = '/favicon.svg'
+      const line = whoLine(data)
+      return node('div', 'a5-tabs-head', art, node('div', 'a5-tabs-brand', logo, node('span', null, text().portal || '', line ? node('small', null, line) : null)))
+    }
+
     function render(focusAt) {
-      menu.replaceChildren()
+      menu.replaceChildren(head())
       items = []
       picks = []
       for (const e of entries()) {
         if (e.account) menu.append(node('div', 'a5-tabs-sep'))
+        if (e.caps) menu.append(node('div', 'a5-tabs-sep'), node('span', 'a5-tabs-caps', text().seeAsCaps || ''))
         const current = e.id === data.current
-        const it = node('button', 'a5-tabs-item' + (current ? ' a5-tabs-current' : '') + ('view' in e ? ' a5-tabs-view' : ''),
-          node('span', 'a5-tabs-check', current ? '✓' : ''),
-          icon(e.icon),
-          node('span', 'a5-tabs-name', nameOf(e)),
-          e.hint ? node('span', 'a5-tabs-hint', e.hint) : null,
-          e.badge ? node('span', 'a5-tabs-dot', shown(e.badge)) : null)
+        const drawn = icon(e.icon)
+        // no drawing: the first letter of the name on the gray tile
+        const tile = node('span', 'a5-tabs-tile', drawn || node('span', 'a5-tabs-letter', String(nameOf(e) || '').charAt(0).toUpperCase()))
+        if (drawn) tile.dataset.icon = e.icon
+        const it = node('button', 'a5-tabs-item' + (current ? ' a5-tabs-current' : '') + (e.back ? ' a5-tabs-back' : 'view' in e ? ' a5-tabs-view' : ''),
+          tile,
+          node('span', 'a5-tabs-text', node('span', 'a5-tabs-name', nameOf(e)), e.hint ? node('span', 'a5-tabs-hint', e.hint) : null),
+          e.badge ? node('span', 'a5-tabs-dot', shown(e.badge)) : null,
+          node('span', 'a5-tabs-check', current ? '✓' : ''))
         it.type = 'button'
         it.setAttribute('role', 'menuitem')
         it.tabIndex = -1
@@ -171,12 +233,18 @@
         if (e.badge && text().waiting) it.setAttribute('aria-label', `${nameOf(e)}, ${text().waiting(e.badge)}`)
         it.addEventListener('click', () => choose(e))
         menu.append(it)
-        if (e.top) menu.append(node('div', 'a5-tabs-sep'))
         items.push(it)
         picks.push(e)
       }
-      const at = Math.max(0, Math.min(focusAt, items.length - 1))
-      items[at].focus()
+      if (focusAt >= 0) focusItem(focusAt)
+    }
+
+    // never scroll the page to the list: the item is kept in view inside the list instead
+    function focusItem(i) {
+      const it = items[Math.max(0, Math.min(i, items.length - 1))]
+      it.focus({ preventScroll: true })
+      if (it.offsetTop + it.offsetHeight > menu.scrollTop + menu.clientHeight) menu.scrollTop = it.offsetTop + it.offsetHeight - menu.clientHeight + 8
+      else if (it.offsetTop < menu.scrollTop) menu.scrollTop = Math.max(0, it.offsetTop - 8)
     }
 
     function place() {
@@ -196,12 +264,14 @@
       menu.addEventListener('keydown', onKey)
       document.body.append(backdrop, menu)
       const cur = entries().findIndex((e) => e.id === data.current)
-      render(cur < 0 ? 0 : cur)
+      // drawn and placed next to the title first, focused after (the focus never scrolls the page)
+      render(-1)
       place()
+      focusItem(cur < 0 ? 0 : cur)
       title.setAttribute('aria-expanded', 'true')
       window.addEventListener('resize', close)
       // fresh counts each time the list opens (the portal keeps them a minute)
-      refresh().then(() => { if (menu) render(items.indexOf(document.activeElement)) })
+      refresh().then(() => { if (menu) render(Math.max(0, items.indexOf(document.activeElement))) })
     }
 
     function close() {
@@ -219,16 +289,19 @@
     let switching = false
     async function choose(e) {
       // back to the owner asks for Face ID, which only the portal page can do (the tabs' CSP)
-      if ('view' in e && e.view === null) {
-        location.assign('/conta/?owner=1&next=' + encodeURIComponent(location.pathname + location.search))
-        return
-      }
+      if ('view' in e && e.view === null) { location.assign(backUrl()); return }
       if ('view' in e) {
         if (switching) return
         switching = true
         const d = await setView(e.view)
         switching = false
         if (!d) { close(); return }
+        // the rehearsal starts from the signed-out pages (app.js draws them, made up)
+        if (e.out) {
+          try { sessionStorage.setItem(REHEARSAL_OUT, '1') } catch { /* private mode: it starts signed in */ }
+          location.assign('/')
+          return
+        }
         // stay on this page if the new view still opens it; otherwise its first tab, or the account
         const here = pathTab()
         if (here === 'conta' || d.tabs.some((t) => t.id === here)) { location.reload(); return }
@@ -244,7 +317,7 @@
 
     function onKey(ev) {
       const i = items.indexOf(document.activeElement)
-      const go = (n) => { ev.preventDefault(); items[(n + items.length) % items.length].focus() }
+      const go = (n) => { ev.preventDefault(); focusItem((n + items.length) % items.length) }
       if (ev.key === 'ArrowDown') go(i + 1)
       else if (ev.key === 'ArrowUp') go(i - 1)
       else if (ev.key === 'Home') go(0)

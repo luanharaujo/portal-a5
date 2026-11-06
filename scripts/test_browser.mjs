@@ -43,7 +43,7 @@ export async function launch() {
 }
 
 // One isolated browser context (own cookies and storage) with one page.
-export async function page(b, base, cookie, { touch = false } = {}) {
+export async function page(b, base, cookie, { touch = false, scheme = null } = {}) {
   const { browserContextId } = await b.send('Target.createBrowserContext')
   const { targetId } = await b.send('Target.createTarget', { url: 'about:blank', browserContextId })
   const { sessionId } = await b.send('Target.attachToTarget', { targetId, flatten: true })
@@ -59,6 +59,7 @@ export async function page(b, base, cookie, { touch = false } = {}) {
     await s('Emulation.setDeviceMetricsOverride', { width: 393, height: 852, deviceScaleFactor: 3, mobile: true })
     await s('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 })
   }
+  if (scheme) await s('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] })
   if (cookie) {
     const [name, value] = cookie.split('=')
     await s('Network.setCookie', { name, value, url: base + '/', path: '/', secure: true, httpOnly: true, sameSite: 'Lax' })
@@ -148,6 +149,7 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
       focused: it.indexOf(document.activeElement), passkeyHint: it[1].querySelector('.a5-tabs-hint')?.textContent,
       passkeyDot: it[1].querySelector('.a5-tabs-dot')?.textContent, heights: it.map((i) => i.getBoundingClientRect().height),
       expanded: document.querySelector('[data-a5-tabs]').getAttribute('aria-expanded') } })()`)
+    if (process.env.A5_SHOTS) { await sleep(400); await o.shot(process.env.A5_SHOTS + '/owner_menu_computer.png') }
     check('browser: Enter opens the list with every tab, then Conta after a line', m && m.names.filter((n, i) => !m.view[i]).join() === 'Tab A,Tab B,tab-slow,Odd,Conta' && m.sep && m.expanded === 'true', m)
     check('browser: current tab marked and focused', m && m.current === 0 && m.check === '✓' && m.focused === 0, m)
     check('browser: the Face ID tab says so and shows its own count', m && m.passkeyHint === 'Face ID' && m.passkeyDot === '3', m)
@@ -278,22 +280,42 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     await v.waitFor(ON)
     await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
     await v.waitFor(`!!document.querySelector('[role=menu]')`)
-    const X = await v.evaluate(`(() => { const t = A5_TEXT.shell, g = t.groupNames; return { screens: t.seeAs(g['owner-screens']), res: t.seeAs(g.residents),
-      seeing: t.seeingAs(g.residents), back: t.backToOwner, conta: t.tabNames.conta } })()`)
+    const X = await v.evaluate(`(() => { const t = A5_TEXT.shell, g = t.groupNames, n = t.viewNames; return { screens: n['owner-screens'], res: n.residents,
+      seeing: t.seeingAs(g.residents), back: t.backToOwner, conta: t.tabNames.conta, made: A5_TEXT.rehearsal.name, caps: t.seeAsCaps, state: t.band.state('residents', g.residents), portal: t.portal, owner: t.whoGroups.owner } })()`)
     const vn = await v.evaluate(`[...document.querySelectorAll('[role=menuitem] .a5-tabs-name')].map((x) => x.textContent)`)
-    check('browser: owner list has the "see as" items above Conta', vn.join() === ['Tab A', 'Tab B', 'tab-slow', 'Odd', X.screens, X.res, X.conta].join(), [vn, X])
-    if (SHOTS) await v.shot(SHOTS + '/owner_menu.png')
-    await v.evaluate(`[...document.querySelectorAll('[role=menuitem]')].find((i) => i.textContent.includes(${JSON.stringify(X.res)})).click()`)
+    check('browser: owner list has the "see as" items and the rehearsal above Conta', vn.join() === ['Tab A', 'Tab B', 'tab-slow', 'Odd', X.res, X.screens, X.made, X.conta].join(), [vn, X])
+    const hd = await v.evaluate(`(() => { const h = document.querySelector('.a5-tabs-head'); return h && { brand: h.querySelector('.a5-tabs-brand span').firstChild.textContent, who: h.querySelector('small')?.textContent,
+      art: h.querySelector('img.a5-tabs-art').getAttribute('src'), caps: document.querySelector('.a5-tabs-caps')?.textContent,
+      tiles: [...document.querySelectorAll('[role=menuitem] .a5-tabs-tile')].map((x) => x.dataset.icon || '') } })()`)
+    check('browser: list header with the house, the portal and "<first name> · Dono"', hd && hd.brand === X.portal && / · /.test(hd.who) && hd.who.endsWith(X.owner) && /^\/art\/house-night-wide\.svg$/.test(hd.art), hd)
+    check('browser: tiles by icon, the "see as" caption, screens and rehearsal icons', hd && hd.caps === X.caps && hd.tiles.join() === 'bolt,mic,,,eye,screen,flask,person', hd)
+    if (SHOTS) { await new Promise((r) => setTimeout(r, 400)); await v.shot(SHOTS + '/owner_menu.png') }
+    await v.evaluate(`[...document.querySelectorAll('[role=menuitem]')].find((i) => i.querySelector('.a5-tabs-name').textContent === ${JSON.stringify(X.res)}).click()`)
     check('browser: seeing as a resident, same page reloaded with the mark', await v.waitFor(`${ON} && !document.querySelector('.a5-tabs-viewas').hidden`, 5000))
     const vm = await v.evaluate(`({ mark: document.querySelector('.a5-tabs-viewas').textContent, dot: document.querySelector('[data-a5-tabs] > .a5-tabs-dot').hidden, path: location.pathname })`)
     check('browser: the mark names the group, no dot', vm.mark === X.seeing && vm.dot === true && vm.path === '/tab-a/page', vm)
+    const tb = await v.evaluate(`({ bar: document.querySelector('.a5-rehearsal span')?.textContent, attr: document.documentElement.hasAttribute('data-a5-rehearsal') })`)
+    check('browser: a tab page seen as a resident carries the yellow rehearsal bar', tb.attr && tb.bar === X.state, tb)
     if (SHOTS) await v.shot(SHOTS + '/seeing_as_resident.png')
+    // a long tab page: the list opens by the title and the page does not move
+    await v.go('/tab-a/long')
+    await v.waitFor(ON)
+    await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
+    await v.waitFor(`!!document.querySelector('[role=menu]')`)
+    await sleep(400)
+    const lp = await v.evaluate(`({ y: window.scrollY, top: document.querySelector('.a5-tabs-menu').getBoundingClientRect().top })`)
+    check('browser: opening the list never scrolls the page', lp.y === 0 && lp.top > 0 && lp.top < 200, lp)
+    if (SHOTS) await v.shot(SHOTS + '/seeing_as_long_menu.png')
+    await v.evaluate(`document.querySelector('.a5-tabs-backdrop').click()`)
+    await v.go('/tab-a/page')
+    await v.waitFor(ON)
     await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
     await v.waitFor(`!!document.querySelector('[role=menu]')`)
     const vn2 = await v.evaluate(`[...document.querySelectorAll('[role=menuitem] .a5-tabs-name')].map((x) => x.textContent)`)
-    check('browser: as a resident: back on top, then Tab A, the other view and Conta', vn2.join() === [X.back, 'Tab A', X.screens, X.conta].join(), vn2)
+    check('browser: as a resident: back on top, then Tab A and Conta, no "see as" rows', vn2.join() === [X.back, 'Tab A', X.conta].join(), vn2)
+    check('browser: the back row is yellow and says whose view it is', await v.evaluate(`(() => { const b = document.querySelector('[role=menuitem]'); return b.classList.contains('a5-tabs-back') && b.querySelector('.a5-tabs-hint').textContent === A5_TEXT.shell.backHint(A5_TEXT.shell.groupNames.residents) })()`))
     check('browser: as a resident the account hint lists devices only', await v.evaluate(`[...document.querySelectorAll('[role=menuitem]')].pop().querySelector('.a5-tabs-hint').textContent === A5_TEXT.shell.hints.contaResident`))
-    if (SHOTS) await v.shot(SHOTS + '/resident_menu.png')
+    if (SHOTS) { await new Promise((r) => setTimeout(r, 400)); await v.shot(SHOTS + '/resident_menu.png') }
     await v.evaluate(`document.querySelector('.a5-tabs-backdrop').click()`)
     await v.go('/conta/')
     await v.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
@@ -301,15 +323,15 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     check('browser: account page as a resident: no people and groups, mark on', !vc.house && vc.mark, vc)
     if (SHOTS) await v.shot(SHOTS + '/account_as_resident.png')
     // rehearsal: the made-up resident, a sign out drawn on the page only, and back in
-    const rn = await v.evaluate(`({ name: document.querySelector('.index .profile b').textContent, band: !!document.querySelector('.index .rehearsal-band') })`)
+    const rn = await v.evaluate(`({ name: document.querySelector('.index .profile b').textContent, band: document.querySelectorAll('.a5-rehearsal').length === 1 })`)
     check('browser: rehearsal shows the made-up resident and the band', rn.name === (await v.evaluate('A5_TEXT.rehearsal.name')) && rn.band, rn)
     await v.evaluate(`document.querySelector('.index .logout').click()`)
-    check('browser: rehearsal sign out draws the sign-in page with the band', await v.waitFor(`!!document.querySelector('#phone') && !!document.querySelector('.sheet .rehearsal-band')`, 5000))
+    check('browser: rehearsal sign out draws the sign-in page with the band', await v.waitFor(`!!document.querySelector('#phone') && document.querySelector('.a5-rehearsal span')?.textContent === A5_TEXT.shell.band.out`, 5000))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_signin.png')
     await v.go('/conta/')
-    check('browser: rehearsal: signed out survives a reload', await v.waitFor(`!!document.querySelector('#phone') && !!document.querySelector('.rehearsal-band')`, 5000))
+    check('browser: rehearsal: signed out survives a reload', await v.waitFor(`!!document.querySelector('#phone') && !!document.querySelector('.a5-rehearsal')`, 5000))
     await v.evaluate(`document.querySelector('.screen-link').click()`)
-    check('browser: rehearsal: the screen pairing page, made up', await v.waitFor(`!!document.querySelector('.pair-code') && !!document.querySelector('.rehearsal-band')`, 3000))
+    check('browser: rehearsal: the screen pairing page, made up', await v.waitFor(`!!document.querySelector('.pair-code') && !!document.querySelector('.a5-rehearsal')`, 3000))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_pair.png')
     await v.evaluate(`document.querySelector('.pair-back').click()`)
     await v.waitFor(`!!document.querySelector('#phone')`)
@@ -317,13 +339,16 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     check('browser: rehearsal: the message step with a made-up code', await v.waitFor(`!!document.querySelector('.bubble .code') && /^A5-/.test(document.querySelector('.bubble .code').textContent)`, 3000))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_message.png')
     await v.evaluate(`document.querySelector('.sheet .btn-ghost').click()`)
-    check('browser: rehearsal: the waiting-for-approval step, new person first', await v.waitFor(`!!document.querySelector('.sheet .rehearsal-band') && document.querySelector('.sheet .notice')?.textContent.includes(A5_TEXT.status.pendingWhy.new_number)`, 3000))
+    check('browser: rehearsal: the waiting-for-approval step, new person first', await v.waitFor(`!!document.querySelector('.a5-rehearsal') && document.querySelector('.sheet .notice')?.textContent.includes(A5_TEXT.status.pendingWhy.new_number)`, 3000))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_pending.png')
     await v.evaluate(`document.querySelector('.rehearsal-cases [data-v=other]').click()`)
     check('browser: rehearsal: the other-number case on the switch', await v.waitFor(`document.querySelector('.sheet .notice')?.textContent.includes(A5_TEXT.status.pendingWhy.other_number)`, 3000))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_pending_other.png')
     await v.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
-    check('browser: rehearsal: approval signs the made-up resident back in', await v.waitFor(`${ON} && !document.querySelector('#phone') && !document.querySelector('.a5-tabs-viewas').hidden`, 8000), [await v.evaluate('location.href')])
+    check('browser: rehearsal: approval shows the welcome for the made-up resident', await v.waitFor(`!!document.querySelector('.sheet .done-mark') && document.querySelector('.sheet h1').textContent === A5_TEXT.welcome.title(A5_TEXT.rehearsal.name) && !!document.querySelector('.sheet .tip .mini-title')`, 5000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_welcome.png')
+    await v.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
+    check('browser: rehearsal: the welcome opens the tab, signed in as the made-up resident', await v.waitFor(`${ON} && !document.querySelector('#phone') && !document.querySelector('.a5-tabs-viewas').hidden`, 8000), [await v.evaluate('location.href')])
     await v.go('/conta/')
     await v.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
     await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
@@ -334,7 +359,48 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     await strong() // stands in for Face ID on the phone (the software passkey of the battery)
     await v.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
     check('browser: back to the owner mode brings the owner back on the same page', await v.waitFor(`${ON} && location.pathname === '/conta/' && document.querySelector('.a5-tabs-viewas').hidden && !!document.querySelector('.index a.row[href="#pessoas"]')`, 5000))
+    // the rehearsal row: seeing as a resident from the signed-out pages
+    await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
+    await v.waitFor(`!!document.querySelector('[role=menu]')`)
+    if (SHOTS) { await new Promise((r) => setTimeout(r, 400)); await v.shot(SHOTS + '/owner_menu_account.png') }
+    const ap = await v.evaluate(`({ y: window.scrollY, top: document.querySelector('.a5-tabs-menu').getBoundingClientRect().top, letter: [...document.querySelectorAll('.a5-tabs-letter')].map((x) => x.textContent).join() })`)
+    check('browser: the account list opens by its title, page not scrolled; tiles without a drawing show a letter', ap.y === 0 && ap.top > 0 && ap.letter === 'T,O', ap)
+    await v.evaluate(`[...document.querySelectorAll('[role=menuitem]')].find((i) => i.querySelector('.a5-tabs-tile').dataset.icon === 'flask').click()`)
+    check('browser: the rehearsal row starts signed out, with the bar', await v.waitFor(`!!document.querySelector('#phone') && document.querySelector('.a5-rehearsal span')?.textContent === A5_TEXT.shell.band.out`, 5000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_row_signin.png')
+    await strong()
+    await v.evaluate(`fetch('/api/tabs', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Portal': '1' }, body: JSON.stringify({ view_as: null }) })`)
+    await v.evaluate(`sessionStorage.clear()`)
     check('browser: no error while seeing as', !v.log.some((x) => /Content Security Policy|exception/i.test(x)), v.log)
+
+    // after signing in on a device: the owner's Face ID step, then the welcome (the battery's owner has passkeys,
+    // but not on this browser profile)
+    const n = await page(await own(), base, owner, { touch: true, scheme: 'dark' })
+    await n.go('/conta/')
+    await n.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
+    if (SHOTS) {
+      await n.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
+      await n.waitFor(`!!document.querySelector('[role=menu]')`)
+      await sleep(400)
+      await n.shot(SHOTS + '/account_menu_dark.png')
+      await n.evaluate(`document.querySelector('.a5-tabs-backdrop').click()`)
+    }
+    await n.evaluate(`localStorage.removeItem('a5.lastTab'); afterSignIn()`) // a new device has no last tab yet
+    check('browser: owner on a new device: step 3, Face ID here', await n.waitFor(`!!document.querySelector('.sheet .faceid-mark') && document.querySelector('.sheet h1').textContent === A5_TEXT.ownerFaceId.title && document.querySelectorAll('.steps .step').length === 3`, 5000))
+    if (SHOTS) await n.shot(SHOTS + '/owner_faceid_step.png')
+    await n.evaluate(`document.querySelector('.sheet button.back').click()`)
+    check('browser: "not now" goes on to the welcome, which names the tab', await n.waitFor(`!!document.querySelector('.sheet .done-mark') && document.querySelector('.sheet .btn-primary').textContent === A5_TEXT.welcome.open('Tab A')`, 5000))
+    if (SHOTS) await n.shot(SHOTS + '/welcome.png')
+    await n.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
+    const opened = await n.waitFor(`/^\\/tab-a\\//.test(location.pathname)`, 8000)
+    check('browser: the welcome opens the tab and is not shown again', opened && (await n.evaluate(`localStorage.getItem('a5.welcomed')`)) === '1', await n.evaluate(`[location.href, localStorage.getItem('a5.welcomed')]`))
+    // the Face ID page a tab sends the owner to before an owner's command
+    await n.go('/?step_up=tab-a&purpose=command&next=' + encodeURIComponent('/tab-a/page#presence'))
+    check('browser: command Face ID page', await n.waitFor(`!!document.querySelector('.sheet .faceid-mark') && document.querySelector('.sheet h1').textContent === A5_TEXT.commandStepUp.title`, 5000))
+    if (SHOTS) await n.shot(SHOTS + '/command_faceid.png')
+    await n.evaluate(`document.querySelector('.sheet button.back').click()`)
+    check('browser: "not now" goes back to the tab, the action kept in the hash', await n.waitFor(`location.pathname === '/tab-a/page' && location.hash === '#presence'`, 5000))
+    check('browser: no error on the sign-in finish', !n.log.some((x) => /Content Security Policy|exception/i.test(x)), n.log)
 
     // signed out: "/" and /conta/ show the sign-in page, title without a selector
     const a = await page(b, base, null)

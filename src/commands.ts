@@ -194,6 +194,16 @@ export function adminWindowOk(passkeyAt: string | null, setting: string | undefi
   return nowMs - at < Number(m[1]) * (m[2] === 'h' ? 3600e3 : 60e3)
 }
 
+// When that window closes (ISO), or null when it is not open. Same rule as adminWindowOk;
+// 'session' never closes while the session lives, so it answers a far date.
+export function adminWindowUntil(passkeyAt: string | null, setting: string | undefined, nowMs = Date.now()): string | null {
+  if (!adminWindowOk(passkeyAt, setting, nowMs)) return null
+  const v = setting ?? ADMIN_WINDOW_DEFAULT
+  if (v === 'session') return '9999-12-31T00:00:00.000Z'
+  const m = /^(\d{1,4})(m|h)$/.exec(v) ?? /^(\d{1,4})(m|h)$/.exec(ADMIN_WINDOW_DEFAULT)!
+  return new Date(Date.parse(passkeyAt!) + Number(m[1]) * (m[2] === 'h' ? 3600e3 : 60e3)).toISOString()
+}
+
 // Why a caller cannot run an action, or null. The tab access itself (group) is checked before.
 export function refusal(tab: string, action: string, spec: CommandSpec, c: Caller): string | null {
   if (c.credential === 'shortcut') {

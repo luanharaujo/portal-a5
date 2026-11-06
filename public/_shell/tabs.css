@@ -1,8 +1,21 @@
-/* Shared tab selector (/_shell/tabs.js). Colors default to the dark tab look; the portal's own
-   pages override the --a5t-* tokens with the device theme. */
+/* Shared tab selector (/_shell/tabs.css), house look (v4 proposal, 2026-11-06).
+   Same DOM as today's tabs.js plus: a header with the house (a5-tabs-head), a colored tile per tab
+   (a5-tabs-tile, color from the icon name), a second line per item (a5-tabs-text small), the check on
+   the right, the "see as" section with its caption (a5-tabs-caps) and the rehearsal bar (a5-rehearsal).
+   Dark by default (tabs are dark); the portal's own pages and the Controles tab map the --a5t-* tokens
+   to the device theme. No color-mix(), no inset, nothing on hover. */
 :root {
-  --a5t-bg: #1d2633; --a5t-line: #344355; --a5t-current: #26354a; --a5t-check: #f6b73c;
-  --a5t-dot: #ffc94d; --a5t-dot-fg: #141414; --a5t-fg: #e8edf2; --a5t-muted: #a9b5c2; --a5t-shade: rgba(0, 0, 0, .45);
+  --a5t-bg: #161d27; --a5t-line: #2a3542; --a5t-current: #222c3a; --a5t-check: #f6b73c;
+  --a5t-dot: #ffc94d; --a5t-dot-fg: #141414; --a5t-fg: #eef2f6; --a5t-muted: #a9b5c2; --a5t-shade: rgba(5, 8, 12, .55);
+  --a5t-shadow: 0 24px 60px rgba(0, 0, 0, .55), 0 2px 8px rgba(0, 0, 0, .3);
+  /* tile colors by icon */
+  --a5t-sun: #f6b73c; --a5t-sun-bg: rgba(246, 183, 60, .16);
+  --a5t-teal: #4fd1e8; --a5t-teal-bg: rgba(79, 209, 232, .15);
+  --a5t-blue: #5aa9ff; --a5t-blue-bg: rgba(90, 169, 255, .16);
+  --a5t-violet: #b48cf2; --a5t-violet-bg: rgba(180, 140, 242, .16);
+  --a5t-green: #4cc38a; --a5t-green-bg: rgba(76, 195, 138, .15);
+  --a5t-gray: #a9b5c2; --a5t-gray-bg: rgba(169, 181, 194, .12);
+  --a5t-font: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
 /* the marked title keeps the tab's own look, with or without the script */
@@ -10,12 +23,13 @@ button[data-a5-tabs] {
   font: inherit; color: inherit; background: none; border: 0; padding: 0; margin: 0;
   text-align: inherit; letter-spacing: inherit; cursor: default; border-radius: 6px;
 }
-.a5-tabs-title { cursor: pointer; display: inline-flex; align-items: center; gap: .3em; }
+.a5-tabs-title { cursor: pointer; display: inline-flex; align-items: center; }
+.a5-tabs-title > * + * { margin-left: .3em; }
+.a5-tabs-title:focus { outline: none; }
 .a5-tabs-title:focus-visible { outline: 2px solid var(--a5t-check); outline-offset: 3px; }
 .a5-tabs-arrow { width: .8em; height: .8em; flex: none; }
 .a5-tabs-arrow path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .a5-tabs-title[aria-expanded="true"] .a5-tabs-arrow { transform: rotate(180deg); }
-
 .a5-tabs-dot {
   display: inline-flex; align-items: center; justify-content: center; min-width: 1em; height: 1em; padding: 0 .3em;
   border-radius: .5em; background: var(--a5t-dot); color: var(--a5t-dot-fg); font-size: .62em; font-weight: 700; line-height: 1;
@@ -24,56 +38,77 @@ button[data-a5-tabs] {
 .a5-tabs-dot[hidden] { display: none; }
 .a5-tabs-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
-.a5-tabs-backdrop { position: fixed; inset: 0; background: var(--a5t-shade); z-index: 2147483000; }
-.a5-tabs-menu {
-  position: absolute; z-index: 2147483001; min-width: 240px; max-width: calc(100vw - 16px);
-  background: var(--a5t-bg); color: var(--a5t-fg); border: 1px solid var(--a5t-line); border-radius: 14px;
-  padding: 6px; box-shadow: 0 12px 32px rgba(0, 0, 0, .35); font: 16px/1.3 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  animation: a5-tabs-in .12s ease-out;
-}
-.a5-tabs-item {
-  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 8px 12px; margin: 0;
-  background: none; border: 0; border-radius: 10px; color: inherit; font: inherit; text-align: left; cursor: pointer;
-}
-.a5-tabs-item:focus { outline: none; background: var(--a5t-current); }
-.a5-tabs-item:focus-visible { outline: 2px solid var(--a5t-check); outline-offset: -2px; }
-.a5-tabs-current { background: var(--a5t-current); }
-.a5-tabs-check { width: 1em; color: var(--a5t-check); font-weight: 700; }
-.a5-tabs-icon { width: 1.3em; height: 1.3em; flex: none; margin-right: 2px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.a5-tabs-current .a5-tabs-icon { stroke: var(--a5t-check); }
-.a5-tabs-name { font-weight: 600; }
-.a5-tabs-hint { color: var(--a5t-muted); font-size: .85em; }
-.a5-tabs-item .a5-tabs-dot { margin-left: auto; font-size: .8em; min-width: 1.5em; height: 1.5em; border-radius: .75em; }
-.a5-tabs-sep { height: 1px; background: var(--a5t-line); margin: 6px 8px; }
-
-/* "see as": a mark next to the title while an admin sees the portal as another group */
+/* "seeing as ...": the yellow mark next to the title (unchanged) */
 .a5-tabs-viewas {
-  display: inline-block; margin-left: .5em; padding: .25em .7em; border-radius: 999px; vertical-align: middle;
-  background: var(--a5t-dot); color: var(--a5t-dot-fg); font: 700 13px/1.2 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  letter-spacing: 0; white-space: nowrap;
+  display: inline-flex; align-items: center; margin-left: .5em; padding: .3em .75em; border-radius: 999px; vertical-align: middle;
+  background: var(--a5t-dot); color: var(--a5t-dot-fg); font: 700 13px/1.2 var(--a5t-font); letter-spacing: 0; white-space: nowrap; text-shadow: none;
 }
-.a5-tabs-viewas[hidden] { display: none; }
-.a5-tabs-view .a5-tabs-name { font-weight: 500; }
 
-/* pull to refresh (tabs.js): a pill that comes down from the top */
-.a5-pull {
-  position: fixed; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 6px); z-index: 2147482000;
-  display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px;
-  background: var(--a5t-bg); border: 1px solid var(--a5t-line); color: var(--a5t-fg);
-  font: 600 13px/1 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  box-shadow: 0 8px 20px -8px rgba(0, 0, 0, .6); opacity: 0; pointer-events: none;
-  transform: translate(-50%, calc(var(--a5-pull, 0px) - 56px)); transition: opacity .15s;
+/* ---------------------------------------------------------------- the list */
+.a5-tabs-backdrop { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--a5t-shade); z-index: 2147483000;
+  -webkit-backdrop-filter: blur(6px) saturate(1.1); backdrop-filter: blur(6px) saturate(1.1); }
+.a5-tabs-menu {
+  position: absolute; z-index: 2147483001; width: 360px; max-width: calc(100vw - 24px); max-height: calc(100vh - 90px); overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--a5t-line) transparent;
+  background: var(--a5t-bg); color: var(--a5t-fg); border: 1px solid var(--a5t-line); border-radius: 22px;
+  padding: 8px; box-shadow: var(--a5t-shadow); font: 16px/1.3 var(--a5t-font);
+  animation: a5-tabs-in .14s ease-out;
 }
-.a5-pull.a5-pull-on { opacity: 1; }
-.a5-pull-arrow { display: inline-block; color: var(--a5t-check); transition: transform .15s; }
-.a5-pull.a5-pull-ready .a5-pull-arrow { transform: rotate(180deg); }
-.a5-pull.a5-pull-loading .a5-pull-arrow { animation: a5-pull-spin .8s linear infinite; }
-@keyframes a5-pull-spin { to { transform: rotate(360deg); } }
+/* header: the house, small, with the portal's name */
+.a5-tabs-head { position: relative; height: 66px; margin-bottom: 6px; border-radius: 15px; overflow: hidden; }
+.a5-tabs-head picture, .a5-tabs-head img.a5-tabs-art { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; object-position: 50% 78%; }
+.a5-tabs-head::after { content: ""; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, rgba(0, 0, 0, .55), rgba(0, 0, 0, .05) 70%); }
+.a5-tabs-brand { position: absolute; z-index: 1; left: 12px; top: 0; bottom: 0; display: flex; align-items: center; color: #fff; font-weight: 800; font-size: 16px; letter-spacing: -.2px; text-shadow: 0 1px 8px rgba(0, 0, 0, .4); }
+.a5-tabs-brand img { width: 28px; height: 28px; border-radius: 8px; margin-right: 9px; box-shadow: 0 2px 8px rgba(0, 0, 0, .3); }
+.a5-tabs-brand small { display: block; font-size: 12px; font-weight: 600; opacity: .85; letter-spacing: 0; }
 
-@keyframes a5-tabs-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.a5-tabs-item {
+  display: flex; align-items: center; width: 100%; min-height: 58px; padding: 8px 10px; margin: 1px 0;
+  background: none; border: 0; border-radius: 14px; color: inherit; font: inherit; text-align: left; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.a5-tabs-item:focus { outline: none; }
+.a5-tabs-item:focus-visible { box-shadow: 0 0 0 2px var(--a5t-check); }
+.a5-tabs-current { background: var(--a5t-current); }
+.a5-tabs-tile { width: 38px; height: 38px; margin-right: 12px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex: none; background: var(--a5t-gray-bg); color: var(--a5t-gray); }
+.a5-tabs-letter { font-weight: 800; font-size: 16px; line-height: 1; }
+.a5-tabs-icon { width: 21px; height: 21px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.a5-tabs-tile[data-icon="bolt"] { background: var(--a5t-sun-bg); color: var(--a5t-sun); }
+.a5-tabs-tile[data-icon="power"] { background: var(--a5t-teal-bg); color: var(--a5t-teal); }
+.a5-tabs-tile[data-icon="mic"] { background: var(--a5t-blue-bg); color: var(--a5t-blue); }
+.a5-tabs-tile[data-icon="terminal"] { background: var(--a5t-violet-bg); color: var(--a5t-violet); }
+.a5-tabs-tile[data-icon="coin"] { background: var(--a5t-green-bg); color: var(--a5t-green); }
+.a5-tabs-text { flex: 1; min-width: 0; }
+.a5-tabs-name { display: block; font-weight: 700; font-size: 16px; letter-spacing: -.1px; }
+.a5-tabs-hint { display: block; color: var(--a5t-muted); font-size: 13px; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.a5-tabs-item .a5-tabs-dot { margin-left: 10px; font-size: 12.5px; min-width: 24px; height: 24px; border-radius: 12px; }
+.a5-tabs-check { width: 22px; margin-left: 10px; text-align: center; color: var(--a5t-check); font-weight: 800; flex: none; }
+.a5-tabs-check:empty { width: 0; margin-left: 0; }
+.a5-tabs-sep { height: 1px; background: var(--a5t-line); margin: 6px 10px; }
+.a5-tabs-caps { display: block; margin: 10px 12px 4px; font-size: 11px; font-weight: 700; letter-spacing: 1.1px; text-transform: uppercase; color: var(--a5t-muted); }
+
+/* "see as": the other groups (eye) and the rehearsal (the made-up resident); back to owner is a yellow row at the top */
+.a5-tabs-view .a5-tabs-name { font-weight: 600; }
+.a5-tabs-back { background: var(--a5t-dot); color: var(--a5t-dot-fg); margin-bottom: 6px; }
+.a5-tabs-back .a5-tabs-tile { background: rgba(0, 0, 0, .1); color: var(--a5t-dot-fg); }
+.a5-tabs-back .a5-tabs-hint { color: rgba(20, 20, 20, .7); }
+.a5-tabs-back:focus-visible { box-shadow: 0 0 0 2px var(--a5t-fg); }
+
+/* ---------------------------------------------------------------- rehearsal (the made-up resident): a bar on every page */
+.a5-rehearsal {
+  position: fixed; z-index: 2147482500; top: 0; left: 0; right: 0; display: flex; align-items: center;
+  padding: calc(env(safe-area-inset-top) + 6px) calc(env(safe-area-inset-right) + 12px) 6px calc(env(safe-area-inset-left) + 14px);
+  background: var(--a5t-dot); color: var(--a5t-dot-fg); font: 700 13.5px/1.2 var(--a5t-font); box-shadow: 0 4px 14px rgba(0, 0, 0, .25);
+}
+.a5-rehearsal b { font-weight: 800; letter-spacing: 1px; text-transform: uppercase; font-size: 12px; margin-right: 8px; }
+.a5-rehearsal span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.a5-rehearsal button { flex: none; margin-left: 10px; min-height: 30px; padding: 0 12px; border-radius: 999px; border: 0; background: #141414; color: #ffc94d; font: 700 13px var(--a5t-font); cursor: pointer; }
+.a5-rehearsal button:focus-visible { outline: 2px solid #141414; outline-offset: 2px; }
+/* pages move down by the bar's height (the portal's cover and account use it; a tab may too) */
+html[data-a5-rehearsal] { --a5-bar: 42px; }
+
+@keyframes a5-tabs-in { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) {
   .a5-tabs-menu { animation: none; }
   .a5-tabs-title[aria-expanded="true"] .a5-tabs-arrow { transform: none; }
-  .a5-pull, .a5-pull-arrow { transition: none; }
-  .a5-pull.a5-pull-loading .a5-pull-arrow { animation: none; }
 }

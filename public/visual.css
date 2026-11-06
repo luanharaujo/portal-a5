@@ -307,8 +307,7 @@ a { color: inherit; }
 /* ---------------------------------------------------------------- portal glue (added by the portal, not in the proposal) */
 [hidden] { display: none !important; }
 body.loading { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-/* the tab selector follows the device theme on the portal's own pages */
-:root { --a5t-bg: var(--surface); --a5t-line: var(--line); --a5t-current: var(--surface-2); --a5t-check: var(--sun); --a5t-fg: var(--text); --a5t-muted: var(--muted); --a5t-shade: rgba(0, 0, 0, .25); }
+/* the tab selector follows the device theme on the portal's own pages: see the end of this file */
 .account-title button[data-a5-tabs] { color: #fff; }
 .sheet form { margin: 0; }
 .pair-back { margin-top: 22px; }
@@ -342,10 +341,37 @@ body.loading { display: flex; align-items: center; justify-content: center; min-
 .item small.with-chip .chip { margin: 2px 8px 0 0; padding: 0 8px; font-size: 11px; vertical-align: 1px; }
 .code-caption { display: block; margin: 0 0 10px; }
 
-/* rehearsal ("see as"): a band that stays on top of every page of it */
-.rehearsal-band { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 6px); z-index: 5; display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin-bottom: 16px; border-radius: 14px; background: var(--sun-bg); border: 1px solid var(--warn-line); font-size: 14px; line-height: 1.3; }
-.rehearsal-band > .ico { width: 20px; height: 20px; color: var(--sun-ink); flex: none; }
-.rehearsal-band > span { flex: 1; min-width: 0; }
-.rehearsal-band button { flex: none; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--surface); color: var(--text); font: 600 13.5px var(--font); cursor: pointer; }
 .rehearsal-note { margin-top: 14px; font-size: 13px; color: var(--muted); text-align: center; }
 .rehearsal-cases { margin-top: 12px; justify-content: center; }
+
+/* Sign-in finish (v4 proposal, 2026-11-06), on top of visual.css: rehearsal bar room, Face ID step, welcome. */
+
+/* rehearsal (the made-up resident): the yellow bar sits on top; the brand and the account title move below it */
+html[data-a5-rehearsal] .brand { top: calc(env(safe-area-inset-top) + 14px + var(--a5-bar)); }
+html[data-a5-rehearsal] .account-title, html[data-a5-rehearsal] .ctl-title { top: calc(env(safe-area-inset-top) + 10px + var(--a5-bar)); }
+@media (orientation: landscape) and (min-height: 560px) {
+  html[data-a5-rehearsal] .brand { top: calc(44px + var(--a5-bar)); }
+}
+
+/* welcome: one screen after the first sign-in on a device, then the tab */
+.done-mark { width: 72px; height: 72px; border-radius: 22px; display: flex; align-items: center; justify-content: center; background: var(--ok-bg); color: var(--ok); margin-bottom: 16px; }
+.done-mark .ico { width: 40px; height: 40px; stroke-width: 2.4; }
+.tip { display: flex; align-items: center; margin-top: 18px; padding: 14px 14px; border-radius: 16px; background: var(--surface-2); border: 1px solid var(--line); font-size: 14.5px; line-height: 1.4; color: var(--muted); }
+.tip b { color: var(--text); }
+.tip .mini-title { flex: none; display: inline-flex; align-items: center; margin-right: 12px; padding: 7px 11px 7px 13px; border-radius: 12px; background: #0d1117; color: #fff; font-weight: 800; font-size: 15px; letter-spacing: -.2px; box-shadow: 0 4px 12px rgba(0, 0, 0, .18); }
+.tip .mini-title .a5-tabs-arrow { width: 12px; height: 12px; margin-left: 5px; }
+.sheet .btn-primary + .back { display: flex; justify-content: center; width: 100%; }
+.who { display: flex; align-items: center; margin-top: 14px; }
+.who .avatar { width: 40px; height: 40px; font-size: 17px; margin-right: 10px; }
+.who b { display: block; font-size: 15px; }
+.who small { display: block; font-size: 13px; color: var(--muted); }
+
+/* the tab selector on the portal's own pages: device theme (replaces the old --a5t-* line of the portal glue) */
+:root { --a5t-bg: var(--surface); --a5t-line: var(--line); --a5t-current: var(--surface-2); --a5t-check: var(--sun); --a5t-fg: var(--text); --a5t-muted: var(--muted); }
+@media (prefers-color-scheme: light) {
+  :root {
+    --a5t-check: #c98500; --a5t-shade: rgba(26, 31, 36, .28); --a5t-shadow: 0 24px 60px rgba(26, 31, 36, .22), 0 2px 8px rgba(26, 31, 36, .08);
+    --a5t-sun: #9a6400; --a5t-sun-bg: #fff1d2; --a5t-teal: #0e8ba3; --a5t-teal-bg: #dcf2f6; --a5t-blue: #2f7fd1; --a5t-blue-bg: #e3eefa;
+    --a5t-violet: #7650c4; --a5t-violet-bg: #eee7fa; --a5t-green: #1d8656; --a5t-green-bg: #e2f3e9; --a5t-gray: #5b6570; --a5t-gray-bg: #f1ede5;
+  }
+}

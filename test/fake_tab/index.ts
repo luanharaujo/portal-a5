@@ -38,10 +38,22 @@ export class FakeTab extends WorkerEntrypoint {
         '<link rel="stylesheet" href="/_shell/tabs.css"><script src="/locale/pt-BR.js" defer></script><script src="/_shell/tabs.js" defer></script>' +
         '</head><body><h1><button type="button" data-a5-tabs>Panel</button></h1><input id="field"><div id="sheet" data-a5-sheet hidden></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
     }
+    if (p === '/fake.css') {
+      // a dark tab like the real ones, so the screenshots look like them
+      return new Response('body{margin:0;padding:calc(env(safe-area-inset-top) + 16px + var(--a5-bar, 0px)) 20px 20px;background:#0d1117;color:#eef2f6;font:16px/1.4 sans-serif}' +
+        'h1{margin:0 0 16px;font-size:28px}.card{height:140px;margin:0 0 14px;border-radius:18px;background:#161d27;border:1px solid #2a3542}',
+        { headers: { 'Content-Type': 'text/css; charset=utf-8' } })
+    }
+    if (p === '/long') {
+      // a long tab page: the list must open where the title is, without scrolling the page
+      return new Response('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>tab</title>' +
+        '<link rel="stylesheet" href="/_shell/tabs.css"><link rel="stylesheet" href="fake.css"><script src="/locale/pt-BR.js" defer></script><script src="/_shell/tabs.js" defer></script>' +
+        '</head><body><h1><button type="button" data-a5-tabs>Panel</button></h1>' + '<div class="card"></div>'.repeat(14) + '</body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+    }
     if (p === '/page') {
       // a tab page using the shared selector, for the browser test
-      return new Response('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>tab</title>' +
-        '<link rel="stylesheet" href="/_shell/tabs.css"><script src="/locale/pt-BR.js" defer></script><script src="/_shell/tabs.js" defer></script>' +
+      return new Response('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>tab</title>' +
+        '<link rel="stylesheet" href="/_shell/tabs.css"><link rel="stylesheet" href="fake.css"><script src="/locale/pt-BR.js" defer></script><script src="/_shell/tabs.js" defer></script>' +
         '</head><body><h1><button type="button" data-a5-tabs>Panel</button></h1><p id="probe"></p><input id="field"><div id="sheet" data-a5-sheet hidden></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
     }
     if (p === '/stream') {

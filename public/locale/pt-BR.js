@@ -9,7 +9,30 @@ window.T = {
   phonePlaceholder: '(61) 9 9999-9999',
   signIn: 'Entrar pelo WhatsApp',
   signInHint: 'Você manda uma mensagem pronta pelo seu WhatsApp e esta página entra sozinha.',
-  steps: { number: 'Número', message: 'Mensagem', approval: 'Liberação' },
+  steps: { number: 'Número', message: 'Mensagem', approval: 'Liberação', faceId: 'Face ID' },
+  // the owner on a new device: step 3 after the sign-in
+  ownerFaceId: {
+    title: 'Face ID neste aparelho',
+    why: 'Você é o dono: mudar pessoas, telas, a tela do quarto e a presença pede Face ID. Cadastre agora, leva um segundo.',
+    add: 'Cadastrar Face ID',
+    later: 'Agora não',
+  },
+  // once per device, after the first sign-in
+  welcome: {
+    title: (n) => `Pronto, ${n}!`,
+    sub: 'Este aparelho entrou no Portal A5. Da próxima vez ele já abre direto.',
+    tipBefore: 'Para trocar de aba, ',
+    tipBold: 'toque no título',
+    tipAfter: ' lá em cima.',
+    open: (t) => `Abrir a aba ${t}`,
+    openAccount: 'Abrir a Conta',
+  },
+  // a tab sends the owner here before a command only the owner may send
+  commandStepUp: {
+    title: 'Confirmar comando do dono',
+    why: 'Comandos só do dono pedem Face ID uma vez por dia neste aparelho. Depois, toque de novo no comando.',
+    later: 'Agora não',
+  },
   sendTitle: 'Mande a mensagem',
   sendHint: 'Toque no botão, envie a mensagem pronta e volte para cá.',
   bubbleNote: 'É isso que vai aparecer no seu WhatsApp. Vale 10 minutos.',
@@ -63,7 +86,17 @@ window.T = {
     seeAsHint: 'só neste aparelho',
     seeingAs: (g) => `Ensaio · ${g}`,
     backToOwner: 'Voltar ao modo dono',
+    backHint: (g) => `você está vendo como ${g}`,
     groupNames: { residents: 'morador', 'owner-screens': 'Telas do dono' },
+    // the list: its header, the "see as" rows and the rehearsal row
+    portal: 'Portal A5',
+    whoGroups: { owner: 'Dono', residents: 'Morador', 'owner-screens': 'Telas do dono' },
+    seeAsCaps: 'Ver como',
+    viewNames: { residents: 'Morador', 'owner-screens': 'Telas do dono' },
+    rehearsalHint: 'ensaio: entra e sai à vontade',
+    // the yellow bar on every page of a rehearsal
+    // only the state: "Ensaio" already says what it is, the made-up name shows on the welcome and the account
+    band: { label: 'Ensaio', back: 'Voltar ao modo dono', out: 'deslogado', state: (id, g) => String(g).toLowerCase() },
     pull: { pull: 'Puxe para atualizar', release: 'Solte para atualizar', refreshing: 'Atualizando…' },
   },
   you: 'Você',
