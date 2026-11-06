@@ -35,24 +35,39 @@ if [ -s "$LIVE_FILE" ]; then
 fi
 
 # The tab config lives outside git, so the commit check does not cover it: compare it with the
-# config now live and refuse when a tab or a command would disappear, unless that is meant
-# (PORTAL_A5_CONFIG_REMOVE=1).
+# config now live and refuse when a tab or a command would disappear or get looser (a lower
+# level, screens or shortcuts turned on, a higher hourly limit, a shorter gap, a new credential
+# or permission, a lighter entry), unless that is meant (PORTAL_A5_CONFIG_REMOVE=1).
 LIVE_TABS="$STATE_DIR/live_tabs.json"
 if [ -s "$LIVE_TABS" ] && ! cmp -s "$LIVE_TABS" .tabs.local.json; then
-  gone="$(python3 - "$LIVE_TABS" .tabs.local.json <<'PY'
+  changes="$(python3 - "$LIVE_TABS" .tabs.local.json <<'PY'
 import json, sys
 old, new = (json.load(open(f)) for f in sys.argv[1:3])
+LEVEL = {"common": 0, "admin": 1, "sensitive": 2}
 out = []
-for t, v in old.items():
-    if t not in new: out.append(t); continue
-    for c in (v.get("commands") or {}):
-        if c not in (new[t].get("commands") or {}): out.append(f"{t}/{c}")
-print(" ".join(out))
+for t, o in old.items():
+    n = new.get(t)
+    if n is None: out.append(f"{t} removed"); continue
+    if set(n.get("credentials", [])) - set(o.get("credentials", [])): out.append(f"{t} credentials")
+    if set(n.get("allow", [])) - set(o.get("allow", [])): out.append(f"{t} allow")
+    if o.get("entry") == "passkey" and n.get("entry") != "passkey": out.append(f"{t} entry")
+    if o.get("entry") == "passkey" and n.get("entryHours", 0) > o.get("entryHours", 0): out.append(f"{t} entryHours")
+    oc, nc = o.get("commands") or {}, n.get("commands") or {}
+    for c, x in oc.items():
+        y = nc.get(c)
+        if y is None: out.append(f"{t}/{c} removed"); continue
+        if LEVEL.get(y.get("level"), -1) < LEVEL.get(x.get("level"), -1): out.append(f"{t}/{c} level")
+        for f in ("screens", "shortcut"):
+            if y.get(f) and not x.get(f): out.append(f"{t}/{c} {f}")
+        if (y.get("perHour") or 1e9) > (x.get("perHour") or 1e9): out.append(f"{t}/{c} perHour")
+        if ((y.get("gap") or {}).get("seconds") or 0) < ((x.get("gap") or {}).get("seconds") or 0): out.append(f"{t}/{c} gap")
+        if json.dumps(y.get("params"), sort_keys=True) != json.dumps(x.get("params"), sort_keys=True): out.append(f"{t}/{c} params")
+print(", ".join(out))
 PY
-)"
+)" || { echo "refused: the tab config check failed (is .tabs.local.json valid JSON?)" >&2; exit 1; }
   echo "tab config differs from the live one"
-  if [ -n "$gone" ] && [ "${PORTAL_A5_CONFIG_REMOVE:-}" != 1 ]; then
-    echo "refused: this config drops $gone; if that is meant, run again with PORTAL_A5_CONFIG_REMOVE=1" >&2
+  if [ -n "$changes" ] && [ "${PORTAL_A5_CONFIG_REMOVE:-}" != 1 ]; then
+    echo "refused: this config removes or loosens: $changes; if that is meant, run again with PORTAL_A5_CONFIG_REMOVE=1" >&2
     exit 1
   fi
 fi
