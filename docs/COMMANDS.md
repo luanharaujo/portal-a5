@@ -150,3 +150,7 @@ async command(cmd: Command, identity: PortalIdentity): Promise<CommandAnswer>
 ## 9. Audit
 
 One line per command: action `command`, target `<tab>/<action>`, detail `{id, params, credential, shortcut?, status, error?}`. Refusals before the tab are audited as `command_refused` with the reason. Key events: `shortcut_key_created`, `shortcut_key_revoked`, `shortcut_refused`, `shortcut_new_place`. Brake: `commands_off`, `commands_on`. Device release: `device_commands_allowed`. The audit list is admin only.
+
+## Rehearsal ("see as")
+
+While an admin sees the portal as a non-admin group, a page command goes through the same checks a resident meets (catalog, params, group, level, the brake) and then stops: the tab's `command()` is never called, nothing is written to `commands`, and the answer is `200 {"id": "<uuid>", "status": "done", "ok": true, "simulated": true}`. It has its own hourly limit (120), so it never spends the real ones. Audit: `command` with `simulated: true` and `view_as`.

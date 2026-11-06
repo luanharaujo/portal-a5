@@ -27,6 +27,8 @@ export interface PortalIdentity {
   entered_at: string | null  // tabs with entry 'passkey': when this session entered with Face ID
   entry_until: string | null // ...and when that entry ends: close this session's sockets then
   actions: string[]          // commands this identity may send in the tab (docs/COMMANDS.md)
+  rehearsal?: true          // an admin rehearsing as a resident ("see as"): commands come back
+                             // simulated; show the made-up resident (T.rehearsal.name), not name
 }
 
 export interface RevokeRef { session?: number; machine?: number; person?: number }

@@ -218,6 +218,11 @@
 
     let switching = false
     async function choose(e) {
+      // back to the owner asks for Face ID, which only the portal page can do (the tabs' CSP)
+      if ('view' in e && e.view === null) {
+        location.assign('/conta/?owner=1&next=' + encodeURIComponent(location.pathname + location.search))
+        return
+      }
       if ('view' in e) {
         if (switching) return
         switching = true

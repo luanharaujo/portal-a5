@@ -116,7 +116,7 @@ export async function pulls(p, dy = 260, opts) {
 
 const KEYS = { Enter: ['Enter', 'Enter', 13], Escape: ['Escape', 'Escape', 27], ArrowDown: ['ArrowDown', 'ArrowDown', 40], End: ['End', 'End', 35], Tab: ['Tab', 'Tab', 9] }
 
-export async function browserChecks({ base, check, owner, resident, screen, approve }) {
+export async function browserChecks({ base, check, owner, resident, screen, approve, strong }) {
   if (!existsSync(CHROME)) { console.log('skip browser checks: Chrome not found (set CHROME)'); return }
   const b = await launch()
   // touch pages run in a Chrome of their own: a touch cut short by a reload leaves that
@@ -300,9 +300,39 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     const vc = await v.evaluate(`({ house: !!document.querySelector('.index a.row[href="#pessoas"]'), mark: !document.querySelector('.a5-tabs-viewas').hidden })`)
     check('browser: account page as a resident: no people and groups, mark on', !vc.house && vc.mark, vc)
     if (SHOTS) await v.shot(SHOTS + '/account_as_resident.png')
+    // rehearsal: the made-up resident, a sign out drawn on the page only, and back in
+    const rn = await v.evaluate(`({ name: document.querySelector('.index .profile b').textContent, band: !!document.querySelector('.index .rehearsal-band') })`)
+    check('browser: rehearsal shows the made-up resident and the band', rn.name === (await v.evaluate('A5_TEXT.rehearsal.name')) && rn.band, rn)
+    await v.evaluate(`document.querySelector('.index .logout').click()`)
+    check('browser: rehearsal sign out draws the sign-in page with the band', await v.waitFor(`!!document.querySelector('#phone') && !!document.querySelector('.sheet .rehearsal-band')`, 5000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_signin.png')
+    await v.go('/conta/')
+    check('browser: rehearsal: signed out survives a reload', await v.waitFor(`!!document.querySelector('#phone') && !!document.querySelector('.rehearsal-band')`, 5000))
+    await v.evaluate(`document.querySelector('.screen-link').click()`)
+    check('browser: rehearsal: the screen pairing page, made up', await v.waitFor(`!!document.querySelector('.pair-code') && !!document.querySelector('.rehearsal-band')`, 3000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_pair.png')
+    await v.evaluate(`document.querySelector('.pair-back').click()`)
+    await v.waitFor(`!!document.querySelector('#phone')`)
+    await v.evaluate(`document.querySelector('.sheet form').requestSubmit()`)
+    check('browser: rehearsal: the message step with a made-up code', await v.waitFor(`!!document.querySelector('.bubble .code') && /^A5-/.test(document.querySelector('.bubble .code').textContent)`, 3000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_message.png')
+    await v.evaluate(`document.querySelector('.sheet .btn-ghost').click()`)
+    check('browser: rehearsal: the waiting-for-approval step, new person first', await v.waitFor(`!!document.querySelector('.sheet .rehearsal-band') && document.querySelector('.sheet .notice')?.textContent.includes(A5_TEXT.status.pendingWhy.new_number)`, 3000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_pending.png')
+    await v.evaluate(`document.querySelector('.rehearsal-cases [data-v=other]').click()`)
+    check('browser: rehearsal: the other-number case on the switch', await v.waitFor(`document.querySelector('.sheet .notice')?.textContent.includes(A5_TEXT.status.pendingWhy.other_number)`, 3000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_pending_other.png')
+    await v.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
+    check('browser: rehearsal: approval signs the made-up resident back in', await v.waitFor(`${ON} && !document.querySelector('#phone') && !document.querySelector('.a5-tabs-viewas').hidden`, 8000), [await v.evaluate('location.href')])
+    await v.go('/conta/')
+    await v.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
     await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
     await v.waitFor(`!!document.querySelector('[role=menu]')`)
     await v.evaluate(`document.querySelector('[role=menuitem]').click()`)
+    check('browser: back to the owner mode asks for Face ID first', await v.waitFor(`location.pathname === '/conta/' && location.search.includes('owner=1') && !!document.querySelector('.sheet .faceid-mark')`, 5000))
+    if (SHOTS) await v.shot(SHOTS + '/rehearsal_back_faceid.png')
+    await strong() // stands in for Face ID on the phone (the software passkey of the battery)
+    await v.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
     check('browser: back to the owner mode brings the owner back on the same page', await v.waitFor(`${ON} && location.pathname === '/conta/' && document.querySelector('.a5-tabs-viewas').hidden && !!document.querySelector('.index a.row[href="#pessoas"]')`, 5000))
     check('browser: no error while seeing as', !v.log.some((x) => /Content Security Policy|exception/i.test(x)), v.log)
 

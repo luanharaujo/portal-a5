@@ -32,6 +32,24 @@ window.T = {
   nav: { devices: 'Meus aparelhos', admin: 'Pessoas e grupos', logout: 'Sair deste aparelho' },
   account: 'Conta',
   title: 'Portal A5',
+  // "see as" = a rehearsal with a made-up resident; signing out shows the signed-out pages
+  rehearsal: {
+    name: 'Morador de teste',
+    band: 'Ensaio',
+    back: 'Voltar ao modo dono',
+    signOutReal: 'Sem Face ID aqui? Sair de verdade e entrar de novo',
+    backWhy: 'Confirme que é você com o Face ID. Assim, quem estiver com o celular no ensaio não volta a ser dono com um toque.',
+    message: 'Entrar no Portal A5: ',
+    simulateSend: 'Simular o envio',
+    seePending: 'Ver a tela de liberação',
+    casesLabel: 'Qual caso mostrar',
+    caseNew: 'Pessoa nova',
+    caseOther: 'Número diferente',
+    simulateApproval: 'Simular a liberação',
+    note: 'Ensaio: nenhuma mensagem é enviada e nada é pedido a ninguém.',
+    pairNote: 'Ensaio: código de mentira, nenhuma tela é pareada.',
+    nothingSent: 'Ensaio: nada foi enviado',
+  },
   // the tab selector (/_shell/tabs.js), also loaded by the tab pages
   shell: {
     tabNames: { conta: 'Conta' }, // the other tabs' names come with the list
@@ -43,7 +61,7 @@ window.T = {
     // "see as": an admin sees the portal as one of the other groups, on this device only
     seeAs: (g) => `Ver como ${g}`,
     seeAsHint: 'só neste aparelho',
-    seeingAs: (g) => `Vendo como ${g}`,
+    seeingAs: (g) => `Ensaio · ${g}`,
     backToOwner: 'Voltar ao modo dono',
     groupNames: { residents: 'morador', 'owner-screens': 'Telas do dono' },
     pull: { pull: 'Puxe para atualizar', release: 'Solte para atualizar', refreshing: 'Atualizando…' },

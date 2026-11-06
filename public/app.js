@@ -9,6 +9,14 @@ const onAccount = () => location.pathname === ACCOUNT
 const MODE = (window.matchMedia('(display-mode: standalone)').matches || navigator.standalone) ? 'app' : 'browser'
 const WIDE = window.matchMedia('(orientation: landscape) and (min-width: 900px)')
 let ME = null
+// "see as" is a rehearsal: signing out of it only draws the signed-out pages here, with made-up
+// data and no call to the sign-in, pairing or passkey routes. The owner's session stays as it is.
+const OUT_KEY = 'a5.rehearsalOut'
+const store = {
+  get: () => { try { return sessionStorage.getItem(OUT_KEY) === '1' } catch { return false } },
+  set: (on) => { try { if (on) sessionStorage.setItem(OUT_KEY, '1'); else sessionStorage.removeItem(OUT_KEY) } catch { /* private mode: the rehearsal just ends */ } },
+}
+let REHEARSAL = false
 
 // ------------------------------------------------------------------ helpers
 function el(tag, attrs, ...kids) {
@@ -40,6 +48,7 @@ const ICONS = {
   list: [['path', { d: 'M8 6h13M8 12h13M8 18h13' }], ['path', { d: 'M3.5 6h.01M3.5 12h.01M3.5 18h.01', 'stroke-width': '3' }]],
   logout: [['path', { d: 'M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3' }], ['path', { d: 'M10 17l-5-5 5-5M5 12h11' }]],
   check: [['path', { d: 'm5 12.5 4.5 4.5L19 7.5' }]],
+  eye: [['path', { d: 'M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z' }], ['circle', { cx: '12', cy: '12', r: '3' }]],
   wifi: [['path', { d: 'M2 9a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0' }], ['circle', { cx: '12', cy: '19.5', r: '.8' }]],
   alert: [['path', { d: 'M12 3.5 2.5 20h19z' }], ['path', { d: 'M12 10v4.5M12 17.2h.01' }]],
   bolt: [['path', { d: 'M13 2.5 4.5 13.5H12l-1 8 8.5-11H12z' }]],
@@ -213,8 +222,8 @@ const keyOnce = (text, key) => el('div', { class: 'key-once' }, el('p', {}, text
   btn(T.bridges.copy, () => navigator.clipboard.writeText(key).then(() => toast(T.bridges.copied)), 'btn-sm'))
 
 // ------------------------------------------------------------------ cover: sign-in, pairing, Face ID
-function cover(kids, pair) {
-  const sheet = el('main', { class: 'sheet' }, kids)
+function cover(kids, pair, noBand) {
+  const sheet = el('main', { class: 'sheet' }, REHEARSAL && !noBand ? rehearsalBand() : null, kids)
   setPage(pair ? 'cover pair' : 'cover',
     el('div', { class: 'scene' }, houseArt(true)),
     el('a', { class: 'brand', href: '/' }, el('img', { src: '/favicon.svg', alt: '' }), el('b', {}, T.title)),
@@ -297,6 +306,110 @@ async function askCode(phone) {
     if (s.status === 'waiting' || s.status === 'pending') pollTimer = setTimeout(poll, 2000)
   }
   pollTimer = setTimeout(poll, 2000)
+}
+
+// ------------------------------------------------------------------ rehearsal (signed out, made up)
+function rehearsalBand() {
+  return el('div', { class: 'rehearsal-band', role: 'note' }, icon('eye'),
+    el('span', {}, el('b', {}, T.rehearsal.band), ' · ', T.rehearsal.name),
+    el('button', { type: 'button', onclick: () => guarded(backToOwner) }, T.rehearsal.back))
+}
+
+// back to the owner: Face ID first (the server asks for one made after going in)
+function backToOwner() {
+  const next = nextPath()
+  cover([
+    el('div', { class: 'faceid-mark' }, icon('faceid')),
+    el('h1', {}, T.rehearsal.back),
+    el('p', { class: 'sub' }, T.rehearsal.backWhy),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
+      await api('POST', '/api/tabs', { view_as: null })
+      store.set(false)
+      location.assign(next && !next.startsWith(ACCOUNT + '?') ? next : ACCOUNT)
+    }) }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
+    backLink(T.back, () => { history.replaceState(null, '', ACCOUNT); start() }),
+    // no Face ID on this device, or it failed: sign out for real and sign in again by WhatsApp
+    el('button', { type: 'button', class: 'screen-link', onclick: () => guarded(async () => {
+      await rawApi('POST', '/api/logout', { real: true })
+      store.set(false)
+      location.assign(ACCOUNT)
+    }) }, icon('logout'), el('span', {}, T.rehearsal.signOutReal), icon('chev', 'ico chev')),
+  ], false, true)
+}
+
+function rehearsalSignOut() {
+  store.set(true)
+  REHEARSAL = true
+  history.replaceState(null, '', '/')
+  rehearsalLogin()
+}
+
+// the end of every rehearsal path: signed in again as the made-up resident
+function rehearsalIn() {
+  store.set(false)
+  location.assign(nextPath() || '/')
+}
+
+const fakeCode = () => 'A5-' + Array.from(crypto.getRandomValues(new Uint8Array(4)), (x) => 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[x % 31]).join('')
+const rehearsalNote = (text) => el('p', { class: 'rehearsal-note' }, text)
+
+function rehearsalLogin() {
+  const input = el('input', { type: 'tel', inputmode: 'tel', autocomplete: 'off', placeholder: T.phonePlaceholder, id: 'phone' })
+  cover([
+    el('form', { onsubmit: (ev) => { ev.preventDefault(); rehearsalSend() } },
+      el('h1', {}, T.signInTitle),
+      el('p', { class: 'sub' }, T.signInSub),
+      el('label', { class: 'field' }, el('span', { class: 'caps' }, T.phoneLabel), el('div', { class: 'tel' }, el('span', { class: 'ddi' }, '+55'), input)),
+      el('button', { type: 'submit', class: 'btn btn-wa btn-block' }, icon('chat'), el('span', {}, T.signIn)),
+      el('p', { class: 'hint' }, T.signInHint)),
+    el('button', { type: 'button', class: 'screen-link', onclick: rehearsalPair }, icon('screen'), el('span', {}, T.pair.isScreen), icon('chev', 'ico chev')),
+    rehearsalNote(T.rehearsal.note),
+  ])
+}
+
+function rehearsalSend() {
+  const code = fakeCode()
+  cover([
+    steps(2),
+    el('h1', {}, T.sendTitle),
+    el('p', { class: 'sub' }, T.sendHint),
+    bubble(T.rehearsal.message + code, code),
+    el('p', { class: 'bubble-note' }, T.bubbleNote),
+    el('button', { type: 'button', class: 'btn btn-wa btn-block', onclick: rehearsalIn }, icon('chat'), el('span', {}, T.rehearsal.simulateSend)),
+    status(T.status.waiting, true),
+    el('button', { type: 'button', class: 'btn btn-ghost btn-block', onclick: () => rehearsalPending(false) }, el('span', {}, T.rehearsal.seePending)),
+    rehearsalNote(T.rehearsal.note),
+    backLink(T.back, rehearsalLogin),
+  ])
+}
+
+// a new person waits for the owner (the usual case); "other number" is the typed/sent mismatch
+function rehearsalPending(other) {
+  const pick = (v, label) => el('button', { type: 'button', 'data-v': v, 'aria-pressed': String(!!other === (v === 'other')), onclick: () => rehearsalPending(v === 'other') }, label)
+  cover([
+    steps(3),
+    el('h1', {}, T.pendingTitle),
+    el('div', { class: 'notice' }, icon('hourglass'), el('div', {}, el('b', {}, T.pendingHead), T.status.pendingWhy[other ? 'other_number' : 'new_number'])),
+    el('div', { class: 'toggles rehearsal-cases', role: 'group', 'aria-label': T.rehearsal.casesLabel }, pick('new', T.rehearsal.caseNew), pick('other', T.rehearsal.caseOther)),
+    status(T.status.waitingApproval, true),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: rehearsalIn }, icon('check'), el('span', {}, T.rehearsal.simulateApproval)),
+    rehearsalNote(T.rehearsal.note),
+    backLink(T.back, rehearsalLogin),
+  ])
+}
+
+function rehearsalPair() {
+  const code = fakeCode()
+  cover([
+    el('span', { class: 'caps' }, T.pair.kicker),
+    el('h1', {}, T.pair.title),
+    el('p', { class: 'sub' }, howTo()),
+    el('div', { class: 'code-qr' }, el('div', { class: 'pair-code', 'aria-label': code }, code.replace(/[^A-Z0-9]/gi, '').split('').map((c) => el('span', {}, c))),
+      drawQr(location.origin + '/')),
+    status(T.pair.waiting, true),
+    rehearsalNote(T.rehearsal.pairNote),
+    el('button', { type: 'button', class: 'btn btn-ghost pair-back', onclick: rehearsalLogin }, icon('back'), el('span', {}, T.back)),
+  ], true)
 }
 
 // ------------------------------------------------------------------ fixed screen pairing (screen side)
@@ -499,15 +612,16 @@ function indexRow(key, small, end, current) {
 function renderIndex(current) {
   const me = D.devices.find((d) => d.current)
   const groups = ME.groups || []
-  const profile = el('div', { class: 'card profile' }, avatar(ME.person.name, null),
-    el('div', {}, el('b', {}, ME.person.name), el('small', {}, T.thisDeviceIs(me ? me.label || T.device : T.device)),
+  const name = ME.rehearsal ? T.rehearsal.name : ME.person.name
+  const profile = el('div', { class: 'card profile' }, avatar(name, null),
+    el('div', {}, el('b', {}, name), el('small', {}, T.thisDeviceIs(me ? me.label || T.device : T.device)),
       el('div', { class: 'chips' }, groups.map((g) => el('span', { class: 'chip fill ' + (g.id === 'owner' ? 'sun' : 'ok') }, groupName(g))),
         ME.passkeys ? el('span', { class: 'chip fill ok' }, T.faceId) : null)))
   const rows = (keys) => el('div', { class: 'group' }, keys.filter(allowed).map((k) => indexRow(k, ...summary(k), k === current)))
-  fill($index, profile, WIDE.matches ? null : alerts(),
+  fill($index, ME.rehearsal ? rehearsalBand() : null, profile, WIDE.matches ? null : alerts(),
     el('span', { class: 'section caps' }, T.you), rows(YOU),
     ME.admin ? [el('span', { class: 'section caps' }, T.house), rows(HOUSE)] : null,
-    el('button', { type: 'button', class: 'logout', onclick: () => guarded(async () => { await rawApi('POST', '/api/logout', {}); start() }) }, icon('logout'), T.nav.logout))
+    el('button', { type: 'button', class: 'logout', onclick: () => guarded(async () => { if (ME.rehearsal) return rehearsalSignOut(); await rawApi('POST', '/api/logout', {}); start() }) }, icon('logout'), T.nav.logout))
 }
 
 // the small line and the end (count or badge) of each index row
@@ -828,7 +942,14 @@ async function start() {
     setPage('loading', el('p', { class: 'muted loading-text' }, T.offline))
     return
   }
+  REHEARSAL = !!ME.rehearsal
   const q = new URLSearchParams(location.search)
+  if (q.get('owner') === '1') {
+    if (REHEARSAL) return backToOwner()
+    history.replaceState(null, '', ACCOUNT)
+  }
+  if (!REHEARSAL) store.set(false)
+  else if (store.get()) return rehearsalLogin()
   const stepUp = q.get('step_up')
   if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return stepUpView(stepUp)
   const agentReq = q.get('agent_request')

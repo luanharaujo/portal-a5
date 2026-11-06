@@ -341,3 +341,11 @@ body.loading { display: flex; align-items: center; justify-content: center; min-
 }
 .item small.with-chip .chip { margin: 2px 8px 0 0; padding: 0 8px; font-size: 11px; vertical-align: 1px; }
 .code-caption { display: block; margin: 0 0 10px; }
+
+/* rehearsal ("see as"): a band that stays on top of every page of it */
+.rehearsal-band { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 6px); z-index: 5; display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin-bottom: 16px; border-radius: 14px; background: var(--sun-bg); border: 1px solid var(--warn-line); font-size: 14px; line-height: 1.3; }
+.rehearsal-band > .ico { width: 20px; height: 20px; color: var(--sun-ink); flex: none; }
+.rehearsal-band > span { flex: 1; min-width: 0; }
+.rehearsal-band button { flex: none; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--surface); color: var(--text); font: 600 13.5px var(--font); cursor: pointer; }
+.rehearsal-note { margin-top: 14px; font-size: 13px; color: var(--muted); text-align: center; }
+.rehearsal-cases { margin-top: 12px; justify-content: center; }

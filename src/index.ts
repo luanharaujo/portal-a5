@@ -70,6 +70,8 @@ const COOKIE = '__Host-a5s'
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O/1/I/L
 // The reader matches this exact phrase, so it is part of the protocol, not UI text.
 const LOGIN_PHRASE = 'Entrar no Portal A5: '
+// commands sent while an admin rehearses as a resident ("see as"): nothing leaves the portal
+const REHEARSAL_COMMANDS_PER_HOUR = 120
 const ROBOT_KEY_PREFIX = 'pa5_robo_'
 const OWNER_GROUP = 'owner'
 // groups made only for screens: a tab whose policy takes no screen credential can't be put there
@@ -816,6 +818,8 @@ async function me(env: Env, who: Who) {
     groups: who.groups.map((g) => ({ id: g.id, name: g.name })),
     admin: who.admin,
     view_as: who.viewAs,
+    // the page shows a made-up resident then (its name lives in the locale)
+    rehearsal: !!who.viewAs,
     tabs: who.tabs.has('*') ? Object.keys(tabBindings(env)) : [...who.tabs],
     all_tabs: who.admin ? Object.keys(tabBindings(env)) : [],
     screen_tabs: who.admin ? Object.keys(tabBindings(env)).filter((t) => policyOf(t).credentials.includes('screen')) : [],
@@ -829,6 +833,11 @@ async function me(env: Env, who: Who) {
 }
 
 async function myDevices(env: Env, who: Who) {
+  // the made-up resident of a rehearsal has only the device in hand
+  if (who.viewAs) {
+    const r = await env.DB.prepare('SELECT id, kind, label, place, created_at, last_used_at FROM sessions WHERE id = ?').bind(who.sessionId).all<Row>()
+    return r.results.map((s) => ({ ...s, current: true }))
+  }
   const r = await env.DB.prepare('SELECT id, kind, label, place, created_at, last_used_at FROM sessions WHERE person_id = ? AND expires_at > ? ORDER BY last_used_at DESC')
     .bind(who.person.id, now()).all<Row>()
   return r.results.map((s) => ({ ...s, current: Number(s.id) === who.sessionId }))
@@ -1111,6 +1120,7 @@ function identityOf(env: Env, tab: string, who: Who, policy: TabPolicy, enteredA
     session: who.sessionId, machine: null, shortcut: null, strong: fresh(who), entered_at: enteredAt,
     entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null,
     actions: allowedActions(tab, catalogOf(env, tab), callerOf(env, who)),
+    ...(who.viewAs ? { rehearsal: true } : {}),
   }
 }
 
@@ -1178,8 +1188,9 @@ async function viewOptions(env: Env): Promise<{ id: string; name: string }[]> {
 // POST /api/tabs {"view_as": "<group>" | null}: an admin browser session shows itself as one
 // non-admin group, on this device only, or comes back. It goes through /api/tabs because that is
 // the one portal path the tab pages may call (their CSP), and the selector lives in them too.
-// Neither way asks for anything: the mode only takes power away, and coming back gives this
-// session what it already had. Never for screens or non-admins.
+// Going in asks for nothing (the mode only takes power away). Coming back asks for Face ID done
+// after going in (the owner's call on the Security R1): whoever holds the phone during a rehearsal
+// must not get the owner back with one touch. Never for screens or non-admins.
 async function setViewAs(env: Env, req: Request, who: Who, url: URL) {
   if (who.kind !== 'browser' || !who.realAdmin) throw new HttpError(403, 'admin_only')
   const b = await body(req)
@@ -1193,8 +1204,11 @@ async function setViewAs(env: Env, req: Request, who: Who, url: URL) {
     if (g.is_admin) throw new HttpError(400, 'view_as_admin_group')
     next = String(g.id)
   }
+  // going in drops this session's Face ID, so "fresh" below can only be a check made since
+  if (was && next === null && !fresh(who)) throw new HttpError(403, 'passkey_required', { passkey: true })
   if (next !== was) {
-    await env.DB.prepare('UPDATE sessions SET view_as = ? WHERE id = ?').bind(next, who.sessionId).run()
+    if (!was) await env.DB.prepare('UPDATE sessions SET view_as = ?, passkey_at = NULL WHERE id = ?').bind(next, who.sessionId).run()
+    else await env.DB.prepare('UPDATE sessions SET view_as = ? WHERE id = ?').bind(next, who.sessionId).run()
     if (was) await audit(env, req, { who, action: 'view_as_off', target: was })
     if (next) await audit(env, req, { who, action: 'view_as_on', target: next })
   }
@@ -1318,6 +1332,15 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   if (c.who && c.who.kind === 'browser' && !c.who.realAdmin && !c.who.commandsOkAt &&
     Date.now() - Date.parse(c.who.sessionCreatedAt) < DEVICE_COMMAND_HOLD_MS) return refuse(403, 'device_too_new')
   if (await commandsOff(env)) return refuse(503, 'commands_off')
+
+  // "see as" is a rehearsal: the command passes every check a resident would meet, then nothing
+  // goes to the tab or the house. It has its own hourly limit, so it never spends the real ones.
+  if (c.who?.viewAs) {
+    if (!(await underLimit(env, `cmd-rehearsal:p${person.id}`, REHEARSAL_COMMANDS_PER_HOUR))) return refuse(429, 'too_many_commands')
+    const id = crypto.randomUUID()
+    await audit(env, req, { ...actor, action: 'command', target, detail: { id, params: p.params, credential, status: 'done', simulated: true } })
+    return json({ id, status: 'done', ok: true, simulated: true }, 200)
+  }
 
   const callerId = c.key ? `k${c.key.id}` : `p${person.id}`
   if (c.key && !(await underLimit(env, `cmd-key:${c.key.id}`, SHORTCUT_PER_HOUR))) return refuse(429, 'too_many_commands')
@@ -1918,6 +1941,10 @@ async function handle(req: Request, env: Env): Promise<Response> {
     if (path === '/api/pair/claim' && m === 'POST') return pairClaim(req, env)
     if (path === '/api/logout' && m === 'POST') {
       const who = await currentSession(req, env)
+      // a rehearsal signs out only on the page (app.js): the owner's real session never drops here,
+      // unless the page says so in words ({"real": true}: the way out when Face ID cannot bring
+      // the owner back). Signing out only takes power away.
+      if (who?.viewAs && (await body(req)).real !== true) throw new HttpError(403, 'view_as_active')
       if (who) {
         await dropSessions(env, [who.sessionId])
         await audit(env, req, { who, action: 'logout' })

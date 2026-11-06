@@ -736,7 +736,9 @@ const ps3 = await tv3.req('POST', '/api/pair/start', {})
 await owner.req('POST', '/api/admin/pair', { code: ps3.data.code, name: 'TV browser' })
 await tv3.req('POST', '/api/pair/status', { secret: ps3.data.secret })
 check('screen for the browser test paired', !!tv3.cookie)
-await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie,
+// a fresh Face ID check on the owner's session (the software passkey)
+const strongNow = async () => owner.req('POST', '/api/passkey/get/verify', await auth.get((await owner.req('POST', '/api/passkey/get/options', {})).data))
+await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie, strong: strongNow,
   approve: async (code) => check('browser pairing approved', (await owner.req('POST', '/api/admin/pair', { code, name: 'TV deep link' })).status === 200) })
 
 // ------------------------------------------------------------------ "see as" (an admin sees the portal as another group)
@@ -772,17 +774,36 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   const vp = await cmd(owner, 'tab-a', 'presence', { state: 'home' })
   check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')
+  const logBefore = (await cmdLog()).length
   const vl = await cmd(owner, 'tab-a', 'light')
-  check('see as: common command goes through (no new-device hold for the admin\'s own device)', vl.status === 200 && vl.data.status === 'done', vl)
-  check('see as: audit rows written in the mode carry view_as', (await (async () => { await owner.req('POST', '/api/tabs', { view_as: null }); const r = (await owner.req('GET', '/api/admin/audit')).data; await owner.req('POST', '/api/tabs', { view_as: 'residents' }); return r })())
-    .some((a) => a.action === 'command' && /"view_as":"residents"/.test(String(a.detail))))
+  check('rehearsal: common command answers done + simulated (no new-device hold)', vl.status === 200 && vl.data.status === 'done' && vl.data.ok === true && vl.data.simulated === true && UUID.test(vl.data.id), vl)
+  check('rehearsal: the command never reached the tab', (await cmdLog()).length === logBefore)
+  check('rehearsal: bad params still refused', (await cmd(owner, 'tab-a', 'light', { nope: 1 })).status === 400)
+  check('rehearsal: the tab identity carries rehearsal', vid.rehearsal === true)
+  check('rehearsal: /api/me says rehearsal, devices = only this one', vme.rehearsal === true &&
+    (await (async () => { const d = (await owner.req('GET', '/api/me/devices')).data; return d.length === 1 && d[0].current === true && d[0].id === vme.session_id })()))
+  const lo = await owner.req('POST', '/api/logout', {})
+  check('rehearsal: sign out on the server refused, session kept', lo.status === 403 && lo.data.error === 'view_as_active' && !lo.setCookie &&
+    (await owner.req('GET', '/api/me')).status === 200, lo)
+  check('rehearsal: sign out with real:false is still refused', (await owner.req('POST', '/api/logout', { real: 'yes' })).status === 403)
+  check('see as: audit rows written in the mode carry view_as', (await (async () => { await strongNow(); await owner.req('POST', '/api/tabs', { view_as: null }); const r = (await owner.req('GET', '/api/admin/audit')).data; await owner.req('POST', '/api/tabs', { view_as: 'residents' }); return r })())
+    .some((a) => a.action === 'command' && /"view_as":"residents"/.test(String(a.detail)) && /"simulated":true/.test(String(a.detail))))
   check('see as: cannot disconnect another of the owner\'s devices', (await owner.req('DELETE', "/api/me/devices/999999")).data.error === 'view_as_active')
   check('see as: no passkey registration', (await owner.req('POST', '/api/passkey/create/options', {})).status === 403)
   const sw = await owner.req('POST', '/api/tabs', { view_as: 'owner-screens' })
   check('see as: switch to another group', sw.status === 200 && sw.data.view_as?.id === 'owner-screens', sw.data)
 
+  await strongNow()
+  check('see as off: with a fresh Face ID', (await owner.req('POST', '/api/tabs', { view_as: null })).status === 200)
+  await strongNow()
+  await owner.req('POST', '/api/tabs', { view_as: 'residents' })
+  const weak = await owner.req('POST', '/api/tabs', { view_as: null })
+  check('see as off: Face ID made before going in does not count', weak.status === 403 && weak.data.error === 'passkey_required' && weak.data.passkey === true &&
+    (await owner.req('GET', '/api/me')).data.view_as?.id === 'residents', weak.data)
+  check('see as: switching groups inside the mode asks for nothing', (await owner.req('POST', '/api/tabs', { view_as: 'owner-screens' })).status === 200)
+  check('see as: Face ID works inside the mode', (await strongNow()).status === 200)
   const off = await owner.req('POST', '/api/tabs', { view_as: null })
-  check('see as off: back to the owner without asking anything', off.status === 200 && off.data.view_as === null && off.data.tabs.length === 4 && (await owner.req('GET', '/api/me')).data.admin === true, off.data)
+  check('see as off: back to the owner after a fresh Face ID', off.status === 200 && off.data.view_as === null && off.data.tabs.length === 4 && (await owner.req('GET', '/api/me')).data.admin === true, off.data)
   check('see as off twice: no-op', (await owner.req('POST', '/api/tabs', { view_as: null })).status === 200)
   check('see as off: admin pages back', (await owner.req('GET', '/api/admin/people')).status === 200)
   const va = (await owner.req('GET', '/api/admin/audit')).data
