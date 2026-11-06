@@ -46,8 +46,34 @@ button[data-a5-tabs] {
 .a5-tabs-item .a5-tabs-dot { margin-left: auto; font-size: .8em; min-width: 1.5em; height: 1.5em; border-radius: .75em; }
 .a5-tabs-sep { height: 1px; background: var(--a5t-line); margin: 6px 8px; }
 
+/* "see as": a mark next to the title while an admin sees the portal as another group */
+.a5-tabs-viewas {
+  display: inline-block; margin-left: .5em; padding: .25em .7em; border-radius: 999px; vertical-align: middle;
+  background: var(--a5t-dot); color: var(--a5t-dot-fg); font: 700 13px/1.2 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0; white-space: nowrap;
+}
+.a5-tabs-viewas[hidden] { display: none; }
+.a5-tabs-view .a5-tabs-name { font-weight: 500; }
+
+/* pull to refresh (tabs.js): a pill that comes down from the top */
+.a5-pull {
+  position: fixed; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 6px); z-index: 2147482000;
+  display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px;
+  background: var(--a5t-bg); border: 1px solid var(--a5t-line); color: var(--a5t-fg);
+  font: 600 13px/1 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-shadow: 0 8px 20px -8px rgba(0, 0, 0, .6); opacity: 0; pointer-events: none;
+  transform: translate(-50%, calc(var(--a5-pull, 0px) - 56px)); transition: opacity .15s;
+}
+.a5-pull.a5-pull-on { opacity: 1; }
+.a5-pull-arrow { display: inline-block; color: var(--a5t-check); transition: transform .15s; }
+.a5-pull.a5-pull-ready .a5-pull-arrow { transform: rotate(180deg); }
+.a5-pull.a5-pull-loading .a5-pull-arrow { animation: a5-pull-spin .8s linear infinite; }
+@keyframes a5-pull-spin { to { transform: rotate(360deg); } }
+
 @keyframes a5-tabs-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) {
   .a5-tabs-menu { animation: none; }
   .a5-tabs-title[aria-expanded="true"] .a5-tabs-arrow { transform: none; }
+  .a5-pull, .a5-pull-arrow { transition: none; }
+  .a5-pull.a5-pull-loading .a5-pull-arrow { animation: none; }
 }

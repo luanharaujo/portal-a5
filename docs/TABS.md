@@ -250,6 +250,14 @@ There is no home page. `/` opens the last tab used on that device (`localStorage
 - `locale/pt-BR.js` sets `window.T` and `window.A5_TEXT`; the selector reads `A5_TEXT` only, so a tab may keep its own `T` (load the locale before the tab's scripts).
 - Colors: dark by default (`--a5t-*` tokens in `tabs.css`); a tab may override the tokens. The portal's own pages map them to the device theme.
 
+### Pull to refresh (every tab, from the shell)
+
+The home-screen app has no reload button, so `tabs.js` reloads the page when a signed-in person drags it down at the top (past 80 px, with a "pull/release to refresh" pill). Nothing to do in the tab. It starts only when the selector is on (never on a fixed screen), on touch only (a TV remote never starts it), with one finger (pinch zoom is left alone), only at the top of the page and of the box under the finger, and never while the tab list, a `<dialog open>`, an `aria-modal="true"` element, an element marked `data-a5-sheet` (not `hidden`) or a text field is open. Mark your sheets with `data-a5-sheet`. A tab with its own pull to refresh sets `<html data-a5-pull="own">` and the shell stays out. Texts: `A5_TEXT.shell.pull`.
+
+### "See as" (admins)
+
+An admin's list also offers "see as <group>" (`A5_TEXT.shell.seeAs`) for every non-admin group, above the line before Conta. Picking one sends `POST /api/tabs {"view_as": "<group>"}` and, from then on, that session (that device only) is that group and no admin: `/api/tabs`, `/<tab>/*`, the identity every tab gets (`groups`, `actions` with the group's level), commands and the account pages. Nothing to change in a tab: it shows exactly what that group sees. The title carries a "seeing as ..." mark (`seeingAs`) and the list starts with "back to owner mode" (`backToOwner`, sends `{"view_as": null}`). Neither way asks for Face ID: the mode only takes power away. No counts while it is on. Audit: `view_as_on` and `view_as_off`, target the group.
+
 ### `GET /api/tabs`
 
 Session required (401 otherwise), GET only, `Cache-Control: no-store`.
@@ -262,9 +270,14 @@ Session required (401 otherwise), GET only, `Cache-Control: no-store`.
     {"id": "notes", "path": "/notes/", "label": "Notes", "icon": "grid", "badge": null, "entry": "session"},
     {"id": "voice", "path": "/voice/", "label": "Voice", "icon": "mic", "badge": 2, "entry": "passkey"}
   ],
-  "account": {"id": "conta", "path": "/conta/"}
+  "account": {"id": "conta", "path": "/conta/"},
+  "view_as": null,
+  "view_options": [{"id": "residents", "name": "Residents"}]
 }
 ```
+
+- `view_as`: the group this session is seen as (`{id, name}`), or null. `view_options`: the groups an admin can see the portal as (empty for everyone else).
+- `POST /api/tabs` with `{"view_as": "<group>" | null}` (same origin, `X-Portal: 1`) turns "see as" on or off and answers the new list. Admin browser sessions only (403); an admin group is refused (400 `view_as_admin_group`).
 
 - `tabs`: the tabs this session can open (group and the tab's `credentials` policy, the same rule as `/<tab>/*`), in configuration order, with the configured `label` and `icon` (or null). The account's name comes from the locale.
 - `selector` is `false` for a fixed screen (`credential: 'screen'`): plain title, no counts.
@@ -278,7 +291,7 @@ async badge(identity: PortalIdentity): Promise<{ count: number }>
 ```
 
 - How many things wait for this person in the tab (for example, decisions waiting for an answer). The tab decides what counts. Only the number leaves the tab, never the content.
-- Called only for a browser session with more than one tab, for each of its tabs. Never for a fixed screen or a person with a single tab.
+- Called only for a browser session with more than one tab, for each of its tabs. Never for a fixed screen, a person with a single tab or an admin seeing as another group.
 - The identity is the person's, with `strong` false (a count is never an action) and `entered_at` and `entry_until` null: a passkey tab's count shows without Face ID, its content stays behind the entry.
 - The portal waits 300 ms at most, then shows no number. Anything but a non-negative integer is no number; above 99 is shown as 99 (the dot itself shows `9+` above 9). The answer is kept per person and tab for 60 seconds in the portal's isolate.
 - The dot next to the title is the sum of the other tabs' counts; inside the list each tab shows its own.

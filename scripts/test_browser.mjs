@@ -9,7 +9,7 @@ import { join } from 'node:path'
 const CHROME = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-async function launch() {
+export async function launch() {
   const dir = mkdtempSync(join(tmpdir(), 'a5-chrome-'))
   const proc = spawn(CHROME, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] })
   const wsUrl = await new Promise((resolve, reject) => {
@@ -43,7 +43,7 @@ async function launch() {
 }
 
 // One isolated browser context (own cookies and storage) with one page.
-async function page(b, base, cookie) {
+export async function page(b, base, cookie, { touch = false } = {}) {
   const { browserContextId } = await b.send('Target.createBrowserContext')
   const { targetId } = await b.send('Target.createTarget', { url: 'about:blank', browserContextId })
   const { sessionId } = await b.send('Target.attachToTarget', { targetId, flatten: true })
@@ -55,12 +55,18 @@ async function page(b, base, cookie) {
     if (m.method === 'Runtime.exceptionThrown') log.push('exception: ' + m.params.exceptionDetails.text)
   })
   await s('Page.enable'); await s('Runtime.enable'); await s('Log.enable'); await s('Network.enable')
+  if (touch) {
+    await s('Emulation.setDeviceMetricsOverride', { width: 393, height: 852, deviceScaleFactor: 3, mobile: true })
+    await s('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 })
+  }
   if (cookie) {
     const [name, value] = cookie.split('=')
     await s('Network.setCookie', { name, value, url: base + '/', path: '/', secure: true, httpOnly: true, sameSite: 'Lax' })
   }
   const evaluate = async (expr) => {
-    const r = await s('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true })
+    // a page that is navigating can leave a call unanswered: give up after 5 s
+    const r = await Promise.race([s('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true }),
+      sleep(5000).then(() => { throw new Error('evaluate timed out: ' + expr.slice(0, 80)) })])
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text)
     return r.result.value
   }
@@ -72,12 +78,40 @@ async function page(b, base, cookie) {
     }
     return false
   }
-  const go = async (path) => { await s('Page.navigate', { url: base + path }); await sleep(150) }
+  const go = async (path) => { await Promise.race([s('Page.navigate', { url: base + path }), sleep(5000)]); await sleep(150) }
   const key = async (k, code = k, vk = 0) => {
     for (const type of ['keyDown', 'keyUp']) await s('Input.dispatchKeyEvent', { type, key: k, code, windowsVirtualKeyCode: vk })
     await sleep(60)
   }
-  return { evaluate, waitFor, go, key, log }
+  // one finger dragged straight down from (x, y) by dy pixels, then lifted
+  // input and screenshots can wait forever on a page that is reloading: never more than 3 s
+  const soon = (m, p) => Promise.race([s(m, p), sleep(3000).then(() => { log.push('timeout: ' + m) })])
+  const drag = async (dy, { x = 200, y = 120, fingers = 1 } = {}) => {
+    const pts = (yy) => Array.from({ length: fingers }, (_, i) => ({ x: x + i * 40, y: yy, id: i }))
+    await soon('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: pts(y) })
+    for (let i = 1; i <= 10; i++) await soon('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: pts(y + (dy * i) / 10) })
+  }
+  const lift = () => soon('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  const shot = async (file) => {
+    await soon('Page.bringToFront')
+    const r = await soon('Page.captureScreenshot', { format: 'png' })
+    if (!r) return
+    const { data } = r
+    const { writeFileSync } = await import('node:fs')
+    writeFileSync(file, Buffer.from(data, 'base64'))
+  }
+  return { evaluate, waitFor, go, key, log, drag, lift, shot }
+}
+
+// Pull to refresh on one page: true when a long pull reloads it (a marker set on the page is gone).
+export async function pulls(p, dy = 260, opts) {
+  if (process.env.A5_DEBUG) console.error('pull', dy, JSON.stringify(opts || {}))
+  await p.evaluate('window.__stay = 1')
+  await p.drag(dy, opts)
+  const ready = await p.evaluate(`!!document.querySelector('.a5-pull.a5-pull-ready')`)
+  await p.lift()
+  const reloaded = await p.waitFor(`window.__stay !== 1 && document.readyState === 'complete'`, 2500)
+  return { ready, reloaded }
 }
 
 const KEYS = { Enter: ['Enter', 'Enter', 13], Escape: ['Escape', 'Escape', 27], ArrowDown: ['ArrowDown', 'ArrowDown', 40], End: ['End', 'End', 35], Tab: ['Tab', 'Tab', 9] }
@@ -105,12 +139,12 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     await o.evaluate(`document.querySelector('[data-a5-tabs]').focus()`)
     await press(o, 'Enter')
     const m = await o.evaluate(`(() => { const m = document.querySelector('[role=menu]'); if (!m) return null; const it = [...m.querySelectorAll('[role=menuitem]')]; return {
-      names: it.map((i) => i.querySelector('.a5-tabs-name').textContent), sep: !!m.querySelector('.a5-tabs-sep'),
+      names: it.map((i) => i.querySelector('.a5-tabs-name').textContent), view: it.map((i) => i.classList.contains('a5-tabs-view')), sep: !!m.querySelector('.a5-tabs-sep'),
       current: it.findIndex((i) => i.getAttribute('aria-current') === 'page'), check: it[0].querySelector('.a5-tabs-check').textContent,
       focused: it.indexOf(document.activeElement), passkeyHint: it[1].querySelector('.a5-tabs-hint')?.textContent,
       passkeyDot: it[1].querySelector('.a5-tabs-dot')?.textContent, heights: it.map((i) => i.getBoundingClientRect().height),
       expanded: document.querySelector('[data-a5-tabs]').getAttribute('aria-expanded') } })()`)
-    check('browser: Enter opens the list with every tab, then Conta after a line', m && m.names.join() === 'Tab A,Tab B,tab-slow,Odd,Conta' && m.sep && m.expanded === 'true', m)
+    check('browser: Enter opens the list with every tab, then Conta after a line', m && m.names.filter((n, i) => !m.view[i]).join() === 'Tab A,Tab B,tab-slow,Odd,Conta' && m.sep && m.expanded === 'true', m)
     check('browser: current tab marked and focused', m && m.current === 0 && m.check === '✓' && m.focused === 0, m)
     check('browser: the Face ID tab says so and shows its own count', m && m.passkeyHint === 'Face ID' && m.passkeyDot === '3', m)
     const ic = await o.evaluate(`[...document.querySelectorAll('[role=menuitem]')].map((i) => { const s = i.querySelector('svg.a5-tabs-icon'); return s ? getComputedStyle(s).stroke : null })`)
@@ -191,6 +225,81 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
       await approve(await p.evaluate(`document.querySelector('.pair-code').textContent`))
       check('browser: paired screen lands on next, query kept', await p.waitFor(`location.pathname + location.search === '/tab-a/?view=landscape'`, 8000), [await p.evaluate('location.href'), await p.evaluate(`document.querySelector('.pair .status')?.textContent`), p.log])
     }
+
+    // pull to refresh (touch), from the shell, on a tab page and on the account page
+    const SHOTS = process.env.A5_SHOTS
+    const t1 = await page(b, base, owner, { touch: true })
+    await t1.go('/tab-a/page')
+    await t1.waitFor(ON)
+    let pr = await pulls(t1)
+    check('browser: pull to refresh reloads a tab page', pr.ready && pr.reloaded, pr)
+    await t1.waitFor(ON)
+    pr = await pulls(t1, 60)
+    check('browser: a short pull does not reload', !pr.ready && !pr.reloaded, pr)
+    pr = await pulls(t1, 260, { fingers: 2 })
+    check('browser: two fingers (pinch) never reload', !pr.reloaded, pr)
+    await t1.evaluate(`document.getElementById('field').focus()`)
+    pr = await pulls(t1)
+    check('browser: no pull while a text field is open', !pr.reloaded, pr)
+    await t1.evaluate(`document.activeElement.blur(); document.getElementById('sheet').hidden = false`)
+    pr = await pulls(t1)
+    check('browser: no pull while a sheet is open', !pr.reloaded, pr)
+    await t1.evaluate(`document.getElementById('sheet').hidden = true; document.querySelector('[data-a5-tabs]').click()`)
+    await t1.waitFor(`!!document.querySelector('[role=menu]')`)
+    pr = await pulls(t1)
+    check('browser: no pull while the tab list is open', !pr.reloaded, pr)
+    await t1.go('/tab-a/page-own')
+    await t1.waitFor(ON)
+    pr = await pulls(t1)
+    check('browser: a tab with its own pull (data-a5-pull="own") gets none from the shell', !pr.reloaded && !(await t1.evaluate(`!!document.querySelector('.a5-pull')`)), pr)
+    check('browser: no CSP violation or error with pull to refresh', !t1.log.some((x) => /Content Security Policy|exception/i.test(x)), t1.log)
+    // a fresh page: a touch cut short by a reload can leave the emulated finger down in this one
+    const t2 = await page(b, base, owner, { touch: true })
+    await t2.go('/conta/')
+    await t2.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
+    pr = await pulls(t2)
+    check('browser: pull to refresh reloads the account page', pr.ready && pr.reloaded, pr)
+    if (SHOTS) { await t2.waitFor(`${ON} && !!document.querySelector('.index .profile')`); await t2.drag(260); await sleep(200); await t2.shot(SHOTS + '/puxar_conta.png'); await t2.lift() }
+    if (screen) {
+      const ts = await page(b, base, screen, { touch: true })
+      await ts.go('/tab-a/page')
+      await sleep(800)
+      pr = await pulls(ts)
+      check('browser: fixed screen never pulls to refresh', !pr.reloaded, pr)
+    }
+
+    // "see as": the owner sees the portal as a resident from the selector, and comes back
+    const v = await page(b, base, owner, { touch: true })
+    await v.go('/tab-a/page')
+    await v.waitFor(ON)
+    await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
+    await v.waitFor(`!!document.querySelector('[role=menu]')`)
+    const X = await v.evaluate(`(() => { const t = A5_TEXT.shell, g = t.groupNames; return { screens: t.seeAs(g['owner-screens']), res: t.seeAs(g.residents),
+      seeing: t.seeingAs(g.residents), back: t.backToOwner, conta: t.tabNames.conta } })()`)
+    const vn = await v.evaluate(`[...document.querySelectorAll('[role=menuitem] .a5-tabs-name')].map((x) => x.textContent)`)
+    check('browser: owner list has the "see as" items above Conta', vn.join() === ['Tab A', 'Tab B', 'tab-slow', 'Odd', X.screens, X.res, X.conta].join(), [vn, X])
+    if (SHOTS) await v.shot(SHOTS + '/menu_dono.png')
+    await v.evaluate(`[...document.querySelectorAll('[role=menuitem]')].find((i) => i.textContent.includes(${JSON.stringify(X.res)})).click()`)
+    check('browser: seeing as a resident, same page reloaded with the mark', await v.waitFor(`${ON} && !document.querySelector('.a5-tabs-viewas').hidden`, 5000))
+    const vm = await v.evaluate(`({ mark: document.querySelector('.a5-tabs-viewas').textContent, dot: document.querySelector('[data-a5-tabs] > .a5-tabs-dot').hidden, path: location.pathname })`)
+    check('browser: the mark names the group, no dot', vm.mark === X.seeing && vm.dot === true && vm.path === '/tab-a/page', vm)
+    if (SHOTS) await v.shot(SHOTS + '/vendo_como_morador.png')
+    await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
+    await v.waitFor(`!!document.querySelector('[role=menu]')`)
+    const vn2 = await v.evaluate(`[...document.querySelectorAll('[role=menuitem] .a5-tabs-name')].map((x) => x.textContent)`)
+    check('browser: as a resident: back on top, then Tab A, the other view and Conta', vn2.join() === [X.back, 'Tab A', X.screens, X.conta].join(), vn2)
+    if (SHOTS) await v.shot(SHOTS + '/menu_morador.png')
+    await v.evaluate(`document.querySelector('.a5-tabs-backdrop').click()`)
+    await v.go('/conta/')
+    await v.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
+    const vc = await v.evaluate(`({ house: !!document.querySelector('.index a.row[href="#pessoas"]'), mark: !document.querySelector('.a5-tabs-viewas').hidden })`)
+    check('browser: account page as a resident: no people and groups, mark on', !vc.house && vc.mark, vc)
+    if (SHOTS) await v.shot(SHOTS + '/conta_como_morador.png')
+    await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
+    await v.waitFor(`!!document.querySelector('[role=menu]')`)
+    await v.evaluate(`document.querySelector('[role=menuitem]').click()`)
+    check('browser: back to the owner mode brings the owner back on the same page', await v.waitFor(`${ON} && location.pathname === '/conta/' && document.querySelector('.a5-tabs-viewas').hidden && !!document.querySelector('.index a.row[href="#pessoas"]')`, 5000))
+    check('browser: no error while seeing as', !v.log.some((x) => /Content Security Policy|exception/i.test(x)), v.log)
 
     // signed out: "/" and /conta/ show the sign-in page, title without a selector
     const a = await page(b, base, null)

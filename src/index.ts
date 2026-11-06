@@ -105,6 +105,9 @@ interface Group { id: string; name: string; tabs: string; is_admin: number }
 interface Who {
   person: Person; sessionId: number; sessionCreatedAt: string; kind: 'browser' | 'screen'; groups: Group[]; admin: boolean; tabs: Set<string>
   passkeyAt: string | null; refreshCookie: string | null; commandsOkAt: string | null
+  // "see as": an admin session shown as one non-admin group. groups, admin and tabs above are
+  // then that group's; realAdmin keeps what the person really is (only to leave the mode).
+  realAdmin: boolean; viewAs: { id: string; name: string } | null
 }
 
 class HttpError extends Error {
@@ -266,7 +269,7 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
   const token = cookieValue(req, COOKIE)
   if (!token || token.length < 40) return null
   const s = await env.DB.prepare(
-    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.commands_ok_at, p.* FROM sessions s JOIN people p ON p.id = s.person_id
+    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.commands_ok_at, s.view_as, p.* FROM sessions s JOIN people p ON p.id = s.person_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
   ).bind(await sha256(token), now()).first<Row>()
   if (!s || s.status !== 'active') return null
@@ -278,12 +281,20 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
     refreshCookie = sessionCookie(token, kind)
   }
   const person: Person = { id: Number(s.id), name: String(s.name), phone: String(s.phone), status: String(s.status), kind: String(s.kind) }
-  const groups = await groupsOf(env, person.id)
+  const real = await groupsOf(env, person.id)
   // a screen account is never an admin, whatever its groups say
-  const admin = kind === 'browser' && person.kind !== 'screen' && groups.some((g) => g.is_admin)
+  const realAdmin = kind === 'browser' && person.kind !== 'screen' && real.some((g) => g.is_admin)
+  // "see as" only ever narrows: kept only while the person is an admin and the group is not one
+  let view: Group | null = null
+  if (realAdmin && s.view_as) {
+    const g = await env.DB.prepare('SELECT * FROM groups WHERE id = ?').bind(String(s.view_as)).first<Group>()
+    if (g && !g.is_admin) view = g
+  }
+  const groups = view ? [view] : real
   return {
-    person, sessionId: Number(s.sid), sessionCreatedAt: String(s.screated), kind, groups, admin, tabs: tabsOf(groups),
+    person, sessionId: Number(s.sid), sessionCreatedAt: String(s.screated), kind, groups, admin: realAdmin && !view, tabs: tabsOf(groups),
     passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie, commandsOkAt: (s.commands_ok_at as string | null) ?? null,
+    realAdmin, viewAs: view ? { id: view.id, name: view.name } : null,
   }
 }
 
@@ -795,6 +806,7 @@ async function me(env: Env, who: Who) {
     person: { id: who.person.id, name: who.person.name },
     groups: who.groups.map((g) => ({ id: g.id, name: g.name })),
     admin: who.admin,
+    view_as: who.viewAs,
     tabs: who.tabs.has('*') ? Object.keys(tabBindings(env)) : [...who.tabs],
     all_tabs: who.admin ? Object.keys(tabBindings(env)) : [],
     screen_tabs: who.admin ? Object.keys(tabBindings(env)).filter((t) => policyOf(t).credentials.includes('screen')) : [],
@@ -1088,7 +1100,7 @@ function visibleTabs(env: Env, who: Who): string[] {
 const badgeCache = new Map<string, { at: number; count: number | null }>()
 
 async function badgeOf(env: Env, who: Who, tab: string): Promise<number | null> {
-  const key = `${who.person.id}:${tab}`
+  const key = `${who.person.id}:${who.viewAs?.id ?? ''}:${tab}`
   const hit = badgeCache.get(key)
   if (hit && Date.now() - hit.at < BADGE_CACHE_MS) return hit.count
   let count: number | null = null
@@ -1115,8 +1127,9 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
   const tabs = visibleTabs(env, who)
   // fixed screens get no selector; the list is still there so "/" knows where to go
   const selector = who.kind === 'browser'
-  // the dot only makes sense with more than one tab besides the account
-  const withBadges = selector && tabs.length > 1
+  // the dot only makes sense with more than one tab besides the account; none while seeing as
+  // someone else (the counts would still be the admin's own)
+  const withBadges = selector && tabs.length > 1 && !who.viewAs
   const badges = withBadges ? await Promise.all(tabs.map((t) => badgeOf(env, who, t))) : tabs.map(() => null)
   const cur = url.searchParams.get('current')
   return {
@@ -1127,7 +1140,43 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
       return { id: t, path: `/${t}/`, label: c?.label ?? null, icon: c?.icon ?? null, badge: badges[i], entry: policyOf(t).entry }
     }),
     account: { id: 'conta', path: ACCOUNT_PATH },
+    view_as: who.viewAs,
+    view_options: selector && who.realAdmin ? await viewOptions(env) : [],
   }
+}
+
+// Groups an admin can see the portal as: every group that is not an admin group (a few rows).
+async function viewOptions(env: Env): Promise<{ id: string; name: string }[]> {
+  const r = await env.DB.prepare('SELECT id, name FROM groups WHERE is_admin = 0 ORDER BY id').all<{ id: string; name: string }>()
+  return r.results
+}
+
+// POST /api/tabs {"view_as": "<group>" | null}: an admin browser session shows itself as one
+// non-admin group, on this device only, or comes back. It goes through /api/tabs because that is
+// the one portal path the tab pages may call (their CSP), and the selector lives in them too.
+// Neither way asks for anything: the mode only takes power away, and coming back gives this
+// session what it already had. Never for screens or non-admins.
+async function setViewAs(env: Env, req: Request, who: Who, url: URL) {
+  if (who.kind !== 'browser' || !who.realAdmin) throw new HttpError(403, 'admin_only')
+  const b = await body(req)
+  if (!('view_as' in b)) throw new HttpError(400, 'bad_value')
+  const was = who.viewAs?.id ?? null
+  let next: string | null = null
+  if (b.view_as !== null) {
+    if (typeof b.view_as !== 'string' || !/^[a-z][a-z0-9-]{0,30}$/.test(b.view_as)) throw new HttpError(400, 'bad_value')
+    const g = await env.DB.prepare('SELECT id, is_admin FROM groups WHERE id = ?').bind(b.view_as).first<Row>()
+    if (!g) throw new HttpError(404, 'group_not_found')
+    if (g.is_admin) throw new HttpError(400, 'view_as_admin_group')
+    next = String(g.id)
+  }
+  if (next !== was) {
+    await env.DB.prepare('UPDATE sessions SET view_as = ? WHERE id = ?').bind(next, who.sessionId).run()
+    if (was) await audit(env, req, { who, action: 'view_as_off', target: was })
+    if (next) await audit(env, req, { who, action: 'view_as_on', target: next })
+  }
+  const after = await currentSession(req, env)
+  if (!after) throw new HttpError(401, 'signed_out')
+  return tabsMenu(env, after, url)
 }
 
 // The account tab is a portal page: the same index.html, with the portal's own headers.
@@ -1241,7 +1290,8 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   const why = refusal(tab, action, spec, caller)
   if (why) return refuse(403, why)
   // a borrowed WhatsApp sign-in cannot act at once (Security B4c)
-  if (c.who && c.who.kind === 'browser' && !c.who.admin && !c.who.commandsOkAt &&
+  // (an admin seeing as a resident is still the admin's own device: no hold)
+  if (c.who && c.who.kind === 'browser' && !c.who.realAdmin && !c.who.commandsOkAt &&
     Date.now() - Date.parse(c.who.sessionCreatedAt) < DEVICE_COMMAND_HOLD_MS) return refuse(403, 'device_too_new')
   if (await commandsOff(env)) return refuse(503, 'commands_off')
 
@@ -1858,10 +1908,15 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
     if (path === '/api/me' && m === 'GET') return out(await me(env, who))
     if (path === '/api/tabs' && m === 'GET') return out(await tabsMenu(env, who, url))
+    if (path === '/api/tabs' && m === 'POST') return out(await setViewAs(env, req, who, url))
     if (path === '/api/me/devices' && m === 'GET') return out(await myDevices(env, who))
     if ((mm = path.match(/^\/api\/me\/devices\/(\d+)$/)) && m === 'DELETE') {
       // an admin weak session must not be able to kick the owner's real devices out
-      if (who.admin && Number(mm[1]) !== who.sessionId) requireStrongAdmin(who)
+      if (who.realAdmin && Number(mm[1]) !== who.sessionId) {
+        // seeing as a resident never skips the admin's own rule: come back first
+        if (who.viewAs) throw new HttpError(403, 'view_as_active')
+        requireStrongAdmin(who)
+      }
       await revokeSession(env, req, who, Number(mm[1]), false)
       return out({ ok: true })
     }

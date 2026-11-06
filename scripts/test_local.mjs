@@ -485,7 +485,7 @@ check('tabs told when a group loses a tab', revAfter.length > revBefore && revAf
 
 // shell v2: /api/tabs, badge, the account page and the shared selector files
 check('/api/tabs signed out = 401', (await anon.req('GET', '/api/tabs')).status === 401)
-check('/api/tabs is GET only', (await owner.req('POST', '/api/tabs', {})).status === 404)
+check('/api/tabs POST takes only view_as', (await owner.req('POST', '/api/tabs', {})).status === 400 && (await owner.req('PUT', '/api/tabs', {})).status === 404)
 const t0 = Date.now()
 const ot = await owner.req('GET', '/api/tabs?current=tab-a')
 const took = Date.now() - t0
@@ -722,6 +722,68 @@ await tv3.req('POST', '/api/pair/status', { secret: ps3.data.secret })
 check('screen for the browser test paired', !!tv3.cookie)
 await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie,
   approve: async (code) => check('browser pairing approved', (await owner.req('POST', '/api/admin/pair', { code, name: 'TV deep link' })).status === 200) })
+
+// ------------------------------------------------------------------ "see as" (an admin sees the portal as another group)
+{
+  const ot0 = (await owner.req('GET', '/api/tabs')).data
+  check('see as: owner gets the non-admin groups to see as, nobody else', ot0.view_as === null &&
+    ot0.view_options.map((g) => g.id).join() === 'owner-screens,residents' &&
+    (await resident.req('GET', '/api/tabs')).data.view_options.length === 0 && (await tv3.req('GET', '/api/tabs')).data.view_options.length === 0, ot0)
+  check('see as: a resident cannot turn it on', (await resident.req('POST', '/api/tabs', { view_as: 'residents' })).status === 403)
+  check('see as: a screen cannot turn it on', (await tv3.req('POST', '/api/tabs', { view_as: 'residents' })).status === 403)
+  check('see as: never an admin group', (await owner.req('POST', '/api/tabs', { view_as: 'owner' })).data.error === 'view_as_admin_group')
+  check('see as: unknown group = 404', (await owner.req('POST', '/api/tabs', { view_as: 'nobody' })).status === 404)
+  check('see as: bad value = 400', (await owner.req('POST', '/api/tabs', { view_as: 7 })).status === 400 && (await owner.req('POST', '/api/tabs', { view_as: 'Bad Id' })).status === 400)
+  check('see as: needs X-Portal and the same origin', (await owner.req('POST', '/api/tabs', { view_as: 'residents' }, { 'X-Portal': undefined })).status === 403 &&
+    (await owner.req('POST', '/api/tabs', { view_as: 'residents' }, { Origin: 'https://evil.example' })).status === 403)
+  check('see as: still the owner after the refusals', (await owner.req('GET', '/api/me')).data.admin === true)
+
+  const on = await owner.req('POST', '/api/tabs?current=tab-b', { view_as: 'residents' })
+  check('see as on: answers the new list (Tab A only), current tab-b no longer listed', on.status === 200 && on.data.view_as?.id === 'residents' &&
+    on.data.tabs.map((t) => t.id).join() === 'tab-a' && on.data.current === null && on.data.view_options.length === 2, on.data)
+  const vme = (await owner.req('GET', '/api/me')).data
+  check('see as: /api/me is a resident, same person', vme.admin === false && vme.groups.map((g) => g.id).join() === 'residents' && vme.tabs.join() === 'tab-a' &&
+    vme.person.id === ownerId && vme.view_as?.id === 'residents' && vme.alerts.length === 0 && vme.commands_off === undefined && vme.passkeys === 0, vme)
+  check('see as: no counts in the list', (await owner.req('GET', '/api/tabs')).data.tabs.every((t) => t.badge === null))
+  check('see as: account admin pages = 403', (await owner.req('GET', '/api/admin/people')).status === 403 && (await owner.req('GET', '/api/admin/audit')).status === 403 &&
+    (await owner.req('GET', '/api/me/shortcuts')).status === 403)
+  check('see as: admin write refused even with a fresh passkey', (await owner.req('POST', '/api/admin/people', { name: 'X', phone: '5561900000099' })).status === 403)
+  check('see as: tab outside the group = 403', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 403 && (await navigate(owner, '/tab-b/')).status === 403 &&
+    (await owner.req('GET', '/tab-slow/echo', undefined, CORS)).status === 403)
+  const vid = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
+  check('see as: the tab gets a resident identity (groups, common actions only)', vid.person === ownerId && vid.groups.join() === 'residents' &&
+    vid.actions.join() === 'tv,ac,light,slow,boom', vid)
+  const vp = await cmd(owner, 'tab-a', 'presence', { state: 'home' })
+  check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
+  check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')
+  const vl = await cmd(owner, 'tab-a', 'light')
+  check('see as: common command goes through (no new-device hold for the admin\'s own device)', vl.status === 200 && vl.data.status === 'done', vl)
+  check('see as: cannot disconnect another of the owner\'s devices', (await owner.req('DELETE', "/api/me/devices/999999")).data.error === 'view_as_active')
+  check('see as: no passkey registration', (await owner.req('POST', '/api/passkey/create/options', {})).status === 403)
+  const sw = await owner.req('POST', '/api/tabs', { view_as: 'owner-screens' })
+  check('see as: switch to another group', sw.status === 200 && sw.data.view_as?.id === 'owner-screens', sw.data)
+
+  const off = await owner.req('POST', '/api/tabs', { view_as: null })
+  check('see as off: back to the owner without asking anything', off.status === 200 && off.data.view_as === null && off.data.tabs.length === 4 && (await owner.req('GET', '/api/me')).data.admin === true, off.data)
+  check('see as off twice: no-op', (await owner.req('POST', '/api/tabs', { view_as: null })).status === 200)
+  check('see as off: admin pages back', (await owner.req('GET', '/api/admin/people')).status === 200)
+  const va = (await owner.req('GET', '/api/admin/audit')).data
+  check('audit: view_as_on and view_as_off with the group', va.some((a) => a.action === 'view_as_on' && a.target === 'residents') &&
+    va.some((a) => a.action === 'view_as_off' && a.target === 'residents') && va.some((a) => a.action === 'view_as_on' && a.target === 'owner-screens'), va.slice(0, 6))
+  // an admin group set behind the portal's back is ignored (never more than the session has)
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--command',
+    `UPDATE sessions SET view_as = 'residents' WHERE id = ${me.session_id}`], { stdio: 'ignore' })
+  const forced = (await owner.req('GET', '/api/me')).data
+  check('see as: stored on the session (this device only)', forced.view_as?.id === 'residents' && forced.session_id === me.session_id, forced)
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--command',
+    `UPDATE sessions SET view_as = 'owner' WHERE id = ${me.session_id}`], { stdio: 'ignore' })
+  check('see as: an admin group in the row is ignored', (await owner.req('GET', '/api/me')).data.view_as === null)
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--command',
+    `UPDATE sessions SET view_as = 'residents' WHERE person_id = ${residentId}`], { stdio: 'ignore' })
+  const rv = (await resident.req('GET', '/api/me')).data
+  check('see as: ignored for a non-admin', rv.view_as === null && rv.tabs.join() === 'tab-a', rv)
+  await owner.req('POST', '/api/tabs', { view_as: null })
+}
 
 // ------------------------------------------------------------------ house agents (pa5_adm_, D11/D12)
 { // own scope: these names must not clash with the rest of the battery
