@@ -44,6 +44,14 @@ if [ -s "$LIVE_TABS" ] && ! cmp -s "$LIVE_TABS" .tabs.local.json; then
 import json, sys
 old, new = (json.load(open(f)) for f in sys.argv[1:3])
 LEVEL = {"common": 0, "admin": 1, "sensitive": 2}
+import re
+DEFAULT_PER_HOUR = int(re.search(r"DEFAULT_PER_HOUR = (\d+)", open("src/commands.ts").read()).group(1))
+def eff(v, f):
+    # the value the portal applies (src/commands.ts parseSpec), oriented so that bigger = looser
+    if f == "screens": return int(v.get("screens") is True and v.get("level") == "common")
+    if f == "shortcut": return int(v.get("shortcut") is not False and v.get("level") != "sensitive")
+    if f == "perHour": return v.get("perHour") or DEFAULT_PER_HOUR
+    if f == "gap": return -((v.get("gap") or {}).get("seconds") or 0)
 out = []
 for t, o in old.items():
     n = new.get(t)
@@ -57,10 +65,8 @@ for t, o in old.items():
         y = nc.get(c)
         if y is None: out.append(f"{t}/{c} removed"); continue
         if LEVEL.get(y.get("level"), -1) < LEVEL.get(x.get("level"), -1): out.append(f"{t}/{c} level")
-        for f in ("screens", "shortcut"):
-            if y.get(f) and not x.get(f): out.append(f"{t}/{c} {f}")
-        if (y.get("perHour") or 1e9) > (x.get("perHour") or 1e9): out.append(f"{t}/{c} perHour")
-        if ((y.get("gap") or {}).get("seconds") or 0) < ((x.get("gap") or {}).get("seconds") or 0): out.append(f"{t}/{c} gap")
+        for f in ("screens", "shortcut", "perHour", "gap"):
+            if eff(y, f) > eff(x, f): out.append(f"{t}/{c} {f}")
         if json.dumps(y.get("params"), sort_keys=True) != json.dumps(x.get("params"), sort_keys=True): out.append(f"{t}/{c} params")
 print(", ".join(out))
 PY
