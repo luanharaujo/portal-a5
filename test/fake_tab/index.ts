@@ -36,13 +36,13 @@ export class FakeTab extends WorkerEntrypoint {
       // a tab page with its own pull to refresh: the shared one must stay off
       return new Response('<!doctype html><html lang="pt-BR" data-a5-pull="own"><head><meta charset="utf-8"><title>tab</title>' +
         '<link rel="stylesheet" href="/_shell/tabs.css"><script src="/locale/pt-BR.js" defer></script><script src="/_shell/tabs.js" defer></script>' +
-        '</head><body><h1><button type="button" data-a5-tabs>Painel</button></h1><input id="field"><div id="sheet" data-a5-sheet hidden></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+        '</head><body><h1><button type="button" data-a5-tabs>Panel</button></h1><input id="field"><div id="sheet" data-a5-sheet hidden></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
     }
     if (p === '/page') {
       // a tab page using the shared selector, for the browser test
       return new Response('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>tab</title>' +
         '<link rel="stylesheet" href="/_shell/tabs.css"><script src="/locale/pt-BR.js" defer></script><script src="/_shell/tabs.js" defer></script>' +
-        '</head><body><h1><button type="button" data-a5-tabs>Painel</button></h1><p id="probe"></p><input id="field"><div id="sheet" data-a5-sheet hidden></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+        '</head><body><h1><button type="button" data-a5-tabs>Panel</button></h1><p id="probe"></p><input id="field"><div id="sheet" data-a5-sheet hidden></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
     }
     if (p === '/stream') {
       const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('data: one\n\n')); c.close() } })
