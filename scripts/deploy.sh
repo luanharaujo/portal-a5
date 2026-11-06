@@ -17,6 +17,23 @@ git diff --quiet && git diff --cached --quiet && [ -z "$(git status --porcelain 
   || { echo "working tree is not clean; commit first" >&2; exit 1; }
 COMMIT="$(git rev-parse HEAD)"
 
+# Never roll back by accident: every checkout and worktree shares one record (outside the tree)
+# of the commit now live, and a deploy whose HEAD does not contain it is refused. Going back on
+# purpose: PORTAL_A5_ROLLBACK=<that HEAD commit>. Deploys run from the main checkout only.
+[ "$(git rev-parse --git-dir)" = "$(git rev-parse --git-common-dir)" ] \
+  || { echo "deploy from the main checkout, not from a worktree" >&2; exit 1; }
+STATE_DIR="$HOME/Library/Application Support/portal-a5"
+LIVE_FILE="$STATE_DIR/live_commit"
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+if [ -s "$LIVE_FILE" ]; then
+  LIVE="$(head -1 "$LIVE_FILE")"
+  if ! git merge-base --is-ancestor "$LIVE" "$COMMIT" 2>/dev/null && [ "${PORTAL_A5_ROLLBACK:-}" != "$COMMIT" ]; then
+    echo "refused: the live commit ${LIVE:0:7} is not part of HEAD ${COMMIT:0:7}; this would roll the portal back." >&2
+    echo "rebase on it, or roll back on purpose with PORTAL_A5_ROLLBACK=$COMMIT" >&2
+    exit 1
+  fi
+fi
+
 kc() { security find-generic-password -s "$1" -w 2>/dev/null || { echo "missing Keychain item: $1" >&2; exit 1; }; }
 
 export CLOUDFLARE_API_TOKEN="$(kc portal-a5-cloudflare)"
@@ -82,6 +99,7 @@ kc portal-a5-robot-key | grep -q '^pa5_robo_' || { echo "robot key must start wi
 kc portal-a5-robot-key | npx wrangler secret put ROBOT_LOGIN_KEY -c "$CFG" >/dev/null
 kc portal-a5-owner-phone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null
 printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" "$VERSION" >> .deploy/deployed.log
+( umask 077; echo "$COMMIT" > "$LIVE_FILE" )
 
 # 6. live only when the public page, fetched without cache, names the new files and each one
 # served is byte for byte the new one (the edge may take a few seconds)
