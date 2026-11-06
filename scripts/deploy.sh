@@ -34,6 +34,29 @@ if [ -s "$LIVE_FILE" ]; then
   fi
 fi
 
+# The tab config lives outside git, so the commit check does not cover it: compare it with the
+# config now live and refuse when a tab or a command would disappear, unless that is meant
+# (PORTAL_A5_CONFIG_REMOVE=1).
+LIVE_TABS="$STATE_DIR/live_tabs.json"
+if [ -s "$LIVE_TABS" ] && ! cmp -s "$LIVE_TABS" .tabs.local.json; then
+  gone="$(python3 - "$LIVE_TABS" .tabs.local.json <<'PY'
+import json, sys
+old, new = (json.load(open(f)) for f in sys.argv[1:3])
+out = []
+for t, v in old.items():
+    if t not in new: out.append(t); continue
+    for c in (v.get("commands") or {}):
+        if c not in (new[t].get("commands") or {}): out.append(f"{t}/{c}")
+print(" ".join(out))
+PY
+)"
+  echo "tab config differs from the live one"
+  if [ -n "$gone" ] && [ "${PORTAL_A5_CONFIG_REMOVE:-}" != 1 ]; then
+    echo "refused: this config drops $gone; if that is meant, run again with PORTAL_A5_CONFIG_REMOVE=1" >&2
+    exit 1
+  fi
+fi
+
 kc() { security find-generic-password -s "$1" -w 2>/dev/null || { echo "missing Keychain item: $1" >&2; exit 1; }; }
 
 export CLOUDFLARE_API_TOKEN="$(kc portal-a5-cloudflare)"
@@ -90,6 +113,8 @@ ls -1t "$BACKUPS"/portal_a5_*.sql | tail -n +6 | while IFS= read -r old; do /usr
 
 npx wrangler d1 migrations apply portal_a5 --remote -c "$CFG"
 npx wrangler deploy -c "$CFG" | tee .deploy/last_deploy.txt
+# the Worker changed: record what is live now, before anything else can fail
+( umask 077; echo "$COMMIT" > "$LIVE_FILE"; cp .tabs.local.json "$LIVE_TABS" )
 URL="$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' .deploy/last_deploy.txt | head -1)"
 VERSION="$(sed -n 's/.*Current Version ID: *//p' .deploy/last_deploy.txt | head -1)"
 [ -n "$URL" ] && [ -n "$VERSION" ] || { echo "deploy output without URL or version" >&2; exit 1; }
@@ -99,7 +124,6 @@ kc portal-a5-robot-key | grep -q '^pa5_robo_' || { echo "robot key must start wi
 kc portal-a5-robot-key | npx wrangler secret put ROBOT_LOGIN_KEY -c "$CFG" >/dev/null
 kc portal-a5-owner-phone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null
 printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" "$VERSION" >> .deploy/deployed.log
-( umask 077; echo "$COMMIT" > "$LIVE_FILE" )
 
 # 6. live only when the public page, fetched without cache, names the new files and each one
 # served is byte for byte the new one (the edge may take a few seconds)
