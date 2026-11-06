@@ -132,6 +132,13 @@
       document.documentElement.toggleAttribute('data-a5-viewas', !!v)
     }
 
+    // the account's hint lists what this person finds there: admins see more
+    function accountHint() {
+      const h = text().hints || {}
+      const admin = !data.view_as && (data.view_options || []).length > 0
+      return admin ? h[data.account.id] : (h[data.account.id + 'Resident'] || h[data.account.id])
+    }
+
     function entries() {
       const list = []
       if (data.view_as) list.push({ id: '_back', label: text().backToOwner, icon: 'back', view: null, top: true })
@@ -140,7 +147,7 @@
         if (data.view_as && g.id === data.view_as.id) continue
         list.push({ id: '_view:' + g.id, label: text().seeAs ? text().seeAs(groupName(g)) : g.id, icon: 'eye', view: g.id, hint: text().seeAsHint })
       }
-      list.push({ id: data.account.id, path: data.account.path, icon: 'person', badge: null, hint: text().hints && text().hints[data.account.id], account: true })
+      list.push({ id: data.account.id, path: data.account.path, icon: 'person', badge: null, hint: accountHint(), account: true })
       return list
     }
 

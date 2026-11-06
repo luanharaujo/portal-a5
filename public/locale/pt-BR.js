@@ -31,7 +31,7 @@ window.T = {
   // the tab selector (/_shell/tabs.js), also loaded by the tab pages
   shell: {
     tabNames: { conta: 'Conta' }, // the other tabs' names come with the list
-    hints: { conta: 'aparelhos, pessoas, auditoria' },
+    hints: { conta: 'aparelhos, pessoas, auditoria', contaResident: 'aparelhos' },
     passkeyHint: 'Face ID',
     switchTab: 'Trocar de aba',
     menuLabel: 'Abas',

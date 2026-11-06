@@ -292,6 +292,7 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     await v.waitFor(`!!document.querySelector('[role=menu]')`)
     const vn2 = await v.evaluate(`[...document.querySelectorAll('[role=menuitem] .a5-tabs-name')].map((x) => x.textContent)`)
     check('browser: as a resident: back on top, then Tab A, the other view and Conta', vn2.join() === [X.back, 'Tab A', X.screens, X.conta].join(), vn2)
+    check('browser: as a resident the account hint lists devices only', await v.evaluate(`[...document.querySelectorAll('[role=menuitem]')].pop().querySelector('.a5-tabs-hint').textContent === A5_TEXT.shell.hints.contaResident`))
     if (SHOTS) await v.shot(SHOTS + '/menu_morador.png')
     await v.evaluate(`document.querySelector('.a5-tabs-backdrop').click()`)
     await v.go('/conta/')
