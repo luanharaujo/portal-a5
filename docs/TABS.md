@@ -256,7 +256,9 @@ The home-screen app has no reload button, so `tabs.js` reloads the page when a s
 
 ### "See as" (admins)
 
-An admin's list also offers "see as <group>" (`A5_TEXT.shell.seeAs`) for every non-admin group, above the line before Conta. Picking one sends `POST /api/tabs {"view_as": "<group>"}` and, from then on, that session (that device only) is that group and no admin: `/api/tabs`, `/<tab>/*`, the identity every tab gets (`groups`, `actions` with the group's level), commands and the account pages. Nothing to change in a tab: it shows exactly what that group sees. The title carries a "seeing as ..." mark (`seeingAs`) and the list starts with "back to owner mode" (`backToOwner`, sends `{"view_as": null}`). Neither way asks for Face ID: the mode only takes power away. No counts while it is on. Audit: `view_as_on` and `view_as_off`, target the group.
+An admin's list also offers "see as <group>" (`A5_TEXT.shell.seeAs`) for every non-admin group, above the line before Conta. Picking one sends `POST /api/tabs {"view_as": "<group>"}` and, from then on, that session (that device only) is that group and no admin: `/api/tabs`, `/<tab>/*`, the identity every tab gets (`groups`, `actions` with the group's level), commands and the account pages. Nothing to change in a tab: it shows exactly what that group sees. The title carries a "seeing as ..." mark (`seeingAs`) and the list starts with "back to owner mode" (`backToOwner`, sends `{"view_as": null}`). Neither way asks for Face ID: the mode only takes power away. No counts while it is on. Audit: `view_as_on` and `view_as_off`, target the group, and every other audit row written while it is on carries `view_as` in its detail.
+
+"See as" is a view, not a security boundary: the page still runs with the admin's own session, and any script on it can turn the mode off. Never use it to try out a tab you do not trust.
 
 ### `GET /api/tabs`
 

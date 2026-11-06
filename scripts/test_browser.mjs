@@ -119,6 +119,10 @@ const KEYS = { Enter: ['Enter', 'Enter', 13], Escape: ['Escape', 'Escape', 27], 
 export async function browserChecks({ base, check, owner, resident, screen, approve }) {
   if (!existsSync(CHROME)) { console.log('skip browser checks: Chrome not found (set CHROME)'); return }
   const b = await launch()
+  // touch pages run in a Chrome of their own: a touch cut short by a reload leaves that
+  // browser's input stuck, and later pages in it stop loading
+  const spare = []
+  const own = async () => { const x = await launch(); spare.push(x); return x }
   try {
     const ON = `document.querySelector('[data-a5-tabs]')?.dataset.a5TabsOn === '1'`
     const press = (p, k) => p.key(...KEYS[k])
@@ -228,7 +232,7 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
 
     // pull to refresh (touch), from the shell, on a tab page and on the account page
     const SHOTS = process.env.A5_SHOTS
-    const t1 = await page(b, base, owner, { touch: true })
+    const t1 = await page(await own(), base, owner, { touch: true })
     await t1.go('/tab-a/page')
     await t1.waitFor(ON)
     let pr = await pulls(t1)
@@ -254,14 +258,14 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     check('browser: a tab with its own pull (data-a5-pull="own") gets none from the shell', !pr.reloaded && !(await t1.evaluate(`!!document.querySelector('.a5-pull')`)), pr)
     check('browser: no CSP violation or error with pull to refresh', !t1.log.some((x) => /Content Security Policy|exception/i.test(x)), t1.log)
     // a fresh page: a touch cut short by a reload can leave the emulated finger down in this one
-    const t2 = await page(b, base, owner, { touch: true })
+    const t2 = await page(await own(), base, owner, { touch: true })
     await t2.go('/conta/')
     await t2.waitFor(`${ON} && !!document.querySelector('.index .profile')`)
     pr = await pulls(t2)
     check('browser: pull to refresh reloads the account page', pr.ready && pr.reloaded, pr)
     if (SHOTS) { await t2.waitFor(`${ON} && !!document.querySelector('.index .profile')`); await t2.drag(260); await sleep(200); await t2.shot(SHOTS + '/puxar_conta.png'); await t2.lift() }
     if (screen) {
-      const ts = await page(b, base, screen, { touch: true })
+      const ts = await page(await own(), base, screen, { touch: true })
       await ts.go('/tab-a/page')
       await sleep(800)
       pr = await pulls(ts)
@@ -269,7 +273,7 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     }
 
     // "see as": the owner sees the portal as a resident from the selector, and comes back
-    const v = await page(b, base, owner, { touch: true })
+    const v = await page(await own(), base, owner, { touch: true })
     await v.go('/tab-a/page')
     await v.waitFor(ON)
     await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
@@ -306,6 +310,7 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     await a.go('/conta/')
     check('browser: signed out /conta/ shows sign-in, plain title', await a.waitFor(`!!document.querySelector('#phone') && !document.querySelector('[data-a5-tabs]')`))
   } finally {
+    for (const x of spare) x.close()
     b.close()
   }
 }

@@ -758,6 +758,8 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')
   const vl = await cmd(owner, 'tab-a', 'light')
   check('see as: common command goes through (no new-device hold for the admin\'s own device)', vl.status === 200 && vl.data.status === 'done', vl)
+  check('see as: audit rows written in the mode carry view_as', (await (async () => { await owner.req('POST', '/api/tabs', { view_as: null }); const r = (await owner.req('GET', '/api/admin/audit')).data; await owner.req('POST', '/api/tabs', { view_as: 'residents' }); return r })())
+    .some((a) => a.action === 'command' && /"view_as":"residents"/.test(String(a.detail))))
   check('see as: cannot disconnect another of the owner\'s devices', (await owner.req('DELETE', "/api/me/devices/999999")).data.error === 'view_as_active')
   check('see as: no passkey registration', (await owner.req('POST', '/api/passkey/create/options', {})).status === 403)
   const sw = await owner.req('POST', '/api/tabs', { view_as: 'owner-screens' })

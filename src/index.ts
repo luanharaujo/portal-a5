@@ -211,6 +211,9 @@ const strength = (who: Who | null) => (who ? (fresh(who) ? 'strong' : 'weak') : 
 const fresh = (who: Who) => !!who.passkeyAt && Date.now() - Date.parse(who.passkeyAt) < PASSKEY_FRESH_MS
 
 async function audit(env: Env, req: Request | null, a: { who?: Who | null; person?: number | null; strength?: string | null; action: string; target?: string | null; detail?: unknown }) {
+  // anything done while seeing as another group says so (Security R2)
+  const view = a.who?.viewAs?.id
+  if (view) a = { ...a, detail: a.detail != null && typeof a.detail === 'object' && !Array.isArray(a.detail) ? { ...a.detail, view_as: view } : { value: a.detail ?? null, view_as: view } }
   await env.DB.prepare('INSERT INTO audit (at, person_id, session_id, strength, action, target, detail, ip, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .bind(now(), a.person ?? a.who?.person.id ?? null, a.who?.sessionId ?? null, a.strength ?? strength(a.who ?? null), a.action,
       a.target ?? null, a.detail == null ? null : JSON.stringify(a.detail).slice(0, 2000),
