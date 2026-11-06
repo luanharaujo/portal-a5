@@ -634,9 +634,14 @@ function partGroups(top) {
   const label = (t) => (tabLabels[t]) || t
   return [top(T.groups, T.groupsIntro), el('div', { class: 'group' }, D.groups.map((g) => {
     if (g.is_admin) return el('div', { class: 'item' }, line(el('span', { class: 'row-icon sun' }, icon('layers')), groupName(g), T.seesAll))
-    const box = toggles(tabs.map((t) => [t, label(t)]), g.tabs)
-    return el('div', { class: 'item' }, line(el('span', { class: 'row-icon gray' }, icon('layers')), groupName(g), T.groupTabs),
-      el('div', { class: 'more' }, box, btn(T.save, async () => { await api('POST', `/api/admin/groups/${g.id}`, { tabs: picked(box) }); toast(T.saved); await refresh() }, 'btn-sm btn-primary')))
+    // a tab that takes no screen credential: off and not clickable in a screens group, a note in a mixed one
+    const noScreen = (t) => !(ME.screen_tabs || []).includes(t)
+    const box = toggles(tabs.map((t) => [t, label(t)]), g.screens_only ? g.tabs.filter((t) => !noScreen(t)) : g.tabs)
+    if (g.screens_only) for (const b of box.children) if (noScreen(b.dataset.v)) { b.disabled = true; b.title = T.notOnScreens; b.append(el('small', { class: 'toggle-note' }, ' · ' + T.notOnScreens)) }
+    const hidden = g.screens_only ? g.tabs.filter(noScreen) : []
+    const note = g.screens_only ? null : tabs.filter(noScreen).length ? el('small', { class: 'muted toggle-hint' }, T.screensSkip(tabs.filter(noScreen).map(label).join(', '))) : null
+    return el('div', { class: 'item' }, line(el('span', { class: 'row-icon gray' }, icon('layers')), groupName(g), g.screens_only ? T.groupTabsScreens : T.groupTabs),
+      el('div', { class: 'more' }, box, note, hidden.length ? el('small', { class: 'muted toggle-hint' }, T.screensDropped(hidden.map(label).join(', '))) : null, btn(T.save, async () => { await api('POST', `/api/admin/groups/${g.id}`, { tabs: picked(box) }); toast(T.saved); await refresh() }, 'btn-sm btn-primary')))
   }))]
 }
 let tabLabels = {}
@@ -644,7 +649,7 @@ let tabLabels = {}
 function partScreens(top) {
   const paired = el('section', {}, el('span', { class: 'caps' }, T.screens.paired),
     D.screens.length ? el('div', { class: 'group' }, D.screens.map((s) => el('div', { class: 'item' },
-      el('div', { class: 'line' }, screenIcon('screen'), el('span', { class: 'row-text' }, el('b', {}, s.name),
+      el('div', { class: 'line' }, screenIcon('screen'), el('span', { class: 'row-text' }, el('b', {}, s.name, ...(s.groups || []).map((g) => el('span', { class: 'chip ' + (g === 'owner-screens' ? 'sun' : 'gray') + ' group-chip' }, groupName(g)))),
         el('small', { class: 'with-chip' }, s.status === 'blocked' ? null : el('span', { class: 'chip ' + (s.devices ? 'ok' : 'warn') }, s.devices ? T.screens.onAir : T.screens.waitingTag),
           (s.devices ? T.screens.live : T.screens.idle) + (s.status === 'blocked' ? T.blocked : ''))),
         s.status === 'blocked'

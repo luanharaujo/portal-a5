@@ -794,6 +794,18 @@ check('agent: next must be a portal path', (await agentCall('POST', '/_agent/req
   (await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'X', group: 'residents', next: 'https://evil.example/' }, AK)).status === 400)
 await ownerFaceId()
 await owner.req('POST', '/api/admin/groups/owner-screens', { tabs: ['tab-a'] })
+{
+  const nope = await owner.req('POST', '/api/admin/groups/owner-screens', { tabs: ['tab-a', 'tab-b'] })
+  check('screens group refuses a tab that takes no screen', nope.status === 409 && nope.data.error === 'tab_not_for_screens', nope.data)
+  check('screens group refuses a tab that does not exist', (await owner.req('POST', '/api/admin/groups/owner-screens', { tabs: ['tab-gone'] })).status === 409)
+  check('mixed group still takes a browser-only tab', (await owner.req('POST', '/api/admin/groups/residents', { tabs: ['tab-a', 'tab-b'] })).status === 200)
+  await owner.req('POST', '/api/admin/groups/residents', { tabs: ['tab-a'] })
+  const gl = (await owner.req('GET', '/api/admin/groups')).data
+  check('a refused save leaves the screens group as it was', JSON.stringify(gl.find((g) => g.id === 'owner-screens').tabs) === '["tab-a"]', gl)
+  check('groups say which are for screens', gl.find((g) => g.id === 'owner-screens').screens_only === true && gl.find((g) => g.id === 'residents').screens_only === false, gl)
+  const m = (await owner.req('GET', '/api/me')).data
+  check('me lists the tabs that open on screens', m.screen_tabs.includes('tab-a') && !m.screen_tabs.includes('tab-b'), m.screen_tabs)
+}
 const pr = await agentCall('POST', '/_agent/requests', { kind: 'pair', name: 'Bedroom <b>monitor</b>', group: 'owner-screens', next: '/tab-a/?view=landscape' }, AK)
 check('agent prepares a pairing', pr.status === 201 && /\/#screen_ticket=[A-Za-z0-9_-]{32}$/.test(pr.data.screen_url) && /\/conta\/\?agent_request=\d+$/.test(pr.data.approve_url) && !/[<>]/.test(pr.data.name), pr.data)
 const ticket = new URL(pr.data.screen_url).hash.slice(1).replace(/^screen_ticket=/, '')

@@ -72,6 +72,8 @@ const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' // no 0/O/1/I/L
 const LOGIN_PHRASE = 'Entrar no Portal A5: '
 const ROBOT_KEY_PREFIX = 'pa5_robo_'
 const OWNER_GROUP = 'owner'
+// groups made only for screens: a tab whose policy takes no screen credential can't be put there
+const SCREEN_GROUPS = new Set(['owner-screens'])
 // commands (docs/COMMANDS.md)
 const COMMAND_TTL_MS = 60e3
 const COMMAND_WAIT_MS = 8e3
@@ -795,6 +797,7 @@ async function me(env: Env, who: Who) {
     admin: who.admin,
     tabs: who.tabs.has('*') ? Object.keys(tabBindings(env)) : [...who.tabs],
     all_tabs: who.admin ? Object.keys(tabBindings(env)) : [],
+    screen_tabs: who.admin ? Object.keys(tabBindings(env)).filter((t) => policyOf(t).credentials.includes('screen')) : [],
     session_id: who.sessionId,
     credential: who.kind,
     strong: fresh(who),
@@ -908,7 +911,7 @@ async function editPerson(env: Env, req: Request, who: Who, id: number) {
 
 async function listGroups(env: Env) {
   const r = await env.DB.prepare('SELECT id, name, tabs, is_admin FROM groups ORDER BY is_admin DESC, id').all<Row>()
-  return r.results.map((g) => ({ ...g, tabs: JSON.parse(String(g.tabs)) }))
+  return r.results.map((g) => ({ ...g, tabs: JSON.parse(String(g.tabs)), screens_only: SCREEN_GROUPS.has(String(g.id)) }))
 }
 
 async function editGroup(env: Env, req: Request, who: Who, id: string) {
@@ -918,6 +921,8 @@ async function editGroup(env: Env, req: Request, who: Who, id: string) {
   const tabs = [...new Set(b.tabs.map((t) => String(t).toLowerCase()).filter((t) => /^[a-z][a-z0-9-]{0,30}$/.test(t)))]
   const before = await env.DB.prepare('SELECT tabs FROM groups WHERE id = ?').bind(id).first<{ tabs: string }>()
   if (!before) throw new HttpError(404, 'group_not_found')
+  // fail closed: in a screens group every tab must be one that opens on a screen
+  if (SCREEN_GROUPS.has(id) && tabs.some((t) => !policyOf(t).credentials.includes('screen'))) throw new HttpError(409, 'tab_not_for_screens')
   await env.DB.prepare('UPDATE groups SET tabs = ? WHERE id = ?').bind(JSON.stringify(tabs), id).run()
   let old: string[] = []
   try { old = JSON.parse(before.tabs) } catch { /* bad JSON = no tabs */ }
