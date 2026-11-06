@@ -555,7 +555,13 @@ async function loginStatus(req: Request, env: Env) {
   const state = String(c.state)
   if (state === 'used' || state === 'refused') return json({ status: state })
   if (String(c.expires_at) < now()) return json({ status: 'expired' })
-  if (state === 'waiting' || state === 'pending') return json({ status: state, expires_at: c.expires_at })
+  if (state === 'waiting') return json({ status: state, expires_at: c.expires_at })
+  if (state === 'pending') {
+    // why the owner must decide, said only from what this visitor already knows (the number typed
+    // and the number they sent from): never whether some other number is registered
+    const lr = await env.DB.prepare('SELECT sender_phone FROM link_requests WHERE code_id = ?').bind(c.id).first<Row>()
+    return json({ status: state, expires_at: c.expires_at, why: lr && lr.sender_phone === c.typed_phone ? 'new_number' : 'other_number' })
+  }
   // confirmed: burn the code and hand out the session exactly once
   const r = await env.DB.prepare(`UPDATE login_codes SET state = 'used' WHERE id = ? AND state = 'confirmed'`).bind(c.id).run()
   if (!r.meta.changes) return json({ status: 'used' })
@@ -864,10 +870,19 @@ async function listPeople(env: Env) {
   }))
 }
 
+// fail closed: a person (not a screen) never goes into a group made only for screens
+function noScreenGroups(groups: unknown) {
+  if (Array.isArray(groups) && groups.some((g) => SCREEN_GROUPS.has(String(g)))) throw new HttpError(409, 'group_for_screens')
+}
+
 async function setGroups(env: Env, personId: number, groups: unknown) {
   if (!Array.isArray(groups)) return
   const valid = (await env.DB.prepare('SELECT id FROM groups').all<{ id: string }>()).results.map((g) => g.id)
   const wanted = [...new Set(groups.map(String))].filter((g) => valid.includes(g))
+  if (wanted.some((g) => SCREEN_GROUPS.has(g))) {
+    const p = await env.DB.prepare('SELECT kind FROM people WHERE id = ?').bind(personId).first<Row>()
+    if (p?.kind !== 'screen') throw new HttpError(409, 'group_for_screens')
+  }
   await env.DB.batch([
     env.DB.prepare('DELETE FROM person_groups WHERE person_id = ?').bind(personId),
     ...wanted.map((g) => env.DB.prepare('INSERT INTO person_groups (person_id, group_id) VALUES (?, ?)').bind(personId, g)),
@@ -887,6 +902,7 @@ async function addPerson(env: Env, req: Request, who: Who) {
   const name = text(b.name, 40)
   const phone = normalizePhone(b.phone)
   if (!name || !phone) throw new HttpError(400, 'name_and_number')
+  noScreenGroups(b.groups)
   const p = await env.DB.prepare(`INSERT INTO people (name, phone, status, created_by) VALUES (?, ?, 'active', ?) ON CONFLICT (phone) DO NOTHING RETURNING id`)
     .bind(name, phone, who.person.id).first<{ id: number }>()
   if (!p) throw new HttpError(409, 'number_taken')
@@ -902,6 +918,7 @@ async function editPerson(env: Env, req: Request, who: Who, id: number) {
   await guardOwner(env, id, { status, groups: b.groups })
   const exists = await env.DB.prepare('SELECT id, kind FROM people WHERE id = ?').bind(id).first<Row>()
   if (!exists) throw new HttpError(404, 'person_not_found')
+  if (exists.kind !== 'screen') noScreenGroups(b.groups)
   if (exists.kind === 'screen' && Array.isArray(b.groups)) {
     const admins = (await env.DB.prepare('SELECT id FROM groups WHERE is_admin = 1').all<{ id: string }>()).results.map((g) => g.id)
     if (b.groups.some((g) => admins.includes(String(g)))) throw new HttpError(409, 'screen_not_admin')
@@ -958,7 +975,10 @@ async function listRequests(env: Env) {
        FROM link_requests r LEFT JOIN people s ON s.id = r.sender_person_id LEFT JOIN login_codes c ON c.id = r.code_id
       WHERE r.state = 'pending' ORDER BY r.id`,
   ).all<Row>()
-  return r.results.map((x) => ({ ...x, code_valid: x.code_state === 'pending' && String(x.code_expires_at ?? '') > now() }))
+  // new_number: unknown sender who typed their own number; other_number: a known person typed another
+  // number; new_other: unknown sender who typed another number
+  const why = (x: Row) => x.sender_person_id ? 'other_number' : x.typed_phone === x.sender_phone ? 'new_number' : 'new_other'
+  return r.results.map((x) => ({ ...x, why: why(x), code_valid: x.code_state === 'pending' && String(x.code_expires_at ?? '') > now() }))
 }
 
 // Approving signs the waiting tab in as the SENDER (the number WhatsApp proved), creating that
@@ -980,6 +1000,7 @@ async function resolveRequest(env: Env, req: Request, who: Who, id: number, acti
   if (!person) {
     const name = text(b.name, 40)
     if (!name) throw new HttpError(400, 'name_required')
+    noScreenGroups(b.groups)
     person = await env.DB.prepare(`INSERT INTO people (name, phone, status, created_by) VALUES (?, ?, 'active', ?) RETURNING *`)
       .bind(name, r.sender_phone, who.person.id).first<Person>()
     await setGroups(env, person!.id, b.groups ?? [])

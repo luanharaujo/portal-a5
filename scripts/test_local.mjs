@@ -212,6 +212,22 @@ check('pending tab has no cookie', !victimTab.cookie)
 const reqs = (await owner.req('GET', '/api/admin/requests')).data
 const pend = reqs.find((x) => x.sender_phone === STRANGER)
 check('request listed with sender number', !!pend && pend.typed_phone === RESIDENT, reqs)
+check('request says why: new number, other than the one typed', pend.why === 'new_other', pend)
+check('visitor told: other number', mm.status.data.why === 'other_number', mm.status.data)
+check('a person is never approved into a screens group', (await owner.req('POST', `/api/admin/requests/${pend.id}/approve`, { name: 'Visitor', groups: ['owner-screens'] })).status === 409)
+{
+  const NEWNUM = '5561900000021'
+  const nn = await signIn(client(), NEWNUM, NEWNUM)
+  check('new number typed and sent: visitor told it is new', nn.status.data.status === 'pending' && nn.status.data.why === 'new_number', nn.status.data)
+  const nr = (await owner.req('GET', '/api/admin/requests')).data.find((x) => x.sender_phone === NEWNUM)
+  check('request says why: new number', nr?.why === 'new_number', nr)
+  await owner.req('POST', `/api/admin/requests/${nr.id}/refuse`, {})
+  check('a person is never added to a screens group', (await owner.req('POST', '/api/admin/people', { name: 'X', phone: '5561900000022', groups: ['residents', 'owner-screens'] })).status === 409 &&
+    !(await owner.req('GET', '/api/admin/people')).data.some((x) => x.phone === '5561900000022'))
+  const rid = (await owner.req('GET', '/api/admin/people')).data.find((x) => x.phone === RESIDENT).id
+  const eg = await owner.req('POST', `/api/admin/people/${rid}`, { groups: ['owner-screens'] })
+  check('a person is never moved to a screens group', eg.status === 409 && eg.data.error === 'group_for_screens', eg.data)
+}
 const ap = await owner.req('POST', `/api/admin/requests/${pend.id}/approve`, { name: 'Visitor', groups: ['residents'] })
 check('approve ok', ap.status === 200 && ap.data.code_valid === true, ap.data)
 const after = await victimTab.req('POST', '/api/login/status', { secret: mm.start.data.secret })

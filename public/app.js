@@ -276,13 +276,14 @@ async function askCode(phone) {
     backLink(T.back, backToStart),
   ])
   let pendingShown = false
+  let pendingWhy = ''
   const pendingView = () => {
     pendingShown = true
     st = status(T.status.waitingApproval, true)
     cover([
       steps(3),
       el('h1', {}, T.pendingTitle),
-      el('div', { class: 'notice' }, icon('hourglass'), el('div', {}, el('b', {}, T.pendingHead), T.status.pending)),
+      el('div', { class: 'notice' }, icon('hourglass'), el('div', {}, el('b', {}, T.pendingHead), T.status.pendingWhy[pendingWhy] || T.status.pending)),
       st,
       backLink(T.back, backToStart),
     ])
@@ -291,7 +292,7 @@ async function askCode(phone) {
     let s
     try { s = await rawApi('POST', '/api/login/status', { secret: r.secret, mode: MODE }) } catch (e) { const n = status(e.message); st.replaceWith(n); st = n; return }
     if (s.status === 'ok') { const n = nextPath(); if (n) location.href = n; else start(); return }
-    if (s.status === 'pending' && !pendingShown) pendingView()
+    if (s.status === 'pending' && !pendingShown) { pendingWhy = s.why || ''; pendingView() }
     else if (s.status !== 'waiting' && s.status !== 'pending') { const n = status(T.status[s.status] || s.status); st.replaceWith(n); st = n }
     if (s.status === 'waiting' || s.status === 'pending') pollTimer = setTimeout(poll, 2000)
   }
@@ -575,7 +576,8 @@ function partFaceId(top) {
       btn(ME.passkeys ? T.addAnotherPasskey : T.addPasskeyHere, add, ME.passkeys ? 'btn-block' : 'btn-primary btn-block', 'plus'))]
 }
 
-const groupOptions = () => D.groups.map((g) => [g.id, groupName(g)])
+// people pick from the groups for people: groups made only for screens never show up here
+const groupOptions = () => D.groups.filter((g) => !g.screens_only).map((g) => [g.id, groupName(g)])
 
 function partRequests(top) {
   return [top(T.requests, T.requestsIntro), D.requests.length ? el('div', { class: 'group' }, D.requests.map((r) => {
@@ -583,6 +585,7 @@ function partRequests(top) {
     const gs = toggles(groupOptions(), ['residents'])
     return el('div', { class: 'item' },
       line(avatar(r.sender_known_as || '?', r.id), fmtPhone(r.sender_phone) + (r.sender_known_as ? ` (${r.sender_known_as})` : ''), T.reqLine(fmtPhone(r.typed_phone), r.device || '', shortWhen(r.created_at), r.code_valid)),
+      el('div', { class: 'more' }, el('span', { class: 'chip ' + (r.why === 'new_number' ? 'ok' : 'warn') }, T.reqWhy[r.why] || r.why)),
       r.sender_person_id ? null : el('div', { class: 'edit' }, field(T.name, name), el('span', { class: 'caps' }, T.groups), gs),
       el('div', { class: 'btn-row' },
         btn(T.approve, async () => { await api('POST', `/api/admin/requests/${r.id}/approve`, { name: name.value, groups: picked(gs) }); await refresh() }, 'btn-sm btn-primary', 'check'),
