@@ -27,7 +27,7 @@ button[data-a5-tabs] {
 .a5-tabs-title > * + * { margin-left: .3em; }
 .a5-tabs-title:focus { outline: none; }
 .a5-tabs-title:focus-visible { outline: 2px solid var(--a5t-check); outline-offset: 3px; }
-.a5-tabs-arrow { width: .8em; height: .8em; flex: none; }
+.a5-tabs-arrow { width: .8em; height: .8em; flex: none; margin-left: .3em; } /* the title is often a bare text node */
 .a5-tabs-arrow path { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .a5-tabs-title[aria-expanded="true"] .a5-tabs-arrow { transform: rotate(180deg); }
 .a5-tabs-dot {
