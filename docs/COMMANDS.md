@@ -55,7 +55,7 @@ Action names: `^[a-z][a-z0-9_]{0,39}$`, at most 40 per tab. A malformed action i
 
 On top of the level, the person's groups must still give the tab, at the moment of the command (a key loses an action as soon as its person loses it). Data that only an admin may see (presence) goes in `admin` actions, never `common`.
 
-`identity.actions` (TABS.md section 2) lists the actions this identity may run in the tab, so a page shows only the buttons that will work. It is a hint for the page; the portal checks again on every command. `identity.admin_until` says when this session's window for `admin` actions closes (ISO), or null when it is not open (no recent check, not an admin, a fixed screen, "see as"); a page can ask for Face ID before the tap instead of after a refusal.
+`identity.actions` (TABS.md section 2) lists the actions this identity may run in the tab, so a page shows only the buttons that can work. For an admin's browser session it includes the `admin` actions even while the Face ID window is closed (`admin_until` null): the page shows them and asks for Face ID before sending, and their admin-only readings (presence) are shown too. Never `sensitive` ones without the check, never for a screen, a key or "see as". It is a hint for the page; the portal checks again on every command. `identity.admin_until` says when this session's window for `admin` actions closes (ISO), or null when it is not open (no recent check, not an admin, a fixed screen, "see as"); a page can ask for Face ID before the tap instead of after a refusal.
 
 ### Face ID for an owner's command
 

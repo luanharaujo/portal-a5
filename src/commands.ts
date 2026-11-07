@@ -219,9 +219,14 @@ export function refusal(tab: string, action: string, spec: CommandSpec, c: Calle
   return c.strong ? null : 'passkey_required'
 }
 
-// The actions this caller may run in the tab (sent to the tab as identity.actions).
+// The actions this caller may run in the tab (sent to the tab as identity.actions). An admin's browser session also
+// gets its `admin` actions while the Face ID window is closed (owner's decision, 07/11): the page shows them and asks
+// for Face ID before sending (admin_until); the command itself is still refused with passkey_required until then.
 export const allowedActions = (tab: string, catalog: Catalog, c: Caller): string[] =>
-  Object.keys(catalog).filter((a) => refusal(tab, a, catalog[a], c) === null)
+  Object.keys(catalog).filter((a) => {
+    const why = refusal(tab, a, catalog[a], c)
+    return why === null || (why === 'passkey_required' && catalog[a].level === 'admin' && c.credential === 'browser' && c.admin)
+  })
 
 // Only the declared result fields, and only plain values.
 export function pickReturns(spec: CommandSpec, result: unknown): Record<string, string | number | boolean> | null {

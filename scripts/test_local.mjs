@@ -653,7 +653,9 @@ const setPasskeyAt = (ms) => d1(`UPDATE sessions SET passkey_at = '${new Date(Da
 if (setPasskeyAt(12 * 3600e3 + 60e3)) {
   const old = await cmd(admin3, 'tab-a', 'presence', { state: 'out' })
   check('B2 passkey 12 h 1 min ago: admin action = 403 passkey_required', old.status === 403 && old.data.error === 'passkey_required', old)
-  check('B2 ... and identity.actions leaves it out', !(await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.actions.includes('presence'))
+  const b2id = (await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
+  check('B2 ... but identity.actions still lists it (the page asks for Face ID first), never a sensitive one',
+    b2id.actions.includes('presence') && !b2id.actions.includes('wipe') && b2id.admin_until === null, b2id)
   setPasskeyAt(12 * 3600e3 - 60e3)
   check('B2 passkey 11 h 59 min ago: admin action ok', (await cmd(admin3, 'tab-a', 'presence', { state: 'home' })).status === 200)
   check('B2 ... and identity.actions lists it; sensitive still needs 5 min', (await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.actions.includes('presence') &&
