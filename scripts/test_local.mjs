@@ -424,6 +424,7 @@ check('pairing secret single use', (await tv.req('POST', '/api/pair/status', { s
 const tvMe = (await tv.req('GET', '/api/me')).data
 check('screen is a resident, never admin', tvMe.credential === 'screen' && tvMe.admin === false && tvMe.tabs.join() === 'tab-a' && !/[<>]/.test(tvMe.person.name), tvMe)
 const tvEcho = await tv.req('GET', '/tab-a/echo', undefined, CORS)
+check('screen: identity.actions never lists an admin action (no Face ID window on a screen)', !tvEcho.data.identity.actions.includes('presence') && tvEcho.data.identity.admin_until === null, tvEcho.data.identity)
 check('screen identity reaches the tab', tvEcho.status === 200 && tvEcho.data.identity.credential === 'screen' && tvEcho.data.identity.person === ap1.data.screen, tvEcho.data)
 check('screen has no admin access', (await tv.req('GET', '/api/admin/people')).status === 403)
 check('screen cannot register a passkey', (await tv.req('POST', '/api/passkey/create/options', {})).status === 403)
@@ -776,6 +777,8 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   const on = await owner.req('POST', '/api/tabs?current=tab-b', { view_as: 'residents' })
   check('see as on: answers the new list (Tab A only), current tab-b no longer listed', on.status === 200 && on.data.view_as?.id === 'residents' &&
     on.data.tabs.map((t) => t.id).join() === 'tab-a' && on.data.current === null && on.data.view_options.length === 2, on.data)
+  const vEcho = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
+  check('see as: identity.actions never lists an admin action, Face ID window or not', !vEcho.actions.includes('presence') && vEcho.admin_until === null, vEcho)
   const vme = (await owner.req('GET', '/api/me')).data
   check('see as: /api/me is a resident, same person', vme.admin === false && vme.groups.map((g) => g.id).join() === 'residents' && vme.tabs.join() === 'tab-a' &&
     vme.person.id === ownerId && vme.view_as?.id === 'residents' && vme.alerts.length === 0 && vme.commands_off === undefined && vme.passkeys === 0, vme)
