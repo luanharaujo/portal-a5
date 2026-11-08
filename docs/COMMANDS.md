@@ -82,6 +82,17 @@ A tab page cannot run WebAuthn (its CSP). It sends the person to the portal, ful
 
 The portal page asks for Face ID with the purpose `command:<tab>` (browser sessions, not while seeing as: 403 `admin_only`). The tab must exist, be open to the person and have an action with `passkey` (anyone) or an `admin` or `sensitive` one (admins only); a non-admin on a tab without `passkey` actions gets 403 `admin_only`, anything else 400 `bad_purpose`. A person without a passkey gets 409 `no_passkey` and the page says to ask for an invite. The check sets the session's passkey time, which opens the `admin` window (and, for 5 minutes, `sensitive`), audits `command_passkey_ok` with the tab as target and goes back to `next`. "Not now" goes back too. Nothing is resent on the way back: the person taps the command again. A page command refused with `passkey_required` carries that address as `step_up` (`next` = `/<tab>/`) for an admin's browser session, and for anyone's when the action has `passkey`.
 
+### Face ID asked by the tab page itself (preferred)
+
+The page asks Face ID on the tap, with only the system sheet: no portal page, no navigation. Two routes under the tab's own path (the tab CSP already allows them; the portal answers them, the tab Worker never sees them). Both are `POST` with `Origin` = the portal and `X-Portal: 1`, and pass the same gate as any tab request (session, groups, `credentials`, Face ID on entry if the tab has it).
+
+- `POST /<tab>/_passkey/options`, body `{}`: `{challenge, rpId, allowCredentials, userVerification: "required", timeout}` (base64url ids, 5 minutes). Same rules as the step-up above: 403 `admin_only`, 400 `bad_purpose`, 409 `no_passkey`. The tab comes from the path, so a page only ever gets a challenge for its own tab. Asking again replaces the tab's previous one.
+- `POST /<tab>/_passkey/verify`, body `{id, clientDataJSON, authenticatorData, signature}` (base64url): `{ok: true, passkey_until, admin_until}` (the fields of the identity, so the page updates without reloading). It only takes this tab's own challenge (anything else: 400 `challenge_expired`); 400 `unknown_passkey` or a WebAuthn error code (audited `passkey_failed`). Audits `command_passkey_ok`, detail `{via: "tab"}`.
+
+This check opens only the session's command windows (`admin` actions and actions with `passkey`), and only for commands of that same tab. It never makes the session strong: `identity.strong`, `sensitive` actions, other tabs and the account pages still need the portal's own Face ID. Audited with strength `tab_passkey`. Its challenge (`tabcmd:<tab>`, one per tab) lives beside the portal's own: prefetching never drops a Face ID waiting on a portal page, and the portal never accepts a tab's challenge.
+
+Safari on iOS wants `navigator.credentials.get` straight from the tap (a fetch or await in between may lose the gesture). Fetch the options before the tap (when the control shows, again every 4 minutes and when the page becomes visible), call `get` synchronously in the tap handler, then verify, then send the command. Options serve once: fetch new ones after any `get`. On `NotAllowedError` (cancelled) show nothing; just fetch new options. Fall back to `step_up` only when the options fail in an unexpected way.
+
 ## 4. Routes
 
 ### From a tab page

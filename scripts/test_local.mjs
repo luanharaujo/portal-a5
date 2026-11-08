@@ -550,6 +550,8 @@ const freshen = async (c, a) => { const g = await c.req('POST', '/api/passkey/ge
 const cmdLog = async () => (await owner.req('GET', '/tab-a/commands', undefined, CORS)).data
 const cmd = (c, tab, action, params, headers) => c.req('POST', `/${tab}/_cmd/${action}`, params === undefined ? {} : { params }, headers)
 // writes to the local D1 the wrangler dev is serving (scripts/test_local.sh passes STATE)
+let residentAuth = null
+const d1json = (sql) => JSON.parse(execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--json', '--command', sql], { encoding: 'utf8' }))[0].results
 const d1 = (sql) => { try { execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--command', sql], { stdio: 'ignore' }); return true } catch { return false } }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
@@ -764,7 +766,7 @@ check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv
   check('freshen owner (invite)', await freshen(owner, auth))
   check('P5 owner invites the resident', (await owner.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 200)
   check('P5 resident /api/me shows the invite', (await resident.req('GET', '/api/me')).data.passkey_invite === true)
-  const authR = await makeAuthenticator()
+  const authR = residentAuth = await makeAuthenticator()
   const rco = await resident.req('POST', '/api/passkey/create/options', {})
   // R1: another device used the invite between these options and this verify: this one loses
   d1(`UPDATE passkey_invites SET used_at = '${new Date().toISOString()}' WHERE person_id = ${residentId} AND used_at IS NULL`)
@@ -808,6 +810,87 @@ check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv
   const scr = (await owner.req('GET', '/api/admin/people')).data.find((p) => p.kind === 'screen')
   check('P13 no passkey invite for a fixed screen', !scr || (await owner.req('POST', `/api/admin/people/${scr.id}/passkey-invite`, {})).data.error === 'invite_not_allowed')
   check('P14 the screen session cannot register a passkey', (await tvc.req('POST', '/api/passkey/create/options', {})).status === 403)
+}
+
+// Face ID asked by the tab page itself (/<tab>/_passkey/*, 08/11): only the system sheet, no portal page
+{
+  const lim = { on: true, top: 30 }
+  const resSid2 = (await resident.req('GET', '/api/me')).data.session_id
+  const ownSid = (await owner.req('GET', '/api/me')).data.session_id
+  const ago = (ms) => new Date(Date.now() - ms).toISOString()
+  d1(`UPDATE sessions SET passkey_at = '${ago(10 * 60e3)}', command_passkey_at = NULL WHERE id = ${resSid2}`)
+  d1(`UPDATE sessions SET passkey_at = '${ago(13 * 3600e3)}', command_passkey_at = NULL WHERE id = ${ownSid}`)
+  check('T0 owner admin window closed before', (await cmd(owner, 'tab-a', 'presence', { state: 'home' })).data.error === 'passkey_required')
+  check('T1 GET on the tab passkey route = 405', (await resident.req('GET', '/tab-a/_passkey/options', undefined, CORS)).status === 405)
+  check('T1 unknown tab passkey route = 404', (await resident.req('POST', '/tab-a/_passkey/other', {})).status === 404)
+  check('T1 another origin = 403', (await resident.req('POST', '/tab-a/_passkey/options', {}, { Origin: 'https://evil.example' })).status === 403)
+  check('T1 without X-Portal = 403', (await resident.req('POST', '/tab-a/_passkey/options', {}, { 'X-Portal': undefined })).status === 403)
+  check('T1 a tab with no action that needs Face ID = 400 bad_purpose (owner) / 403 admin_only (resident)',
+    (await owner.req('POST', '/tab-badcmd/_passkey/options', {})).status >= 400)
+  const to = await resident.req('POST', '/tab-a/_passkey/options', {})
+  check('T2 resident options from the tab page: challenge for this host', to.status === 200 && to.data.rpId === new URL(BASE).hostname &&
+    to.data.userVerification === 'required' && to.data.allowCredentials.length === 1, to)
+  const purpose = d1json(`SELECT purpose FROM passkey_challenges WHERE session_id = ${resSid2} AND kind = 'get'`)
+  check('T2 the challenge is bound to tabcmd:tab-a', purpose[0]?.purpose === 'tabcmd:tab-a', purpose)
+  const tv = await resident.req('POST', '/tab-a/_passkey/verify', await residentAuth.get(to.data))
+  const pl = tv.status === 200 ? Date.parse(tv.data.passkey_until.limit) - Date.now() : 0
+  check('T3 verify: ok, passkey_until.limit about 5 min, admin_until null', tv.status === 200 && pl > 4 * 60e3 && pl <= 5 * 60e3 && tv.data.admin_until === null, tv)
+  check('T3 ... then the passkey action works', (await cmd(resident, 'tab-a', 'limit', lim)).status === 200)
+  const sess = d1json(`SELECT passkey_at, command_passkey_at FROM sessions WHERE id = ${resSid2}`)[0]
+  check('T3 only command_passkey_at moved, passkey_at kept old', Date.parse(sess.passkey_at) < Date.now() - 9 * 60e3 && Date.now() - Date.parse(sess.command_passkey_at) < 60e3, sess)
+  check('T3 identity.strong stays false', (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.strong === false)
+  check('T4 the same assertion twice = 400 challenge_expired', (await resident.req('POST', '/tab-a/_passkey/verify', await residentAuth.get(to.data))).data.error === 'challenge_expired')
+  // owner: admin and passkey actions open, account and sensitive stay closed
+  const oo = await owner.req('POST', '/tab-a/_passkey/options', {})
+  const ov = await owner.req('POST', '/tab-a/_passkey/verify', await auth.get(oo.data))
+  const al = ov.status === 200 ? Date.parse(ov.data.admin_until) - Date.now() : 0
+  check('T5 owner verify from the tab: admin_until open (12 h)', ov.status === 200 && al > 11 * 3600e3, ov)
+  check('T5 ... admin and passkey actions pass', (await cmd(owner, 'tab-a', 'presence', { state: 'home' })).status === 200 &&
+    (await cmd(owner, 'tab-a', 'limit', lim)).status === 200)
+  const other = (await owner.req('GET', '/tab-slow/echo', undefined, CORS)).data.identity
+  check('R1 the tab Face ID counts only in its own tab (another tab: admin_until null)', other && other.admin_until === null, other)
+  check('R3 audit strength of a tab Face ID is tab_passkey', (await owner.req('GET', '/api/admin/audit')).data.some((r) => r.action === 'command_passkey_ok' && r.strength === 'tab_passkey'))
+  const ws = await cmd(owner, 'tab-a', 'wipe')
+  check('T6 sensitive action still needs the portal Face ID', ws.status === 403 && ws.data.error === 'passkey_required', ws)
+  const inv = await owner.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})
+  check('T6 account admin write still needs the portal Face ID', inv.status === 403 && inv.data.passkey === true, inv)
+  check('T6 /api/me not strong', (await owner.req('GET', '/api/me')).data.strong !== true)
+  // a portal challenge pending (no purpose) is never taken by the tab route
+  const po = await owner.req('POST', '/api/passkey/get/options', {})
+  const pa = await auth.get(po.data)
+  const steal = await owner.req('POST', '/tab-a/_passkey/verify', pa)
+  check('T7 the tab route never takes a portal challenge', steal.status === 400 && steal.data.error === 'challenge_expired', steal)
+  check('T7 ... which still works on the portal', (await owner.req('POST', '/api/passkey/get/verify', pa)).status === 200)
+  // A1: a tab challenge and a portal challenge live side by side, both ways
+  d1(`UPDATE sessions SET passkey_at = '${ago(13 * 3600e3)}', command_passkey_at = NULL WHERE id = ${ownSid}`)
+  const p1 = await owner.req('POST', '/api/passkey/get/options', {})
+  const t1 = await owner.req('POST', '/tab-a/_passkey/options', {})
+  check('A1 portal options, then tab options, then portal verify = 200', (await owner.req('POST', '/api/passkey/get/verify', await auth.get(p1.data))).status === 200)
+  check('A1 ... and the tab verify after it = 200', (await owner.req('POST', '/tab-a/_passkey/verify', await auth.get(t1.data))).status === 200)
+  const t2 = await owner.req('POST', '/tab-a/_passkey/options', {})
+  const p2 = await owner.req('POST', '/api/passkey/get/options', {})
+  check('A1 tab options, then portal options, then tab verify = 200', (await owner.req('POST', '/tab-a/_passkey/verify', await auth.get(t2.data))).status === 200)
+  check('A1 ... and the portal verify after it = 200', (await owner.req('POST', '/api/passkey/get/verify', await auth.get(p2.data))).status === 200)
+  d1(`UPDATE sessions SET passkey_at = '${ago(13 * 3600e3)}', command_passkey_at = NULL WHERE id = ${ownSid}`)
+  const t3 = await owner.req('POST', '/tab-a/_passkey/options', {})
+  const viaPortal = await owner.req('POST', '/api/passkey/get/verify', await auth.get(t3.data))
+  check('A1 the portal verify never takes a tab challenge (no strong session from it)', viaPortal.status === 400 && viaPortal.data.error === 'challenge_expired' &&
+    d1json(`SELECT passkey_at FROM sessions WHERE id = ${ownSid}`)[0].passkey_at < ago(12 * 3600e3), viaPortal)
+  check('T8 screen: tab passkey options refused', (await tvc.req('POST', '/tab-a/_passkey/options', {})).status === 403)
+  const nor = client()
+  check('T8 signed out = 401', (await nor.req('POST', '/tab-a/_passkey/options', {})).status === 401)
+  const bo = await owner.req('POST', '/tab-b/_passkey/options', {})
+  check('T8 tab-b (entry passed, only a common action): 400 bad_purpose', bo.status === 400 && bo.data.error === 'bad_purpose', bo)
+  const rows = (await owner.req('GET', '/api/admin/audit')).data
+  const ar = rows.find((r) => r.action === 'command_passkey_ok' && r.target === 'tab-a' && JSON.parse(r.detail ?? 'null')?.via === 'tab')
+  check('T9 audit: command_passkey_ok via tab', !!ar, rows.slice(0, 5))
+  // a bad assertion is audited and opens nothing
+  d1(`UPDATE sessions SET command_passkey_at = NULL WHERE id = ${resSid2}`)
+  const bo2 = await resident.req('POST', '/tab-a/_passkey/options', {})
+  const bad = await residentAuth.get(bo2.data)
+  bad.signature = bad.signature.slice(0, -4) + 'AAAA'
+  const br2 = await resident.req('POST', '/tab-a/_passkey/verify', bad)
+  check('T10 bad signature = 400, window still closed', br2.status === 400 && (await cmd(resident, 'tab-a', 'limit', lim)).data.error === 'passkey_required', br2)
 }
 
 // the selector in a real browser (owner, resident and a freshly paired screen)
@@ -858,6 +941,7 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   const vp = await cmd(owner, 'tab-a', 'presence', { state: 'home' })
   check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')
+  check('see as: Face ID from the tab page refused', (await owner.req('POST', '/tab-a/_passkey/options', {})).data.error === 'admin_only')
   const logBefore = (await cmdLog()).length
   const vl = await cmd(owner, 'tab-a', 'light')
   check('rehearsal: common command answers done + simulated (no new-device hold)', vl.status === 200 && vl.data.status === 'done' && vl.data.ok === true && vl.data.simulated === true && UUID.test(vl.data.id), vl)

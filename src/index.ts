@@ -107,6 +107,8 @@ interface Group { id: string; name: string; tabs: string; is_admin: number }
 interface Who {
   person: Person; sessionId: number; sessionCreatedAt: string; kind: 'browser' | 'screen'; groups: Group[]; admin: boolean; tabs: Set<string>
   passkeyAt: string | null; refreshCookie: string | null; commandsOkAt: string | null
+  // Face ID made by a tab page itself (/<tab>/_passkey/verify): command windows only, never strong
+  commandPasskeyAt: string | null; commandPasskeyTab: string | null
   // "see as": an admin session shown as one non-admin group. groups, admin and tabs above are
   // then that group's; realAdmin keeps what the person really is (only to leave the mode).
   realAdmin: boolean; viewAs: { id: string; name: string } | null
@@ -274,7 +276,7 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
   const token = cookieValue(req, COOKIE)
   if (!token || token.length < 40) return null
   const s = await env.DB.prepare(
-    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.commands_ok_at, s.view_as, p.* FROM sessions s JOIN people p ON p.id = s.person_id
+    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.command_passkey_at, s.command_passkey_tab, s.commands_ok_at, s.view_as, p.* FROM sessions s JOIN people p ON p.id = s.person_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
   ).bind(await sha256(token), now()).first<Row>()
   if (!s || s.status !== 'active') return null
@@ -299,6 +301,7 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
   return {
     person, sessionId: Number(s.sid), sessionCreatedAt: String(s.screated), kind, groups, admin: realAdmin && !view, tabs: tabsOf(groups),
     passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie, commandsOkAt: (s.commands_ok_at as string | null) ?? null,
+    commandPasskeyAt: (s.command_passkey_at as string | null) ?? null, commandPasskeyTab: (s.command_passkey_tab as string | null) ?? null,
     realAdmin, viewAs: view ? { id: view.id, name: view.name } : null,
   }
 }
@@ -653,15 +656,20 @@ async function passkeyCount(env: Env, personId: number) {
 async function newChallenge(env: Env, who: Who, kind: 'create' | 'get', purpose: string | null = null) {
   const challenge = randomToken(32)
   await env.DB.batch([
-    env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ?').bind(who.sessionId, kind),
+    env.DB.prepare(`DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ? AND ${NOT_TAB_CHALLENGE}`).bind(who.sessionId, kind),
     env.DB.prepare('INSERT INTO passkey_challenges (session_id, kind, challenge, expires_at, purpose) VALUES (?, ?, ?, ?, ?)')
       .bind(who.sessionId, kind, challenge, inMs(CHALLENGE_MS), purpose),
   ])
   return challenge
 }
 
+// A tab page's own Face ID ('tabcmd:<tab>', /<tab>/_passkey/*) lives beside the portal's challenge:
+// neither replaces nor takes the other (a tab prefetching never drops an approval waiting on the portal,
+// and the portal's verify never turns a tab challenge into a strong session).
+const NOT_TAB_CHALLENGE = "(purpose IS NULL OR purpose NOT LIKE 'tabcmd:%')"
+
 async function takeChallenge(env: Env, who: Who, kind: 'create' | 'get'): Promise<{ challenge: string; purpose: string | null }> {
-  const c = await env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ? AND expires_at > ? RETURNING challenge, purpose')
+  const c = await env.DB.prepare(`DELETE FROM passkey_challenges WHERE session_id = ? AND kind = ? AND expires_at > ? AND ${NOT_TAB_CHALLENGE} RETURNING challenge, purpose`)
     .bind(who.sessionId, kind, now()).first<{ challenge: string; purpose: string | null }>()
   if (!c) throw new HttpError(400, 'challenge_expired')
   return c
@@ -839,6 +847,69 @@ async function passkeyGetVerify(req: Request, env: Env, url: URL, who: Who) {
   }
   await audit(env, req, { who, strength: 'strong', action: 'passkey_ok' })
   return { ok: true }
+}
+
+// Face ID asked by the tab page itself, on the tap, with only the system sheet (docs/COMMANDS.md).
+// The tab comes from the path (a tab's scripts may connect only under their own path), so a page
+// can only ever get a 'command:<its tab>' challenge: never an agent approval or another tab's entry.
+// Same rules as the portal's step-up for commands. The check opens only command_passkey_at.
+async function tabPasskeyOptions(env: Env, url: URL, who: Who, tab: string) {
+  commandPurpose(env, who, tab)
+  const creds = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE person_id = ?').bind(who.person.id).all<{ credential_id: string }>()
+  if (!creds.results.length) throw new HttpError(409, 'no_passkey', { no_passkey: true })
+  const challenge = randomToken(32)
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM passkey_challenges WHERE session_id = ? AND kind = 'get' AND purpose = ?").bind(who.sessionId, `tabcmd:${tab}`),
+    env.DB.prepare("INSERT INTO passkey_challenges (session_id, kind, challenge, expires_at, purpose) VALUES (?, 'get', ?, ?, ?)")
+      .bind(who.sessionId, challenge, inMs(CHALLENGE_MS), `tabcmd:${tab}`),
+  ])
+  return {
+    challenge,
+    rpId: rpOf(url).id,
+    allowCredentials: creds.results.map((c) => ({ type: 'public-key', id: c.credential_id })),
+    userVerification: 'required',
+    timeout: CHALLENGE_MS,
+  }
+}
+
+async function tabPasskeyVerify(req: Request, env: Env, url: URL, who: Who, tab: string) {
+  // the rules again: seeing as, a lost admin group or a changed catalog since the options
+  commandPurpose(env, who, tab)
+  const b = await body(req)
+  const rp = rpOf(url)
+  // only this tab's command challenge; any other pending one (the portal's own) is left alone
+  const c = await env.DB.prepare("DELETE FROM passkey_challenges WHERE session_id = ? AND kind = 'get' AND purpose = ? AND expires_at > ? RETURNING challenge")
+    .bind(who.sessionId, `tabcmd:${tab}`, now()).first<{ challenge: string }>()
+  if (!c) throw new HttpError(400, 'challenge_expired')
+  const key = await env.DB.prepare('SELECT * FROM passkeys WHERE credential_id = ? AND person_id = ?')
+    .bind(String(b.id ?? ''), who.person.id).first<Row>()
+  if (!key) throw new HttpError(400, 'unknown_passkey')
+  let count
+  try {
+    count = await verifyAssertion(
+      { clientDataJSON: String(b.clientDataJSON ?? ''), authenticatorData: String(b.authenticatorData ?? ''), signature: String(b.signature ?? '') },
+      { publicKey: String(key.public_key), signCount: Number(key.sign_count) },
+      { challenge: c.challenge, origin: rp.origin, rpId: rp.id },
+    )
+  } catch (e) {
+    if (e instanceof WebAuthnError) {
+      await audit(env, req, { who, action: 'passkey_failed', target: tab, detail: { reason: e.message, via: 'tab' } })
+      throw new HttpError(400, e.message)
+    }
+    throw e
+  }
+  const t = now()
+  await env.DB.batch([
+    env.DB.prepare('UPDATE passkeys SET sign_count = ?, last_used_at = ? WHERE id = ?').bind(count, t, key.id),
+    env.DB.prepare('UPDATE sessions SET command_passkey_at = ?, command_passkey_tab = ? WHERE id = ?').bind(t, tab, who.sessionId),
+  ])
+  await audit(env, req, { who, strength: 'tab_passkey', action: 'command_passkey_ok', target: tab, detail: { via: 'tab' } })
+  const after: Who = { ...who, commandPasskeyAt: t, commandPasskeyTab: tab }
+  return {
+    ok: true,
+    passkey_until: passkeyUntil(catalogOf(env, tab), callerOf(env, after, tab)),
+    admin_until: after.kind === 'browser' && after.admin ? adminWindowUntil(commandPasskeyAt(after, tab), env.ADMIN_COMMAND_PASSKEY) : null,
+  }
 }
 
 // ------------------------------------------------------------------ "me"
@@ -1162,9 +1233,9 @@ function identityOf(env: Env, tab: string, who: Who, policy: TabPolicy, enteredA
     session: who.sessionId, machine: null, shortcut: null, strong: fresh(who), entered_at: enteredAt,
     entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null,
     // same rule as the commands (callerOf): only a browser session of an admin, never while seeing as
-    admin_until: who.kind === 'browser' && who.admin ? adminWindowUntil(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY) : null,
-    actions: allowedActions(tab, catalogOf(env, tab), callerOf(env, who)),
-    passkey_until: passkeyUntil(catalogOf(env, tab), callerOf(env, who)),
+    admin_until: who.kind === 'browser' && who.admin ? adminWindowUntil(commandPasskeyAt(who, tab), env.ADMIN_COMMAND_PASSKEY) : null,
+    actions: allowedActions(tab, catalogOf(env, tab), callerOf(env, who, tab)),
+    passkey_until: passkeyUntil(catalogOf(env, tab), callerOf(env, who, tab)),
     ...(who.viewAs ? { rehearsal: true } : {}),
   }
 }
@@ -1255,7 +1326,7 @@ async function setViewAs(env: Env, req: Request, who: Who, url: URL) {
   // going in drops this session's Face ID, so "fresh" below can only be a check made since
   if (was && next === null && !fresh(who)) throw new HttpError(403, 'passkey_required', { passkey: true })
   if (next !== was) {
-    if (!was) await env.DB.prepare('UPDATE sessions SET view_as = ?, passkey_at = NULL WHERE id = ?').bind(next, who.sessionId).run()
+    if (!was) await env.DB.prepare('UPDATE sessions SET view_as = ?, passkey_at = NULL, command_passkey_at = NULL, command_passkey_tab = NULL WHERE id = ?').bind(next, who.sessionId).run()
     else await env.DB.prepare('UPDATE sessions SET view_as = ? WHERE id = ?').bind(next, who.sessionId).run()
     if (was) await audit(env, req, { who, action: 'view_as_off', target: was })
     if (next) await audit(env, req, { who, action: 'view_as_on', target: next })
@@ -1301,6 +1372,14 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
   }
   // commands from the tab's own pages: answered by the portal, never handed to handle()
   const cmdPath = url.pathname.slice(tab.length + 1)
+  if (cmdPath === '/_passkey' || cmdPath.startsWith('/_passkey/')) {
+    if (req.method !== 'POST') throw new HttpError(405, 'method_not_allowed')
+    let data: unknown
+    if (cmdPath === '/_passkey/options') data = await tabPasskeyOptions(env, url, who, tab)
+    else if (cmdPath === '/_passkey/verify') data = await tabPasskeyVerify(req, env, url, who, tab)
+    else throw new HttpError(404, 'not_found')
+    return json(data, 200, who.refreshCookie ? { 'Set-Cookie': who.refreshCookie } : {})
+  }
   if (cmdPath === '/_cmd' || cmdPath.startsWith('/_cmd/')) {
     const a = /^\/_cmd\/([a-z][a-z0-9_]{0,39})$/.exec(cmdPath)
     if (!a) throw new HttpError(404, 'not_found')
@@ -1327,11 +1406,20 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
 // The tab's actions, from its configuration (validated in tabs.ts; a bad catalog drops the tab).
 const catalogOf = (env: Env, tab: string): Catalog => tabsConfig(env.TABS)[tab]?.commands ?? {}
 
-// identity.actions and every command use the same rule: this session's own passkey_at.
-function callerOf(env: Env, who: Who): Caller {
+// identity.actions and every command use the same rule: this session's own last Face ID, from the
+// portal (passkey_at) or from a tab page (command_passkey_at, only for commands of that same tab).
+// Only passkey_at makes it strong.
+function commandPasskeyAt(who: Who, tab: string): string | null {
+  const a = who.passkeyAt, b = who.commandPasskeyTab === tab ? who.commandPasskeyAt : null
+  if (!a || !b) return a ?? b
+  return Date.parse(b) > Date.parse(a) ? b : a
+}
+
+function callerOf(env: Env, who: Who, tab: string): Caller {
+  const at = commandPasskeyAt(who, tab)
   return {
-    credential: who.kind, admin: who.admin, strong: fresh(who), adminFresh: adminWindowOk(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY), scope: null,
-    passkeyAt: who.passkeyAt, rehearsal: !!who.viewAs,
+    credential: who.kind, admin: who.admin, strong: fresh(who), adminFresh: adminWindowOk(at, env.ADMIN_COMMAND_PASSKEY), scope: null,
+    passkeyAt: at, rehearsal: !!who.viewAs,
   }
 }
 
@@ -1375,7 +1463,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   if (c.key && policy.entry === 'passkey') return refuse(403, 'not_for_shortcuts')
   const caller: Caller = c.key
     ? { credential: 'shortcut', admin: c.key.admin, strong: false, adminFresh: false, scope: c.key.scope }
-    : callerOf(env, c.who!)
+    : callerOf(env, c.who!, tab)
   const why = refusal(tab, action, spec, caller)
   // an action with its own passkey window, for anyone: a person with no passkey at all is told so
   // (an admin invites them from the account page) instead of being sent to a Face ID that cannot work
