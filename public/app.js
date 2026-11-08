@@ -701,8 +701,11 @@ function currentPart() {
   return { part: ME.admin && D.requests && D.requests.length ? 'pedidos' : 'aparelhos', chosen: false }
 }
 
+let paneTouched = false // the admin typed or toggled in the open pane: a background refresh must not redraw it
+
 function renderAccount() {
   accountShell()
+  paneTouched = false
   const { part, chosen } = currentPart()
   const showPane = chosen || WIDE.matches
   document.body.classList.toggle('at-pane', chosen)
@@ -1081,6 +1084,30 @@ async function start() {
   }
   return guarded(() => account(q))
 }
+
+// New sign-in requests show up without a reload: poll lightly while the page is visible, and when it comes back.
+const REQUESTS_POLL_MS = 12000
+let pollingRequests = false
+async function pollRequests() {
+  if (pollingRequests || document.hidden || !$index || !ME || !ME.admin || !document.body.classList.contains('account')) return
+  pollingRequests = true
+  try {
+    const fresh = await rawApi('GET', '/api/admin/requests')
+    const ids = (l) => l.map((r) => r.id).join(',')
+    if (!Array.isArray(fresh) || ids(fresh) === ids(D.requests || [])) return
+    D.requests = fresh
+    const { part, chosen } = currentPart()
+    const busy = paneTouched || ($pane && $pane.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName))
+    if (busy && part === 'pedidos') renderIndex(chosen || WIDE.matches ? part : null) // keep what is being typed; the list catches up on the next quiet poll
+    else renderAccount()
+  } catch (e) { /* offline or signed out: the next tick or the next action sorts it out */ } finally { pollingRequests = false }
+}
+setInterval(pollRequests, REQUESTS_POLL_MS)
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollRequests() })
+window.addEventListener('focus', pollRequests)
+window.addEventListener('pageshow', pollRequests)
+document.addEventListener('input', (e) => { if ($pane && $pane.contains(e.target)) paneTouched = true })
+document.addEventListener('click', (e) => { if ($pane && $pane.contains(e.target) && e.target.closest('.toggles')) paneTouched = true })
 
 window.addEventListener('hashchange', () => { if ($index && ME) { if (allowed(location.hash.slice(1))) agentReqId = null; renderAccount(); if (!WIDE.matches) window.scrollTo(0, 0) } })
 window.addEventListener('popstate', () => { if ($index && ME) { const a = new URLSearchParams(location.search).get('agent_request'); agentReqId = a && /^\d{1,12}$/.test(a) ? Number(a) : null; renderAccount() } })
