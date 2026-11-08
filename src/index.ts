@@ -79,7 +79,6 @@ const SCREEN_GROUPS = new Set(['owner-screens'])
 // commands (docs/COMMANDS.md)
 const COMMAND_TTL_MS = 60e3
 const COMMAND_WAIT_MS = 8e3
-const DEVICE_COMMAND_HOLD_MS = 24 * 3600e3 // a non-admin browser session waits this long, or an admin lets it
 const SHORTCUT_PER_HOUR = 30
 const SHORTCUT_FAIL_PER_IP = 30
 const TAB_COMMANDS_PER_HOUR = 300
@@ -213,6 +212,9 @@ const clearCookie = () => `${COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; M
 
 const strength = (who: Who | null) => (who ? (fresh(who) ? 'strong' : 'weak') : null)
 const fresh = (who: Who) => !!who.passkeyAt && Date.now() - Date.parse(who.passkeyAt) < PASSKEY_FRESH_MS
+// "strong" as told to tabs, commands and the page: only an admin's (08/11: everyone may
+// have a passkey now, and a resident's Face ID only opens the `passkey` windows of the catalog)
+const strongAdmin = (who: Who) => who.admin && fresh(who)
 
 async function audit(env: Env, req: Request | null, a: { who?: Who | null; person?: number | null; strength?: string | null; action: string; target?: string | null; detail?: unknown }) {
   // anything done while seeing as another group says so in its audit row
@@ -353,6 +355,13 @@ async function createSession(env: Env, req: Request, person: Person, label: stri
   if (admin)
     await env.DB.prepare('INSERT INTO device_alerts (person_id, session_id, label, place, created_at) VALUES (?, ?, ?, ?, ?)')
       .bind(person.id, r!.id, label, place(req), t).run()
+  else {
+    // every new resident device warns the admins at once, with a way to sign it out (08/11)
+    const admins = await env.DB.prepare('SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
+    for (const a of admins.results)
+      await env.DB.prepare("INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, ?, ?, ?, ?, 'resident_login')")
+        .bind(a.person_id, r!.id, `${person.name} · ${label}`, place(req), t).run()
+  }
   return token
 }
 
@@ -714,20 +723,29 @@ function entryPurpose(env: Env, who: Who, raw: unknown): string | null {
 // From a weak session a passkey can be added only (a) when the portal has no passkey at all,
 // once, with the owner in front of the screen, or (b) with an unexpired invite a strong admin
 // created for this person. Anything else needs a fresh passkey check.
-// A non-admin (resident, 08/11: for actions with their own `passkey` window) adds one only with an
-// invite, every time, even from a strong session: a second device is the owner's call too.
+// A non-admin (resident, 08/11) adds their own (since 08/11 everyone has their own Face ID,
+// no waiting; what it unlocks is still the groups and the catalog): the first one from any of their
+// sessions, another only after their own Face ID on the portal (or with an invite). At most
+// RESIDENT_PASSKEYS each. Every one is an alert to the admins, as is every new resident sign-in.
 async function pendingInvite(env: Env, personId: number): Promise<number | null> {
   const inv = await env.DB.prepare('SELECT id FROM passkey_invites WHERE person_id = ? AND expires_at > ? AND used_at IS NULL ORDER BY id DESC')
     .bind(personId, now()).first<{ id: number }>()
   return inv?.id ?? null
 }
 
+const RESIDENT_PASSKEYS = 3
+
 async function canAddPasskey(env: Env, who: Who): Promise<number | null> {
-  if (who.kind !== 'browser' || who.viewAs) throw new HttpError(403, 'passkey_admin_only')
+  if (who.kind !== 'browser' || who.viewAs || who.person.kind === 'screen') throw new HttpError(403, 'passkey_admin_only')
   if (!who.admin) {
+    const count = await passkeyCount(env, who.person.id)
+    if (count >= RESIDENT_PASSKEYS) throw new HttpError(409, 'passkey_limit')
     const inv = await pendingInvite(env, who.person.id)
     if (inv) return inv
-    throw new HttpError(403, 'passkey_invite_required')
+    // a second key needs the person's own Face ID first (the portal's; a tab's check never counts),
+    // so whoever holds a session cannot plant a key of their own beside the person's
+    if (count > 0 && !fresh(who)) throw new HttpError(403, 'passkey_required', { passkey: true })
+    return null
   }
   if (fresh(who)) return null
   const any = await env.DB.prepare('SELECT 1 FROM passkeys LIMIT 1').first()
@@ -784,6 +802,18 @@ async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
   if (invite) {
     const claimed = await env.DB.prepare('UPDATE passkey_invites SET used_at = ? WHERE id = ? AND used_at IS NULL').bind(now(), invite).run()
     if (!claimed.meta.changes) throw new HttpError(403, who.admin ? 'passkey_required' : 'passkey_invite_required', who.admin ? { passkey: true } : {})
+  }
+  if (!who.admin) {
+    // the limit holds against two devices registering at once too
+    const ins = await env.DB.prepare(`INSERT INTO passkeys (person_id, credential_id, public_key, sign_count, label, created_at)
+      SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM passkeys WHERE person_id = ?) < ?`)
+      .bind(who.person.id, reg.credentialId, reg.publicKey, reg.signCount, label, now(), who.person.id, RESIDENT_PASSKEYS).run()
+    if (!ins.meta.changes) throw new HttpError(409, 'passkey_limit')
+    // registering is not a Face ID check: it opens no window and never makes the session strong
+    const age = Math.round((Date.now() - Date.parse(who.sessionCreatedAt)) / 3600e3)
+    await audit(env, req, { who, action: 'passkey_added', target: label, detail: { ...(invite ? { invite } : { self: true }), session_hours: age, released: !!who.commandsOkAt } })
+    await alertAdmins(env, req, `${who.person.name} · ${label}`, 'passkey')
+    return { ok: true }
   }
   await env.DB.prepare('INSERT INTO passkeys (person_id, credential_id, public_key, sign_count, label, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .bind(who.person.id, reg.credentialId, reg.publicKey, reg.signCount, label, now()).run()
@@ -936,13 +966,43 @@ async function me(env: Env, who: Who) {
     screen_tabs: who.admin ? Object.keys(tabBindings(env)).filter((t) => policyOf(t).credentials.includes('screen')) : [],
     session_id: who.sessionId,
     credential: who.kind,
-    strong: fresh(who),
+    strong: strongAdmin(who),
     // the made-up resident of a rehearsal has none
     passkeys: who.viewAs || who.kind !== 'browser' ? 0 : await passkeyCount(env, who.person.id),
     passkey_invite: !who.admin && !who.viewAs && who.kind === 'browser' ? !!(await pendingInvite(env, who.person.id)) : false,
+    ...(await selfPasskeyState(env, who)),
     alerts: await alertsOf(env, who),
     commands_off: who.admin ? await commandsOff(env) : undefined,
   }
+}
+
+// /api/me: may this session add a passkey (passkey_can_add; with a key already, the page asks the
+// Face ID first). passkey_add_after stays null (no waiting since 08/11).
+async function selfPasskeyState(env: Env, who: Who) {
+  if (who.kind !== 'browser' || who.viewAs || who.person.kind === 'screen') return { passkey_can_add: false, passkey_add_after: null }
+  if (who.admin) return { passkey_can_add: true, passkey_add_after: null }
+  const count = await passkeyCount(env, who.person.id)
+  if (count >= RESIDENT_PASSKEYS) return { passkey_can_add: false, passkey_add_after: null, passkey_limit: true }
+  return { passkey_can_add: true, passkey_add_after: null }
+}
+
+// A person's passkeys (never the key itself), for the account page.
+async function passkeysOf(env: Env, personId: number) {
+  const r = await env.DB.prepare('SELECT id, label, created_at, last_used_at FROM passkeys WHERE person_id = ? ORDER BY id').bind(personId).all<Row>()
+  return r.results
+}
+
+// Removing a passkey: the person's own after a fresh Face ID of the portal (so a session alone
+// cannot drop the person's keys and register its own), or anyone's by a strong admin.
+// Every Face ID window of that person's sessions closes with it.
+async function removePasskey(env: Env, req: Request, who: Who, personId: number, id: number) {
+  if (who.kind !== 'browser' || who.viewAs) throw new HttpError(403, 'view_as_active')
+  if (personId !== who.person.id) requireStrongAdmin(who)
+  else if (!fresh(who)) throw new HttpError(403, 'passkey_required', { passkey: true })
+  const k = await env.DB.prepare('DELETE FROM passkeys WHERE id = ? AND person_id = ? RETURNING label').bind(id, personId).first<{ label: string }>()
+  if (!k) throw new HttpError(404, 'passkey_not_found')
+  await env.DB.prepare('UPDATE sessions SET passkey_at = NULL, command_passkey_at = NULL, command_passkey_tab = NULL WHERE person_id = ?').bind(personId).run()
+  await audit(env, req, { who, action: 'passkey_removed', target: String(personId), detail: { passkey: id, label: k.label } })
 }
 
 async function myDevices(env: Env, who: Who) {
@@ -1230,7 +1290,7 @@ async function forwardSocket(env: Env, req: Request, service: TabService, tab: s
 function identityOf(env: Env, tab: string, who: Who, policy: TabPolicy, enteredAt: string | null): PortalIdentity {
   return {
     credential: who.kind, person: who.person.id, name: who.person.name, groups: who.groups.map((g) => g.id),
-    session: who.sessionId, machine: null, shortcut: null, strong: fresh(who), entered_at: enteredAt,
+    session: who.sessionId, machine: null, shortcut: null, strong: strongAdmin(who), entered_at: enteredAt,
     entry_until: enteredAt ? new Date(Date.parse(enteredAt) + policy.entryHours * 3600e3).toISOString() : null,
     // same rule as the commands (callerOf): only a browser session of an admin, never while seeing as
     admin_until: who.kind === 'browser' && who.admin ? adminWindowUntil(commandPasskeyAt(who, tab), env.ADMIN_COMMAND_PASSKEY) : null,
@@ -1418,7 +1478,7 @@ function commandPasskeyAt(who: Who, tab: string): string | null {
 function callerOf(env: Env, who: Who, tab: string): Caller {
   const at = commandPasskeyAt(who, tab)
   return {
-    credential: who.kind, admin: who.admin, strong: fresh(who), adminFresh: adminWindowOk(at, env.ADMIN_COMMAND_PASSKEY), scope: null,
+    credential: who.kind, admin: who.admin, strong: strongAdmin(who), adminFresh: adminWindowOk(at, env.ADMIN_COMMAND_PASSKEY), scope: null,
     passkeyAt: at, rehearsal: !!who.viewAs,
   }
 }
@@ -1476,10 +1536,8 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     return refuse(403, why, { step_up: `/?step_up=${tab}&purpose=command&next=${encodeURIComponent(`/${tab}/`)}` })
   }
   if (why) return refuse(403, why)
-  // a borrowed WhatsApp sign-in cannot act at once (Security B4c)
-  // (an admin seeing as a resident is still the admin's own device: no hold)
-  if (c.who && c.who.kind === 'browser' && !c.who.realAdmin && !c.who.commandsOkAt &&
-    Date.now() - Date.parse(c.who.sessionCreatedAt) < DEVICE_COMMAND_HOLD_MS) return refuse(403, 'device_too_new')
+  // (the 24 h hold on a new resident device, was dropped on 08/11: a person
+  // the owner put in a group acts at once; every new resident sign-in is an alert to the admins instead)
   if (await commandsOff(env)) return refuse(503, 'commands_off')
 
   // "see as" is a rehearsal: the command passes every check a resident would meet, then nothing
@@ -1586,7 +1644,7 @@ async function shortcutCommand(req: Request, env: Env, tab: string, action: stri
   if (!k) return refuse('unknown')
   if (k.revoked_at) return refuse('revoked', Number(k.pid))
   if (k.status !== 'active' || k.kind === 'screen') return refuse('person_blocked', Number(k.pid))
-  // a key used from a city/network it never used before warns every admin (Security R1)
+  // a key used from a city/network it never used before warns every admin
   const where = placeKey(req)
   let seen: string[] = []
   try { seen = (JSON.parse(String(k.seen_places)) as unknown[]).filter((x): x is string => typeof x === 'string') } catch { /* none */ }
@@ -2120,6 +2178,11 @@ async function handle(req: Request, env: Env): Promise<Response> {
       await revokeSession(env, req, who, Number(mm[1]), false)
       return out({ ok: true })
     }
+    if (path === '/api/me/passkeys' && m === 'GET') return out(who.viewAs || who.kind !== 'browser' ? [] : await passkeysOf(env, who.person.id))
+    if ((mm = path.match(/^\/api\/me\/passkeys\/(\d+)$/)) && m === 'DELETE') {
+      await removePasskey(env, req, who, who.person.id, Number(mm[1]))
+      return out({ ok: true })
+    }
     if (path === '/api/me/shortcuts' && m === 'GET') return out(await listShortcutKeys(env, who))
     if (path === '/api/me/shortcuts' && m === 'POST') return out(await addShortcutKey(env, req, who))
     if ((mm = path.match(/^\/api\/me\/shortcuts\/(\d+)$/)) && m === 'DELETE') {
@@ -2143,6 +2206,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
         if (path === '/api/admin/groups') return out(await listGroups(env))
         if (path === '/api/admin/requests') return out(masked(await listRequests(env), who, ['typed_phone', 'sender_phone']))
         if (path === '/api/admin/devices') return out(await listAllDevices(env))
+        if ((mm = path.match(/^\/api\/admin\/people\/(\d+)\/passkeys$/))) return out(await passkeysOf(env, Number(mm[1])))
         if (path === '/api/admin/audit') return out(masked(await listAudit(env, url), who, ['detail']))
         if (path === '/api/admin/pair') return out(await pairLookup(req, env, url))
         if (path === '/api/admin/machines') return out(await listMachines(env))
@@ -2163,6 +2227,10 @@ async function handle(req: Request, env: Env): Promise<Response> {
       if (path === '/api/admin/people' && m === 'POST') return out(await addPerson(env, req, who))
       if ((mm = path.match(/^\/api\/admin\/people\/(\d+)$/)) && m === 'POST') {
         await editPerson(env, req, who, Number(mm[1]))
+        return out({ ok: true })
+      }
+      if ((mm = path.match(/^\/api\/admin\/people\/(\d+)\/passkeys\/(\d+)$/)) && m === 'DELETE') {
+        await removePasskey(env, req, who, Number(mm[1]), Number(mm[2]))
         return out({ ok: true })
       }
       if ((mm = path.match(/^\/api\/admin\/people\/(\d+)\/passkey-invite$/)) && m === 'POST') {

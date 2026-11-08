@@ -50,7 +50,7 @@ Action names: `^[a-z][a-z0-9_]{0,39}$`, at most 40 per tab. A malformed action i
 
 | Level | Browser | Fixed screen | Shortcuts key |
 |---|---|---|---|
-| `common` | anyone with the tab; a non-admin session only 24 h after sign-in or once an admin lets that device | only with `screens: true` | if in the key's scope |
+| `common` | anyone with the tab (since 08/11 a new non-admin device acts at once; each new resident sign-in is an alert to the admins) | only with `screens: true` | if in the key's scope |
 | `admin` | admin group, with a passkey check within `ADMIN_COMMAND_PASSKEY` on this very session (`ADMIN_COMMAND_PASSKEY` in wrangler.toml: `12h`, one Face ID a day; `<n>m`/`<n>h`, or `session`; missing or malformed = 5 minutes). Shortcuts keys need no Face ID: the key is the proof | never | admin's key, if in scope |
 | `sensitive` | admin with a passkey check in the last 5 minutes | never | never |
 
@@ -130,7 +130,7 @@ No cookie, no session. Browsers cannot send this from another site: `Authorizati
 | 502 | `failed` | the bridge tried and failed |
 | 503 | `offline` | no bridge connected |
 
-Refusals before the tab: 404 `unknown_action` (or `not_found` for a tab that does not exist); 400 `bad_params`, `unknown_param`, `missing_param`, `bad_param`; 401 `bad_key`; 403 `no_tab_access`, `admin_only`, `passkey_required`, `passkey_missing`, `not_for_screens`, `not_for_shortcuts`, `out_of_scope`, `device_too_new`; 429 `too_many_commands`, `too_soon` (with `retry_after` in seconds), `too_many_attempts`; 503 `commands_off`.
+Refusals before the tab: 404 `unknown_action` (or `not_found` for a tab that does not exist); 400 `bad_params`, `unknown_param`, `missing_param`, `bad_param`; 401 `bad_key`; 403 `no_tab_access`, `admin_only`, `passkey_required`, `passkey_missing`, `not_for_screens`, `not_for_shortcuts`, `out_of_scope`; 429 `too_many_commands`, `too_soon` (with `retry_after` in seconds), `too_many_attempts`; 503 `commands_off`.
 
 ## 5. Shortcuts keys
 

@@ -647,8 +647,8 @@ let agentReqId = null // ?agent_request=<id> shows that request in the pane
 
 const PARTS = {
   aparelhos: { ico: 'phone', color: 'off', title: () => T.myDevices, render: partMyDevices },
-  // residents see it once they have a passkey or an invite to make one
-  faceid: { show: () => ME.admin || !!ME.passkeys || !!ME.passkey_invite, ico: 'faceid', color: 'ok', title: () => T.faceId, render: partFaceId },
+  // everyone with a browser has their own Face ID (08/11); a rehearsal's made-up resident has none
+  faceid: { show: () => ME.admin || (ME.credential === 'browser' && !ME.rehearsal), ico: 'faceid', color: 'ok', title: () => T.faceId, render: partFaceId },
   pedidos: { admin: true, ico: 'inbox', color: 'sun', title: () => T.requests, render: partRequests },
   pessoas: { admin: true, ico: 'people', color: 'on', title: () => T.people, render: partPeople },
   grupos: { admin: true, ico: 'layers', color: 'gray', title: () => T.groups, render: partGroups },
@@ -667,6 +667,7 @@ const allowed = (k) => PARTS[k] && (PARTS[k].show ? PARTS[k].show() : (!PARTS[k]
 async function loadData() {
   const get = (p) => rawApi('GET', p)
   D.devices = await get('/api/me/devices')
+  D.passkeys = ME.credential === 'browser' && !ME.rehearsal ? await get('/api/me/passkeys') : []
   if (!ME.admin) return
   const [people, groups, requests, all, machines, shortcuts, agents, agentReqs] = await Promise.all([
     get('/api/admin/people'), get('/api/admin/groups'), get('/api/admin/requests'), get('/api/admin/devices'),
@@ -749,7 +750,7 @@ function summary(k) {
   const badge = (n) => n ? el('span', { class: 'badge' }, String(n)) : null
   switch (k) {
     case 'aparelhos': return [D.devices.map((d) => (d.label || T.device) + (d.current ? T.thisOne : '')).slice(0, 2).join(', '), String(D.devices.length)]
-    case 'faceid': return [ME.passkeys ? T.passkeyShort(ME.passkeys) : T.noPasskeyShort, !ME.passkeys || ME.passkey_invite ? badge('!') : null]
+    case 'faceid': return [ME.passkeys ? T.passkeyShort(ME.passkeys) : T.noPasskeyShort, !ME.passkeys && ME.passkey_can_add ? badge('!') : null]
     case 'pedidos': return [D.requests.length ? T.requestsLine(D.requests.length) : T.noRequests, badge(D.requests.length)]
     case 'pessoas': return [names(D.people, 4), String(D.people.length)]
     case 'grupos': return [D.groups.map(groupName).join(' · '), null]
@@ -767,11 +768,13 @@ function summary(k) {
 function alerts() {
   return (ME.alerts || []).map((a) => el('div', { class: 'alert' }, icon(a.kind === 'device' ? 'faceid' : 'alert'),
     el('div', {},
-      el('b', {}, (a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : a.kind === 'agent_ip' ? T.agentIpAlert : T.newDevice(ME.person.name)).replace(/:\s*$/, '')),
+      el('b', {}, (a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : a.kind === 'agent_ip' ? T.agentIpAlert : a.kind === 'passkey' ? T.passkeyAlert : a.kind === 'resident_login' ? T.residentLoginAlert : T.newDevice(ME.person.name)).replace(/:\s*$/, '')),
       `${a.label || T.device}, ${shortWhen(a.created_at)}${a.place ? ', ' + city(a.place) : ''}${a.current ? T.thisDevice : ''}.`,
       el('div', { class: 'btn-row' },
         btn(T.itWasMe, async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await refresh() }, 'btn-sm'),
-        a.current || !a.live || a.kind !== 'device' ? null : btn(T.revoke, async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await refresh() }, 'btn-sm btn-danger')))))
+        a.current || !a.live || a.kind !== 'device' ? null : btn(T.revoke, async () => { await api('DELETE', `/api/me/devices/${a.session_id}`); await refresh() }, 'btn-sm btn-danger'),
+        // a resident's new device: sign it out from here (the owner's Face ID)
+        a.kind === 'resident_login' && a.live ? btn(T.revoke, async () => { await api('DELETE', `/api/admin/devices/${a.session_id}`); await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await refresh() }, 'btn-sm btn-danger') : null))))
 }
 
 // ---- parts
@@ -793,10 +796,8 @@ function partMyDevices(top) {
 }
 
 function partAllDevices(top) {
-  return [top(T.allDevices, T.allDevicesSub), el('div', { class: 'group' }, D.all.map((d) => deviceItem(d, true,
-    // a new device of a resident sends commands only after 24 h, or once released here
-    d.kind === 'browser' && !d.commands_ok_at && Date.now() - Date.parse(d.created_at) < 864e5
-      ? btn(T.commands.release, async () => { await api('POST', `/api/admin/devices/${d.id}/commands`, {}); toast(T.commands.released); await refresh() }, 'btn-sm') : null)))]
+  // (no "release" button since 08/11: a resident's new device acts at once)
+  return [top(T.allDevices, T.allDevicesSub), el('div', { class: 'group' }, D.all.map((d) => deviceItem(d, true)))]
 }
 
 function partFaceId(top) {
@@ -804,15 +805,50 @@ function partFaceId(top) {
     await passkeyHere()
     toast(T.passkeyAdded); await refresh()
   }
-  // a resident adds one only with an invite (each device is the owner's call)
+  const mine = passkeyList(D.passkeys || [], (k) => api('DELETE', `/api/me/passkeys/${k.id}`))
+  // a resident adds their own from a device past the 24 h hold (or released, or with an invite), up to 3
   if (!ME.admin) {
-    return [top(T.faceId, ME.passkey_invite ? T.inviteWaiting : ME.passkeys ? T.askInvite : T.noPasskeyResident),
+    const why = ME.passkey_limit ? T.passkeyLimit : ME.passkeys ? T.residentPasskeys : T.noPasskeyResident
+    return [top(T.faceId, why),
       el('div', { class: 'card pad' }, el('div', { class: 'faceid-mark' }, icon('faceid')),
-        ME.passkey_invite ? btn(T.addPasskeyHere, add, 'btn-primary btn-block', 'plus') : null)]
+        ME.passkey_can_add ? btn(ME.passkeys ? T.addPasskeyAnother : T.addFaceIdHere, add, ME.passkeys ? 'btn-block' : 'btn-primary btn-block', 'plus') : null), mine]
   }
   return [top(T.faceId, ME.passkeys ? T.passkeyCount(ME.passkeys) : T.noPasskey),
     el('div', { class: 'card pad' }, el('div', { class: 'faceid-mark' }, icon('faceid')),
-      btn(ME.passkeys ? T.addAnotherPasskey : T.addPasskeyHere, add, ME.passkeys ? 'btn-block' : 'btn-primary btn-block', 'plus'))]
+      btn(ME.passkeys ? T.addAnotherPasskey : T.addPasskeyHere, add, ME.passkeys ? 'btn-block' : 'btn-primary btn-block', 'plus')), mine]
+}
+
+// a person's passkeys, each with a remove button that asks twice
+function passkeyList(keys, remove) {
+  if (!keys.length) return null
+  return el('div', { class: 'group' }, keys.map((k) => el('div', { class: 'item' },
+    line(el('span', { class: 'row-icon ok' }, icon('faceid')), k.label || T.device, T.passkeyLine(shortWhen(k.created_at), k.last_used_at ? shortWhen(k.last_used_at) : null)),
+    el('div', { class: 'btn-row' }, confirmButton(T.removePasskey, T.confirmRemovePasskey, async () => { await remove(k); toast(T.passkeyRemoved); await refresh() })))))
+}
+
+// /conta/?add_passkey=1&next=/<tab>/...: a tab sends here a person who has no Face ID yet. One tap
+// (creating a passkey needs it), then back to the tab. Registering never happens inside a tab.
+function addPasskeyView() {
+  // only a tab's own path (query and hash as they came, decoded once by URLSearchParams); never
+  // "//host", a backslash, a scheme or a control character
+  const n = new URLSearchParams(location.search).get('next') || ''
+  const next = /^\/[a-z][a-z0-9-]{0,30}\/[^\\\s\x00-\x1f]*$/.test(n) && !n.startsWith(ACCOUNT) ? n : null
+  const back = () => location.assign(next || ACCOUNT)
+  if (ME.credential !== 'browser' || ME.rehearsal || !ME.passkey_can_add) {
+    const why = ME.passkey_limit ? T.passkeyLimit : T.genericError
+    return cover([el('div', { class: 'faceid-mark' }, icon('faceid')), el('h1', {}, T.addFaceId.title), el('p', { class: 'sub' }, why),
+      el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: back }, el('span', {}, T.back))])
+  }
+  cover([
+    el('div', { class: 'faceid-mark' }, icon('faceid')),
+    el('h1', {}, T.addFaceId.title),
+    el('p', { class: 'sub' }, T.addFaceId.why),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
+      await passkeyHere()
+      back()
+    }) }, icon('faceid'), el('span', {}, T.addFaceId.confirm)),
+    el('button', { type: 'button', class: 'back', onclick: back }, T.commandStepUp.later),
+  ])
 }
 
 // people pick from the groups for people: groups made only for screens never show up here
@@ -868,7 +904,18 @@ function personEdit(p) {
         ? btn(T.unblock, async () => { await api('POST', `/api/admin/people/${p.id}`, { status: 'active' }); await refresh() }, 'btn-sm')
         : confirmButton(T.block, T.confirmBlock, async () => { await api('POST', `/api/admin/people/${p.id}`, { status: 'blocked' }); await refresh() }),
       p.status !== 'blocked' && p.id !== ME.person.id
-        ? btn(T.invitePasskey, async () => { await api('POST', `/api/admin/people/${p.id}/passkey-invite`, {}); toast(T.inviteSent) }, 'btn-sm') : null))
+        ? btn(T.invitePasskey, async () => { await api('POST', `/api/admin/people/${p.id}/passkey-invite`, {}); toast(T.inviteSent) }, 'btn-sm') : null),
+    personPasskeys(p))
+}
+
+// the person's Face IDs, loaded when the person is opened; removing one asks for the owner's Face ID
+function personPasskeys(p) {
+  const box = el('div', { class: 'person-passkeys' })
+  rawApi('GET', `/api/admin/people/${p.id}/passkeys`).then((keys) => {
+    box.replaceChildren(el('span', { class: 'caps' }, T.faceId),
+      passkeyList(keys, (k) => api('DELETE', `/api/admin/people/${p.id}/passkeys/${k.id}`)) || el('p', { class: 'muted' }, T.noPasskeyShort))
+  }).catch(() => {})
+  return box
 }
 
 function partGroups(top) {
@@ -1075,6 +1122,7 @@ async function start() {
   }
   if (!REHEARSAL) store.set(false)
   else if (store.get()) return rehearsalLogin()
+  if (q.get('add_passkey') === '1') return addPasskeyView()
   const stepUp = q.get('step_up')
   if (stepUp && /^[a-z][a-z0-9-]{0,30}$/.test(stepUp)) return q.get('purpose') === 'command' ? commandStepUpView(stepUp) : stepUpView(stepUp)
   const agentReq = q.get('agent_request')

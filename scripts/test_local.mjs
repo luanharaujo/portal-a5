@@ -202,7 +202,7 @@ check('resident ok', r1.status.data.status === 'ok', [r1.robot.data, r1.status.d
 const rme = (await resident.req('GET', '/api/me')).data
 check('resident tabs = tab-a, not admin', rme.admin === false && rme.tabs.join() === 'tab-a', rme)
 check('resident admin read = 403', (await resident.req('GET', '/api/admin/people')).status === 403)
-check('resident cannot register passkey', (await resident.req('POST', '/api/passkey/create/options', {})).status === 403)
+check('resident may start registering a first passkey at once (08/11)', (await resident.req('POST', '/api/passkey/create/options', {})).status === 200)
 
 // someone else sends the resident's code: nobody signs in until the owner approves
 const victimTab = client()
@@ -563,10 +563,14 @@ check('freshen owner', await freshen(owner, auth))
 const oEcho = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
 check('identity.actions: owner with Face ID gets admin and sensitive actions', ['presence', 'wipe'].every((a) => oEcho.actions.includes(a)), oEcho.actions)
 
-// C08: a new non-admin device waits 24 h or the owner's release
+// C08 (dropped by the owner, 08/11): a new resident device acts at once; the owner gets an alert instead
 let n0 = (await cmdLog()).length
-const young = await cmd(resident, 'tab-a', 'tv', { mode: 'on' })
-check('C08 new resident device: first command held', young.status === 403 && young.data.error === 'device_too_new', young)
+const young = await cmd(resident, 'tab-a', 'light')
+check('C08 new resident device: first command goes at once', young.status === 200, young)
+const resAlert = (await owner.req('GET', '/api/me')).data.alerts.find((x) => x.kind === 'resident_login')
+check('C1 a resident sign-in is an alert on the owner page, with the live session', !!resAlert && resAlert.live === true && resAlert.session_id > 0, (await owner.req('GET', '/api/me')).data.alerts)
+check('C1 the resident sees no such alert', (await resident.req('GET', '/api/me')).data.alerts.length === 0)
+n0 = (await cmdLog()).length
 const resSid = (await resident.req('GET', '/api/me')).data.session_id
 check('owner releases the resident device', (await owner.req('POST', `/api/admin/devices/${resSid}/commands`, {})).status === 200)
 check('resident cannot release devices', (await resident.req('POST', `/api/admin/devices/${resSid}/commands`, {})).status === 403)
@@ -746,8 +750,8 @@ for (const a of ['command', 'command_refused', 'shortcut_key_created', 'shortcut
   check(`audit has ${a}`, rows.some((r) => r.action === a))
 const shRow = rows.find((r) => r.action === 'command' && r.strength === 'shortcut')
 check('shortcut command audited with the key id and person, never the key', shRow && shRow.person_id === ownerId && JSON.parse(shRow.detail).shortcut > 0 && !rows.some((r) => String(r.detail).includes('pa5_atl_')), shRow)
-const refRow = rows.find((r) => r.action === 'command_refused' && JSON.parse(r.detail).reason === 'device_too_new')
-check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv', refRow)
+const refRow = rows.find((r) => r.action === 'command_refused' && JSON.parse(r.detail).reason === 'admin_only')
+check('refusal audited with its reason', !!refRow, refRow)
 
 // common action with its own passkey window (TV volume limiter, 08/11): Face ID every time, residents too
 {
@@ -758,9 +762,12 @@ check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv
   check('P2 resident without any passkey = 403 passkey_missing, no step_up', nm.status === 403 && nm.data.error === 'passkey_missing' && !nm.data.step_up, nm)
   const no = await resident.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
   check('P3 resident step_up allowed for a tab with a passkey action, but no passkey = 409 no_passkey', no.status === 409 && no.data.error === 'no_passkey', no)
+  // K1 (since 08/11): a new device registers its first key at once, no invite, no waiting
+  d1(`UPDATE sessions SET commands_ok_at = NULL WHERE id = ${resSid}`)
   const ni = await resident.req('POST', '/api/passkey/create/options', {})
-  check('P4 resident without invite cannot register = 403 passkey_invite_required', ni.status === 403 && ni.data.error === 'passkey_invite_required', ni)
-  check('P4 resident /api/me: no invite, passkeys 0', (await resident.req('GET', '/api/me')).data.passkey_invite === false)
+  check('K1 resident on a new device without invite: options 200', ni.status === 200, ni)
+  const nme = (await resident.req('GET', '/api/me')).data
+  check('K1 resident /api/me: no invite, passkeys 0, can add', nme.passkey_invite === false && nme.passkey_can_add === true && nme.passkey_add_after === null, nme)
   check('P5 weak admin cannot invite', (await admin3.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 403)
   check('P5 resident cannot invite', (await resident.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 403)
   check('freshen owner (invite)', await freshen(owner, auth))
@@ -771,17 +778,25 @@ check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv
   // R1: another device used the invite between these options and this verify: this one loses
   d1(`UPDATE passkey_invites SET used_at = '${new Date().toISOString()}' WHERE person_id = ${residentId} AND used_at IS NULL`)
   const lost = await resident.req('POST', '/api/passkey/create/verify', await (await makeAuthenticator()).create(rco.data))
-  check('R1 an invite already used elsewhere registers nothing', lost.status === 403 && lost.data.error === 'passkey_invite_required' &&
-    (await resident.req('GET', '/api/me')).data.passkeys === 0, lost)
+  // (a first key needs no invite since 08/11: the lost invite only means the key is self-registered)
+  check('R1 an invite used elsewhere is not claimed twice: this key registers as self', lost.status === 200 &&
+    (await owner.req('GET', '/api/admin/audit')).data.some((r) => r.action === 'passkey_added' && r.person_id === residentId && JSON.parse(r.detail).self === true), lost)
+  d1(`DELETE FROM passkeys WHERE person_id = ${residentId}`)
   check('freshen owner (second invite)', await freshen(owner, auth))
   check('R1 owner invites again', (await owner.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 200)
   const rco3 = await resident.req('POST', '/api/passkey/create/options', {})
   const rcv = rco3.status === 200 ? await resident.req('POST', '/api/passkey/create/verify', await authR.create(rco3.data)) : rco3
-  check('P6 invited resident registers a passkey', rcv.status === 200, [rco3.status, rcv])
+  check('P6 invited resident registers a passkey (K4: the invite skips the new-device hold)', rcv.status === 200, [rco3.status, rcv])
   const rme2 = (await resident.req('GET', '/api/me')).data
   check('P6 invite used once; resident still not admin', rme2.passkey_invite === false && rme2.passkeys === 1 && rme2.admin === false, rme2)
-  check('P6 a second passkey needs a new invite, even from a strong session', (await resident.req('POST', '/api/passkey/create/options', {})).data.error === 'passkey_invite_required')
-  check('P6 a strong resident still gets no admin reads or actions', (await resident.req('GET', '/api/admin/people')).status === 403 &&
+  check('K2 registering is not a Face ID check: passkey_at stays empty', !d1json(`SELECT passkey_at FROM sessions WHERE id = ${resSid}`)[0].passkey_at)
+  const second = await resident.req('POST', '/api/passkey/create/options', {})
+  check('K3 a second key without a fresh portal Face ID = 403 passkey_required', second.status === 403 && second.data.error === 'passkey_required' && second.data.passkey === true, second)
+  d1(`UPDATE sessions SET commands_ok_at = '${new Date().toISOString()}' WHERE id = ${resSid}`)
+  check('freshen resident (portal Face ID)', await freshen(resident, authR))
+  check('K8 resident /api/me strong false right after a portal Face ID', (await resident.req('GET', '/api/me')).data.strong === false)
+  check('K8 resident identity.strong false too', (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.strong === false)
+  check('P6 a resident with a fresh Face ID still gets no admin reads or actions', (await resident.req('GET', '/api/admin/people')).status === 403 &&
     (await cmd(resident, 'tab-a', 'presence', { state: 'home' })).data.error === 'admin_only')
   const ok1 = await cmd(resident, 'tab-a', 'limit', lim)
   check('P7 resident with a passkey check under 5 min: passkey action ok', ok1.status === 200 && ok1.data.status === 'done', ok1)
@@ -893,6 +908,68 @@ check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv
   check('T10 bad signature = 400, window still closed', br2.status === 400 && (await cmd(resident, 'tab-a', 'limit', lim)).data.error === 'passkey_required', br2)
 }
 
+// residents register their own Face ID (08/11)
+{
+  const ago = (ms) => new Date(Date.now() - ms).toISOString()
+  const ownSid = (await owner.req('GET', '/api/me')).data.session_id
+  const rows0 = (await owner.req('GET', '/api/admin/audit')).data
+  // K3: second key, with only the tab's Face ID = refused; with the portal's = ok
+  d1(`UPDATE sessions SET passkey_at = NULL WHERE id = ${resSid}`)
+  const to = await resident.req('POST', '/tab-a/_passkey/options', {})
+  check('K3 tab Face ID done', (await resident.req('POST', '/tab-a/_passkey/verify', await residentAuth.get(to.data))).status === 200)
+  check('K3 ... does not count for a second key', (await resident.req('POST', '/api/passkey/create/options', {})).data.error === 'passkey_required')
+  check('freshen resident', await freshen(resident, residentAuth))
+  const a2 = await makeAuthenticator()
+  const c2 = await resident.req('POST', '/api/passkey/create/options', {})
+  const v2 = c2.status === 200 ? await resident.req('POST', '/api/passkey/create/verify', await a2.create(c2.data)) : c2
+  check('K3 second key after the portal Face ID = 200', v2.status === 200, v2)
+  const a3 = await makeAuthenticator()
+  const c3 = await resident.req('POST', '/api/passkey/create/options', {})
+  check('K3 third key ok', c3.status === 200 && (await resident.req('POST', '/api/passkey/create/verify', await a3.create(c3.data))).status === 200)
+  const me3 = (await resident.req('GET', '/api/me')).data
+  check('K5 three keys: /api/me says limit, cannot add', me3.passkeys === 3 && me3.passkey_can_add === false && me3.passkey_limit === true, me3)
+  check('K5 a fourth = 409 passkey_limit', (await resident.req('POST', '/api/passkey/create/options', {})).data.error === 'passkey_limit')
+  check('freshen owner (invite at the limit)', await freshen(owner, auth))
+  await owner.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})
+  check('K5 ... also with an invite', (await resident.req('POST', '/api/passkey/create/options', {})).data.error === 'passkey_limit')
+  // K2 / R3: every registration is an alert on the owner's page and audited with the session age
+  const ome = (await owner.req('GET', '/api/me')).data
+  check('K2 owner sees a passkey alert per resident registration', ome.alerts.filter((x) => x.kind === 'passkey').length >= 3, ome.alerts)
+  const added = (await owner.req('GET', '/api/admin/audit')).data.filter((r) => r.action === 'passkey_added' && r.person_id === residentId)
+  check('K2/R3 audit: self or invite, with session hours and released flag', added.length >= 3 && added.every((r) => { const d = JSON.parse(r.detail); return (d.self || d.invite) && typeof d.session_hours === 'number' && 'released' in d }), added)
+  // K6: removing one's own key
+  const mine = (await resident.req('GET', '/api/me/passkeys')).data
+  check('K6 resident lists own keys (no key material)', mine.length === 3 && mine.every((k) => k.id && k.label && !('public_key' in k) && !('credential_id' in k)), mine)
+  d1(`UPDATE sessions SET passkey_at = '${ago(10 * 60e3)}' WHERE id = ${resSid}`)
+  const rm0 = await resident.req('DELETE', `/api/me/passkeys/${mine[2].id}`)
+  check('K6 remove own without a fresh Face ID = 403 passkey_required', rm0.status === 403 && rm0.data.passkey === true, rm0)
+  const ownerKeys = (await owner.req('GET', '/api/me/passkeys')).data
+  check('freshen resident (remove)', await freshen(resident, residentAuth))
+  check('K6 a key of another person through /api/me = 404', (await resident.req('DELETE', `/api/me/passkeys/${ownerKeys[0].id}`)).status === 404)
+  const tw = await resident.req('POST', '/tab-a/_passkey/options', {})
+  await resident.req('POST', '/tab-a/_passkey/verify', await residentAuth.get(tw.data))
+  check('K6 remove own with a fresh Face ID = 200', (await resident.req('DELETE', `/api/me/passkeys/${mine[2].id}`)).status === 200)
+  const after = d1json(`SELECT passkey_at, command_passkey_at FROM sessions WHERE id = ${resSid}`)[0]
+  check('R1 removing closes every Face ID window of the person', !after.passkey_at && !after.command_passkey_at, after)
+  check('K6 audit passkey_removed', (await owner.req('GET', '/api/admin/audit')).data.some((r) => r.action === 'passkey_removed' && r.target === String(residentId)))
+  // K7: the owner removes a resident's key, strong only
+  const theirs = (await owner.req('GET', `/api/admin/people/${residentId}/passkeys`)).data
+  check('K7 owner lists the resident keys', Array.isArray(theirs) && theirs.length === 2, theirs)
+  check('K7 resident cannot list another person keys', (await resident.req('GET', `/api/admin/people/${residentId}/passkeys`)).status === 403)
+  d1(`UPDATE sessions SET passkey_at = '${ago(10 * 60e3)}' WHERE id = ${ownSid}`)
+  check('K7 weak owner cannot remove = 403', (await owner.req('DELETE', `/api/admin/people/${residentId}/passkeys/${theirs[1].id}`)).status === 403)
+  check('freshen owner (remove)', await freshen(owner, auth))
+  check('K7 strong owner removes = 200', (await owner.req('DELETE', `/api/admin/people/${residentId}/passkeys/${theirs[1].id}`)).status === 200)
+  check('K7 ... and the resident is down to one', (await resident.req('GET', '/api/me')).data.passkeys === 1)
+  // K8: strong is an admin's only
+  check('K8 owner strong true after a portal Face ID', (await owner.req('GET', '/api/me')).data.strong === true &&
+    (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.strong === true)
+  // K9: screens never register
+  check('K9 screen cannot register', (await tvc.req('POST', '/api/passkey/create/options', {})).status === 403)
+  check('K9 screen /api/me cannot add', (await tvc.req('GET', '/api/me')).data.passkey_can_add === false)
+  void rows0
+}
+
 // the selector in a real browser (owner, resident and a freshly paired screen)
 const g5 = await owner.req('POST', '/api/passkey/get/options', {})
 await owner.req('POST', '/api/passkey/get/verify', await auth.get(g5.data))
@@ -942,6 +1019,8 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')
   check('see as: Face ID from the tab page refused', (await owner.req('POST', '/tab-a/_passkey/options', {})).data.error === 'admin_only')
+  check('K9 see as: registering refused', (await owner.req('POST', '/api/passkey/create/options', {})).status === 403)
+  check('K8 see as: strong false', (await owner.req('GET', '/api/me')).data.strong === false)
   const logBefore = (await cmdLog()).length
   const vl = await cmd(owner, 'tab-a', 'light')
   check('rehearsal: common command answers done + simulated (no new-device hold)', vl.status === 200 && vl.data.status === 'done' && vl.data.ok === true && vl.data.simulated === true && UUID.test(vl.data.id), vl)

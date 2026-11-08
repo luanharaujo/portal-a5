@@ -209,6 +209,14 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
       dot: document.querySelector('[data-a5-tabs] > .a5-tabs-dot').hidden })`)
     check('browser: resident sees Tab A and Conta only, no dot', rm.names.join() === 'Tab A,Conta' && rm.dot === true, rm)
 
+    // a tab sends a person without Face ID to /conta/?add_passkey=1&next=...: one button, then back (K10: next only a portal path)
+    for (const [next, back] of [['//evil.example/x', '/conta/'], ['https://evil.example/x', '/conta/'], ['/tab-a/page', '/tab-a/page'], ['/\\evil.example', '/conta/'], ['/tab-a/\\x', '/conta/'], ['javascript:alert(1)', '/conta/']]) {
+      await r.go('/conta/?add_passkey=1&next=' + encodeURIComponent(next))
+      const shown = await r.waitFor(`document.querySelector('.sheet h1')?.textContent === A5_TEXT.addFaceId.title`)
+      await r.evaluate(`document.querySelector('.sheet button.back').click()`)
+      check(`browser: add Face ID page, next ${next} -> back to ${back}`, shown && await r.waitFor(`location.origin === ${JSON.stringify(base)} && location.pathname === ${JSON.stringify(back)}`))
+    }
+
     // a fixed screen: plain title, and "/" goes straight to its tab
     if (screen) {
       const s = await page(b, base, screen)
