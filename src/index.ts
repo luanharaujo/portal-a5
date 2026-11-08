@@ -12,7 +12,7 @@ import {
   policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig,
 } from './tabs'
 import {
-  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, adminWindowUntil, allowedActions, checkParams, checkScope, gapKeyOf,
+  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, adminWindowUntil, allowedActions, passkeyUntil, checkParams, checkScope, gapKeyOf,
   isShortcutKeyShape, pickReturns, readAnswer, refusal,
 } from './commands'
 
@@ -506,7 +506,7 @@ async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
   if (newIp) await alertAdmins(env, req, `${tab}:${m.label}`, 'bridge_ip')
   const identity: PortalIdentity = {
     credential: 'machine', person: null, name: String(m.label), groups: [], session: null, machine: id, shortcut: null,
-    strong: false, entered_at: null, entry_until: null, admin_until: null, actions: [],
+    strong: false, entered_at: null, entry_until: null, admin_until: null, actions: [], passkey_until: {},
   }
   return forwardSocket(env, req, service, tab, identity, null)
 }
@@ -684,10 +684,14 @@ async function checkPurpose(env: Env, who: Who, raw: unknown): Promise<string | 
 // 'command:<tab>': the Face ID a tab page asks for before an owner's command (the tab pages
 // cannot run WebAuthn). It only opens the session's window for admin commands (passkey_at, as any
 // passkey check does) and is audited; the tab never resends a command on its own afterwards.
+// Anyone with the tab may do it when the tab has an action with its own `passkey` window; otherwise
+// only an admin, for the tab's admin or sensitive actions. Never while seeing as.
 function commandPurpose(env: Env, who: Who, tab: string): string {
-  if (!who.admin || who.kind !== 'browser') throw new HttpError(403, 'admin_only')
+  if (who.kind !== 'browser' || who.viewAs) throw new HttpError(403, 'admin_only')
   const catalog = catalogOf(env, tab)
-  if (!tabService(env, tab) || !canOpen(who, tab) || !Object.values(catalog).some((c) => c.level !== 'common')) throw new HttpError(400, 'bad_purpose')
+  const needs = Object.values(catalog).some((c) => !!c.passkey || (who.admin && c.level !== 'common'))
+  if (!needs && !who.admin) throw new HttpError(403, 'admin_only')
+  if (!tabService(env, tab) || !canOpen(who, tab) || !needs) throw new HttpError(400, 'bad_purpose')
   return `command:${tab}`
 }
 
@@ -702,8 +706,21 @@ function entryPurpose(env: Env, who: Who, raw: unknown): string | null {
 // From a weak session a passkey can be added only (a) when the portal has no passkey at all,
 // once, with the owner in front of the screen, or (b) with an unexpired invite a strong admin
 // created for this person. Anything else needs a fresh passkey check.
+// A non-admin (resident, 08/11: for actions with their own `passkey` window) adds one only with an
+// invite, every time, even from a strong session: a second device is the owner's call too.
+async function pendingInvite(env: Env, personId: number): Promise<number | null> {
+  const inv = await env.DB.prepare('SELECT id FROM passkey_invites WHERE person_id = ? AND expires_at > ? AND used_at IS NULL ORDER BY id DESC')
+    .bind(personId, now()).first<{ id: number }>()
+  return inv?.id ?? null
+}
+
 async function canAddPasskey(env: Env, who: Who): Promise<number | null> {
-  if (!who.admin) throw new HttpError(403, 'passkey_admin_only')
+  if (who.kind !== 'browser' || who.viewAs) throw new HttpError(403, 'passkey_admin_only')
+  if (!who.admin) {
+    const inv = await pendingInvite(env, who.person.id)
+    if (inv) return inv
+    throw new HttpError(403, 'passkey_invite_required')
+  }
   if (fresh(who)) return null
   const any = await env.DB.prepare('SELECT 1 FROM passkeys LIMIT 1').first()
   if (!any) return null
@@ -713,9 +730,11 @@ async function canAddPasskey(env: Env, who: Who): Promise<number | null> {
   throw new HttpError(403, 'passkey_required', { passkey: true })
 }
 
+// Any person (never a fixed screen), active.
 async function createInvite(env: Env, req: Request, who: Who, personId: number) {
-  const target = (await groupsOf(env, personId)).some((g) => g.is_admin)
-  if (!target) throw new HttpError(409, 'invite_admin_only')
+  const target = await env.DB.prepare('SELECT kind, status FROM people WHERE id = ?').bind(personId).first<{ kind: string; status: string }>()
+  if (!target) throw new HttpError(404, 'person_not_found')
+  if (target.kind === 'screen' || target.status !== 'active') throw new HttpError(409, 'invite_not_allowed')
   await env.DB.prepare('INSERT INTO passkey_invites (person_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)')
     .bind(personId, who.person.id, now(), inMs(864e5)).run()
   await audit(env, req, { who, action: 'passkey_invite', target: String(personId) })
@@ -753,10 +772,14 @@ async function passkeyCreateVerify(req: Request, env: Env, url: URL, who: Who) {
     throw e
   }
   const label = text(b.label, 60) ?? deviceLabel(req.headers.get('User-Agent'), null)
+  // one invite, one passkey: claim it before inserting (two devices at once cannot both use it)
+  if (invite) {
+    const claimed = await env.DB.prepare('UPDATE passkey_invites SET used_at = ? WHERE id = ? AND used_at IS NULL').bind(now(), invite).run()
+    if (!claimed.meta.changes) throw new HttpError(403, who.admin ? 'passkey_required' : 'passkey_invite_required', who.admin ? { passkey: true } : {})
+  }
   await env.DB.prepare('INSERT INTO passkeys (person_id, credential_id, public_key, sign_count, label, created_at) VALUES (?, ?, ?, ?, ?, ?)')
     .bind(who.person.id, reg.credentialId, reg.publicKey, reg.signCount, label, now()).run()
   await env.DB.prepare('UPDATE sessions SET passkey_at = ? WHERE id = ?').bind(now(), who.sessionId).run()
-  if (invite) await env.DB.prepare('UPDATE passkey_invites SET used_at = ? WHERE id = ?').bind(now(), invite).run()
   await audit(env, req, { who, strength: 'strong', action: 'passkey_added', target: label, detail: invite ? { invite } : null })
   return { ok: true }
 }
@@ -843,7 +866,9 @@ async function me(env: Env, who: Who) {
     session_id: who.sessionId,
     credential: who.kind,
     strong: fresh(who),
-    passkeys: who.admin ? await passkeyCount(env, who.person.id) : 0,
+    // the made-up resident of a rehearsal has none
+    passkeys: who.viewAs || who.kind !== 'browser' ? 0 : await passkeyCount(env, who.person.id),
+    passkey_invite: !who.admin && !who.viewAs && who.kind === 'browser' ? !!(await pendingInvite(env, who.person.id)) : false,
     alerts: await alertsOf(env, who),
     commands_off: who.admin ? await commandsOff(env) : undefined,
   }
@@ -1139,6 +1164,7 @@ function identityOf(env: Env, tab: string, who: Who, policy: TabPolicy, enteredA
     // same rule as the commands (callerOf): only a browser session of an admin, never while seeing as
     admin_until: who.kind === 'browser' && who.admin ? adminWindowUntil(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY) : null,
     actions: allowedActions(tab, catalogOf(env, tab), callerOf(env, who)),
+    passkey_until: passkeyUntil(catalogOf(env, tab), callerOf(env, who)),
     ...(who.viewAs ? { rehearsal: true } : {}),
   }
 }
@@ -1303,7 +1329,10 @@ const catalogOf = (env: Env, tab: string): Catalog => tabsConfig(env.TABS)[tab]?
 
 // identity.actions and every command use the same rule: this session's own passkey_at.
 function callerOf(env: Env, who: Who): Caller {
-  return { credential: who.kind, admin: who.admin, strong: fresh(who), adminFresh: adminWindowOk(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY), scope: null }
+  return {
+    credential: who.kind, admin: who.admin, strong: fresh(who), adminFresh: adminWindowOk(who.passkeyAt, env.ADMIN_COMMAND_PASSKEY), scope: null,
+    passkeyAt: who.passkeyAt, rehearsal: !!who.viewAs,
+  }
 }
 
 interface ShortcutKey { id: number; person: Person; groups: Group[]; admin: boolean; tabs: Set<string>; label: string; scope: string[] }
@@ -1348,8 +1377,14 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     ? { credential: 'shortcut', admin: c.key.admin, strong: false, adminFresh: false, scope: c.key.scope }
     : callerOf(env, c.who!)
   const why = refusal(tab, action, spec, caller)
-  // an owner on a page: where the portal asks the Face ID (the tab page cannot), coming back to the tab
-  if (why === 'passkey_required' && c.who?.admin && c.who.kind === 'browser') {
+  // an action with its own passkey window, for anyone: a person with no passkey at all is told so
+  // (an admin invites them from the account page) instead of being sent to a Face ID that cannot work
+  if (why === 'passkey_required' && spec.passkey && c.who?.kind === 'browser' &&
+    !(await env.DB.prepare('SELECT 1 FROM passkeys WHERE person_id = ? LIMIT 1').bind(person.id).first())) {
+    return refuse(403, 'passkey_missing')
+  }
+  // a page: where the portal asks the Face ID (the tab page cannot), coming back to the tab
+  if (why === 'passkey_required' && c.who?.kind === 'browser' && !c.who.viewAs && (c.who.admin || spec.passkey)) {
     return refuse(403, why, { step_up: `/?step_up=${tab}&purpose=command&next=${encodeURIComponent(`/${tab}/`)}` })
   }
   if (why) return refuse(403, why)
@@ -1395,7 +1430,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     ? {
       credential: 'shortcut', person: person.id, name: person.name, groups: c.key.groups.map((g) => g.id), session: null,
       machine: null, shortcut: c.key.id, strong: false, entered_at: null, entry_until: null, admin_until: null,
-      actions: allowedActions(tab, catalogOf(env, tab), caller),
+      actions: allowedActions(tab, catalogOf(env, tab), caller), passkey_until: {},
     }
     : identityOf(env, tab, c.who!, policy, c.enteredAt)
 

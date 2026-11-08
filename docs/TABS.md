@@ -52,6 +52,8 @@ interface PortalIdentity {
   shortcut: number | null    // Shortcuts key id; only for shortcuts
   actions: string[]          // commands this identity may send in the tab (COMMANDS.md)
   admin_until: string | null // when this session's window for admin commands closes, or null (COMMANDS.md)
+  passkey_until: Record<string, string> // actions with their own `passkey` window that are open on this
+                             // browser session: action -> when it closes (ISO); {} otherwise (COMMANDS.md)
 }
 ```
 

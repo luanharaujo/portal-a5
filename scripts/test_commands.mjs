@@ -1,6 +1,6 @@
 // Unit checks for src/commands.ts (catalog, parameters, levels, key scope). No server needed:
 //   node scripts/test_commands.mjs
-import { adminWindowOk, parseCatalogStrict, allowedActions, checkParams, checkScope, gapKeyOf, isShortcutKeyShape, parseCatalog, pickReturns, readAnswer, refusal } from '../src/commands.ts'
+import { adminWindowOk, passkeyUntil, passkeyWindowOk, parseCatalogStrict, allowedActions, checkParams, checkScope, gapKeyOf, isShortcutKeyShape, parseCatalog, pickReturns, readAnswer, refusal } from '../src/commands.ts'
 
 let failures = 0
 function check(name, cond, extra) {
@@ -102,6 +102,43 @@ check('admin window: never checked refused', !adminWindowOk(null, 'session', T0)
 check('admin window: 5m setting', adminWindowOk(ago(4 * 60e3), '5m', T0) && !adminWindowOk(ago(6 * 60e3), '5m', T0))
 check('admin window: malformed setting = 5 min', adminWindowOk(ago(4 * 60e3), 'forever', T0) && !adminWindowOk(ago(6 * 60e3), '12 h', T0))
 check('admin window: session', adminWindowOk(ago(100 * 86400e3), 'session', T0))
+
+// actions with their own passkey window (TV volume limiter, 08/11)
+const pk = parseCatalog({
+  limit: { level: 'common', passkey: '5m', params: { on: { bool: true }, top: { int: [10, 60] } }, screens: false, shortcut: false },
+  limit_bare: { level: 'common', passkey: '1m' },
+  adm: { level: 'admin', passkey: '60m' },
+  // each must be dropped
+  with_screens: { level: 'common', passkey: '5m', screens: true },
+  with_shortcut: { level: 'common', passkey: '5m', shortcut: true },
+  on_sensitive: { level: 'sensitive', passkey: '5m' },
+  too_long: { level: 'common', passkey: '61m' },
+  zero: { level: 'common', passkey: '0m' },
+  hours: { level: 'common', passkey: '1h' },
+  number: { level: 'common', passkey: 5 },
+  empty: { level: 'common', passkey: '' },
+})
+check('passkey: only well-formed actions kept', Object.keys(pk).sort().join() === 'adm,limit,limit_bare', Object.keys(pk))
+check('passkey: window in ms; never screens or keys', pk.limit.passkey === 300e3 && pk.limit_bare.passkey === 60e3 && !pk.limit_bare.screens && !pk.limit_bare.shortcut)
+check('passkey: other actions have none', cat.tv.passkey === null)
+const N = Date.parse('2026-11-08T12:00:00Z')
+const at = (ms) => new Date(N - ms).toISOString()
+const rWith = (ms, extra = {}) => ({ ...resident, passkeyAt: ms == null ? null : at(ms), ...extra })
+check('passkey: resident never checked = passkey_required', refusal('h', 'limit', pk.limit, rWith(null)) === 'passkey_required')
+check('passkey: resident 4 min ago = ok', passkeyWindowOk(pk.limit, rWith(4 * 60e3), N))
+check('passkey: window edges', passkeyWindowOk(pk.limit, rWith(299e3), N) && !passkeyWindowOk(pk.limit, rWith(300e3), N))
+check('passkey: a check in the future does not count', !passkeyWindowOk(pk.limit, rWith(-5 * 60e3), N))
+check('passkey: owner with 12 h window still needs it', refusal('h', 'limit', pk.limit, { ...ownerDevice, passkeyAt: null }) === 'passkey_required')
+check('passkey: admin action with passkey: resident admin_only first', refusal('h', 'adm', pk.adm, rWith(0)) === 'admin_only')
+check('passkey: screen and key refused', refusal('h', 'limit', pk.limit, screen) === 'not_for_screens' && refusal('h', 'limit', pk.limit, key(['h/limit'])) === 'not_for_shortcuts')
+check('passkey: rehearsal counts as open', passkeyWindowOk(pk.limit, rWith(null, { rehearsal: true }), N))
+check('passkey: listed in actions for a browser while closed; never for a screen',
+  allowedActions('h', pk, rWith(null)).join() === 'limit,limit_bare' && allowedActions('h', pk, screen).length === 0)
+check('passkey: admin with passkey action listed for the owner while closed', allowedActions('h', pk, { ...ownerWeak, passkeyAt: null }).includes('adm'))
+const pu = passkeyUntil(pk, rWith(60e3), N)
+check('passkey_until: open windows only, ISO', pu.limit === new Date(N + 240e3).toISOString() && pu.limit_bare === undefined && pu.adm === new Date(N + 3540e3).toISOString(), pu)
+check('passkey_until: empty for screens and keys', Object.keys(passkeyUntil(pk, { ...screen, passkeyAt: at(0) }, N)).length === 0 && Object.keys(passkeyUntil(pk, key(['h/limit']), N)).length === 0)
+check('passkey: never in a key scope', checkScope(['h/limit'], { h: pk }, true) === null)
 
 console.log(failures ? `\n${failures} FAILED` : '\nall ok')
 process.exit(failures ? 1 : 0)

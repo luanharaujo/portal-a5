@@ -29,6 +29,8 @@ export interface PortalIdentity {
   actions: string[]          // commands this identity may send in the tab (docs/COMMANDS.md)
   admin_until: string | null // admin commands from this browser session need no new Face ID until
                              // then (ADMIN_COMMAND_PASSKEY window); null = ask (docs/COMMANDS.md)
+  passkey_until: Record<string, string> // actions with their own `passkey` window: action -> when
+                             // the window on this browser session closes (ISO); absent = ask Face ID first
   rehearsal?: true          // an admin rehearsing as a resident ("see as"): commands come back
                              // simulated; show the made-up resident (T.rehearsal.name), not name
 }

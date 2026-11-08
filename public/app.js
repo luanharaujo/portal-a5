@@ -411,8 +411,8 @@ function commandStepUpView(tab) {
   const next = n && n.startsWith(`/${tab}/`) ? n : `/${tab}/`
   cover([
     el('div', { class: 'faceid-mark' }, icon('faceid')),
-    el('h1', {}, T.commandStepUp.title),
-    el('p', { class: 'sub' }, T.commandStepUp.why),
+    el('h1', {}, ME.admin ? T.commandStepUp.title : T.commandStepUp.titleAnyone),
+    el('p', { class: 'sub' }, ME.admin ? T.commandStepUp.why : T.commandStepUp.whyAnyone),
     el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
       await passkeyCheck(`command:${tab}`)
       location.href = next
@@ -647,7 +647,8 @@ let agentReqId = null // ?agent_request=<id> shows that request in the pane
 
 const PARTS = {
   aparelhos: { ico: 'phone', color: 'off', title: () => T.myDevices, render: partMyDevices },
-  faceid: { admin: true, ico: 'faceid', color: 'ok', title: () => T.faceId, render: partFaceId },
+  // residents see it once they have a passkey or an invite to make one
+  faceid: { show: () => ME.admin || !!ME.passkeys || !!ME.passkey_invite, ico: 'faceid', color: 'ok', title: () => T.faceId, render: partFaceId },
   pedidos: { admin: true, ico: 'inbox', color: 'sun', title: () => T.requests, render: partRequests },
   pessoas: { admin: true, ico: 'people', color: 'on', title: () => T.people, render: partPeople },
   grupos: { admin: true, ico: 'layers', color: 'gray', title: () => T.groups, render: partGroups },
@@ -661,7 +662,7 @@ const PARTS = {
 }
 const YOU = ['aparelhos', 'faceid']
 const HOUSE = ['pedidos', 'pessoas', 'grupos', 'telas', 'agentes', 'pontes', 'comandos', 'atalhos', 'todos', 'auditoria']
-const allowed = (k) => PARTS[k] && (!PARTS[k].admin || ME.admin)
+const allowed = (k) => PARTS[k] && (PARTS[k].show ? PARTS[k].show() : (!PARTS[k].admin || ME.admin))
 
 async function loadData() {
   const get = (p) => rawApi('GET', p)
@@ -748,7 +749,7 @@ function summary(k) {
   const badge = (n) => n ? el('span', { class: 'badge' }, String(n)) : null
   switch (k) {
     case 'aparelhos': return [D.devices.map((d) => (d.label || T.device) + (d.current ? T.thisOne : '')).slice(0, 2).join(', '), String(D.devices.length)]
-    case 'faceid': return [ME.passkeys ? T.passkeyShort(ME.passkeys) : T.noPasskeyShort, ME.passkeys ? null : badge('!')]
+    case 'faceid': return [ME.passkeys ? T.passkeyShort(ME.passkeys) : T.noPasskeyShort, !ME.passkeys || ME.passkey_invite ? badge('!') : null]
     case 'pedidos': return [D.requests.length ? T.requestsLine(D.requests.length) : T.noRequests, badge(D.requests.length)]
     case 'pessoas': return [names(D.people, 4), String(D.people.length)]
     case 'grupos': return [D.groups.map(groupName).join(' · '), null]
@@ -802,6 +803,12 @@ function partFaceId(top) {
   const add = async () => {
     await passkeyHere()
     toast(T.passkeyAdded); await refresh()
+  }
+  // a resident adds one only with an invite (each device is the owner's call)
+  if (!ME.admin) {
+    return [top(T.faceId, ME.passkey_invite ? T.inviteWaiting : ME.passkeys ? T.askInvite : T.noPasskeyResident),
+      el('div', { class: 'card pad' }, el('div', { class: 'faceid-mark' }, icon('faceid')),
+        ME.passkey_invite ? btn(T.addPasskeyHere, add, 'btn-primary btn-block', 'plus') : null)]
   }
   return [top(T.faceId, ME.passkeys ? T.passkeyCount(ME.passkeys) : T.noPasskey),
     el('div', { class: 'card pad' }, el('div', { class: 'faceid-mark' }, icon('faceid')),
@@ -860,7 +867,7 @@ function personEdit(p) {
       p.status === 'blocked'
         ? btn(T.unblock, async () => { await api('POST', `/api/admin/people/${p.id}`, { status: 'active' }); await refresh() }, 'btn-sm')
         : confirmButton(T.block, T.confirmBlock, async () => { await api('POST', `/api/admin/people/${p.id}`, { status: 'blocked' }); await refresh() }),
-      p.groups.includes('owner') && p.id !== ME.person.id
+      p.status !== 'blocked' && p.id !== ME.person.id
         ? btn(T.invitePasskey, async () => { await api('POST', `/api/admin/people/${p.id}/passkey-invite`, {}); toast(T.inviteSent) }, 'btn-sm') : null))
 }
 

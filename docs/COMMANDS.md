@@ -40,6 +40,7 @@ Each tab lists its actions under `commands`. The list lives in the deploy config
 | `screens` | fixed screens may send it (`common` only) | false |
 | `shortcut` | may go in a Shortcuts key (never `sensitive`) | true |
 | `returns` | result fields the caller gets back (strings up to 80, numbers, booleans) | none |
+| `passkey` | `"<n>m"` (1 to 60): on top of the level, a passkey check on this very browser session within that time, for anyone who runs it, admins included (section 3). Only on `common` or `admin`; never for screens or keys (`screens: true` or `shortcut: true` next to it drops the action) | none |
 
 Prefer absolute states (`on`/`off`) to a toggle: a command repeated or arriving twice then does no harm. A reading (is the TV on?) is never a command: it goes in the tab's `state`, where the tab decides who sees it.
 
@@ -53,6 +54,22 @@ Action names: `^[a-z][a-z0-9_]{0,39}$`, at most 40 per tab. A malformed action i
 | `admin` | admin group, with a passkey check within `ADMIN_COMMAND_PASSKEY` on this very session (`ADMIN_COMMAND_PASSKEY` in wrangler.toml: `12h`, one Face ID a day; `<n>m`/`<n>h`, or `session`; missing or malformed = 5 minutes). Shortcuts keys need no Face ID: the key is the proof | never | admin's key, if in scope |
 | `sensitive` | admin with a passkey check in the last 5 minutes | never | never |
 
+### Actions with their own passkey window (`passkey`)
+
+For something every resident may do but only with Face ID each time (the TV volume limiter):
+
+```json
+"tv_limit": {"level": "common", "passkey": "5m", "params": {"on": {"bool": true}, "max": {"int": [10, 60]}},
+             "perHour": 30, "screens": false, "shortcut": false, "returns": ["on", "max"]}
+```
+
+- Browser sessions only, anyone with the tab. The check must be on this session within the window; the admin window (`ADMIN_COMMAND_PASSKEY`) does not count. Everything else still applies (device hold, brake, limits).
+- `identity.actions` lists it for every browser session with the tab, open or not; never for a screen or a key.
+- `identity.passkey_until`: `{"<action>": "<ISO>"}` for each such action whose window is open on this session; an action missing from it means "ask Face ID first". `{}` for screens and keys.
+- Refused with 403 `passkey_missing` when the person has no passkey at all (no `step_up`: an admin must invite them, account page > People), else 403 `passkey_required` with `step_up`.
+- Residents get a passkey only with an invite (README), one invite per passkey.
+- "See as": the window counts as open (`passkey_until` shows a full window from now) and the command comes back simulated, like any rehearsal.
+
 On top of the level, the person's groups must still give the tab, at the moment of the command (a key loses an action as soon as its person loses it). Data that only an admin may see (presence) goes in `admin` actions, never `common`.
 
 `identity.actions` (TABS.md section 2) lists the actions this identity may run in the tab, so a page shows only the buttons that can work. For an admin's browser session it includes the `admin` actions even while the Face ID window is closed (`admin_until` null): the page shows them and asks for Face ID before sending, and their admin-only readings (presence) are shown too. Never `sensitive` ones without the check, never for a screen, a key or "see as". It is a hint for the page; the portal checks again on every command. `identity.admin_until` says when this session's window for `admin` actions closes (ISO), or null when it is not open (no recent check, not an admin, a fixed screen, "see as"); a page can ask for Face ID before the tap instead of after a refusal.
@@ -63,7 +80,7 @@ A tab page cannot run WebAuthn (its CSP). It sends the person to the portal, ful
 
 `/?step_up=<tab>&purpose=command&next=<path>` (`next` must start with `/<tab>/`; a `#` in it comes back intact)
 
-The portal page asks for Face ID with the purpose `command:<tab>` (admin browser sessions only, not while seeing as; the tab must exist, be open to the person and have an `admin` or `sensitive` action, otherwise 400 `bad_purpose`). The check sets the session's passkey time, which opens the `admin` window (and, for 5 minutes, `sensitive`), audits `command_passkey_ok` with the tab as target and goes back to `next`. "Not now" goes back too. Nothing is resent on the way back: the person taps the command again. A page command refused with `passkey_required` for an admin's browser session carries that address as `step_up` (`next` = `/<tab>/`).
+The portal page asks for Face ID with the purpose `command:<tab>` (browser sessions, not while seeing as: 403 `admin_only`). The tab must exist, be open to the person and have an action with `passkey` (anyone) or an `admin` or `sensitive` one (admins only); a non-admin on a tab without `passkey` actions gets 403 `admin_only`, anything else 400 `bad_purpose`. A person without a passkey gets 409 `no_passkey` and the page says to ask for an invite. The check sets the session's passkey time, which opens the `admin` window (and, for 5 minutes, `sensitive`), audits `command_passkey_ok` with the tab as target and goes back to `next`. "Not now" goes back too. Nothing is resent on the way back: the person taps the command again. A page command refused with `passkey_required` carries that address as `step_up` (`next` = `/<tab>/`) for an admin's browser session, and for anyone's when the action has `passkey`.
 
 ## 4. Routes
 
@@ -102,7 +119,7 @@ No cookie, no session. Browsers cannot send this from another site: `Authorizati
 | 502 | `failed` | the bridge tried and failed |
 | 503 | `offline` | no bridge connected |
 
-Refusals before the tab: 404 `unknown_action` (or `not_found` for a tab that does not exist); 400 `bad_params`, `unknown_param`, `missing_param`, `bad_param`; 401 `bad_key`; 403 `no_tab_access`, `admin_only`, `passkey_required`, `not_for_screens`, `not_for_shortcuts`, `out_of_scope`, `device_too_new`; 429 `too_many_commands`, `too_soon` (with `retry_after` in seconds), `too_many_attempts`; 503 `commands_off`.
+Refusals before the tab: 404 `unknown_action` (or `not_found` for a tab that does not exist); 400 `bad_params`, `unknown_param`, `missing_param`, `bad_param`; 401 `bad_key`; 403 `no_tab_access`, `admin_only`, `passkey_required`, `passkey_missing`, `not_for_screens`, `not_for_shortcuts`, `out_of_scope`, `device_too_new`; 429 `too_many_commands`, `too_soon` (with `retry_after` in seconds), `too_many_attempts`; 503 `commands_off`.
 
 ## 5. Shortcuts keys
 

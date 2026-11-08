@@ -555,7 +555,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 
 check('C01 a tab with one malformed command is never routed', (await owner.req('GET', '/tab-badcmd/echo', undefined, CORS)).status === 404)
 const rEcho = (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
-check('identity.actions: resident gets common actions only (no presence, no sensitive)', rEcho.actions.join() === 'tv,ac,light,slow,boom', rEcho.actions)
+check('identity.actions: resident gets common actions only (no presence, no sensitive)', rEcho.actions.join() === 'tv,ac,light,slow,boom,limit', rEcho.actions)
 check('identity.shortcut is null for a page', rEcho.shortcut === null)
 check('freshen owner', await freshen(owner, auth))
 const oEcho = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
@@ -637,8 +637,8 @@ check('C07 weak admin session: admin action = 403 passkey_required', wp.status =
 check('passkey_required on a page points to the portal Face ID for commands', wp.data.step_up === '/?step_up=tab-a&purpose=command&next=%2Ftab-a%2F', wp.data)
 check('identity.admin_until: null without a passkey check', (await admin3.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.admin_until === null)
 {
-  const ro = await resident.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
-  check('command Face ID: refused to a resident', ro.status === 403, ro)
+  const ro = await resident.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-slow' })
+  check('command Face ID: refused to a resident on a tab without passkey actions', ro.status === 403, ro)
   const so = await owner.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-slow' })
   check('command Face ID: refused for a tab without owner commands', so.status === 400 && so.data.error === 'bad_purpose', so)
   const co = await owner.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
@@ -664,6 +664,7 @@ if (setPasskeyAt(12 * 3600e3 + 60e3)) {
   d1(`UPDATE sessions SET passkey_at = NULL WHERE id = ${a3sid}`)
 } else check('B2 local D1 reachable from the test', false)
 check('weak admin session: common action ok (admins are not held)', (await cmd(admin3, 'tab-a', 'light')).status === 200)
+
 const op = await cmd(owner, 'tab-a', 'presence', { state: 'out' })
 check('owner device with passkey: admin action ok, nothing read back', op.status === 200 && op.data.result === undefined, op)
 check('owner with fresh Face ID: sensitive ok', (await freshen(owner, auth)) && (await cmd(owner, 'tab-a', 'wipe')).status === 200)
@@ -746,6 +747,69 @@ check('shortcut command audited with the key id and person, never the key', shRo
 const refRow = rows.find((r) => r.action === 'command_refused' && JSON.parse(r.detail).reason === 'device_too_new')
 check('refusal audited with its reason', !!refRow && refRow.target === 'tab-a/tv', refRow)
 
+// common action with its own passkey window (TV volume limiter, 08/11): Face ID every time, residents too
+{
+  const lim = { on: true, top: 30 }
+  const rid = (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
+  check('P1 resident identity lists the passkey action, window closed', rid.actions.includes('limit') && JSON.stringify(rid.passkey_until) === '{}', rid)
+  const nm = await cmd(resident, 'tab-a', 'limit', lim)
+  check('P2 resident without any passkey = 403 passkey_missing, no step_up', nm.status === 403 && nm.data.error === 'passkey_missing' && !nm.data.step_up, nm)
+  const no = await resident.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
+  check('P3 resident step_up allowed for a tab with a passkey action, but no passkey = 409 no_passkey', no.status === 409 && no.data.error === 'no_passkey', no)
+  const ni = await resident.req('POST', '/api/passkey/create/options', {})
+  check('P4 resident without invite cannot register = 403 passkey_invite_required', ni.status === 403 && ni.data.error === 'passkey_invite_required', ni)
+  check('P4 resident /api/me: no invite, passkeys 0', (await resident.req('GET', '/api/me')).data.passkey_invite === false)
+  check('P5 weak admin cannot invite', (await admin3.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 403)
+  check('P5 resident cannot invite', (await resident.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 403)
+  check('freshen owner (invite)', await freshen(owner, auth))
+  check('P5 owner invites the resident', (await owner.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 200)
+  check('P5 resident /api/me shows the invite', (await resident.req('GET', '/api/me')).data.passkey_invite === true)
+  const authR = await makeAuthenticator()
+  const rco = await resident.req('POST', '/api/passkey/create/options', {})
+  // R1: another device used the invite between these options and this verify: this one loses
+  d1(`UPDATE passkey_invites SET used_at = '${new Date().toISOString()}' WHERE person_id = ${residentId} AND used_at IS NULL`)
+  const lost = await resident.req('POST', '/api/passkey/create/verify', await (await makeAuthenticator()).create(rco.data))
+  check('R1 an invite already used elsewhere registers nothing', lost.status === 403 && lost.data.error === 'passkey_invite_required' &&
+    (await resident.req('GET', '/api/me')).data.passkeys === 0, lost)
+  check('freshen owner (second invite)', await freshen(owner, auth))
+  check('R1 owner invites again', (await owner.req('POST', `/api/admin/people/${residentId}/passkey-invite`, {})).status === 200)
+  const rco3 = await resident.req('POST', '/api/passkey/create/options', {})
+  const rcv = rco3.status === 200 ? await resident.req('POST', '/api/passkey/create/verify', await authR.create(rco3.data)) : rco3
+  check('P6 invited resident registers a passkey', rcv.status === 200, [rco3.status, rcv])
+  const rme2 = (await resident.req('GET', '/api/me')).data
+  check('P6 invite used once; resident still not admin', rme2.passkey_invite === false && rme2.passkeys === 1 && rme2.admin === false, rme2)
+  check('P6 a second passkey needs a new invite, even from a strong session', (await resident.req('POST', '/api/passkey/create/options', {})).data.error === 'passkey_invite_required')
+  check('P6 a strong resident still gets no admin reads or actions', (await resident.req('GET', '/api/admin/people')).status === 403 &&
+    (await cmd(resident, 'tab-a', 'presence', { state: 'home' })).data.error === 'admin_only')
+  const ok1 = await cmd(resident, 'tab-a', 'limit', lim)
+  check('P7 resident with a passkey check under 5 min: passkey action ok', ok1.status === 200 && ok1.data.status === 'done', ok1)
+  const pu = (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.passkey_until
+  const pl = Date.parse(pu.limit) - Date.now()
+  check('P7 identity.passkey_until.limit about 5 min ahead, only passkey actions', Object.keys(pu).join() === 'limit' && pl > 4 * 60e3 && pl <= 5 * 60e3, pu)
+  check('P7 parameters still checked', (await cmd(resident, 'tab-a', 'limit', { on: true, top: 70 })).data.error === 'bad_param')
+  d1(`UPDATE sessions SET passkey_at = '${new Date(Date.now() - 5 * 60e3 - 30e3).toISOString()}' WHERE id = ${resSid}`)
+  const old = await cmd(resident, 'tab-a', 'limit', lim)
+  check('P8 passkey 5 min 30 s ago: 403 passkey_required with the step_up address', old.status === 403 && old.data.error === 'passkey_required' &&
+    old.data.step_up === '/?step_up=tab-a&purpose=command&next=%2Ftab-a%2F', old)
+  check('P8 identity: window closed, action still listed', (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.passkey_until.limit === undefined)
+  const so2 = await resident.req('POST', '/api/passkey/get/options', { purpose: 'command:tab-a' })
+  const sv2 = so2.status === 200 ? await resident.req('POST', '/api/passkey/get/verify', await authR.get(so2.data)) : so2
+  check('P9 resident step_up Face ID: ok, back to the tab', sv2.status === 200 && sv2.data.next === '/tab-a/', [so2.status, sv2])
+  check('P9 ... then the passkey action works', (await cmd(resident, 'tab-a', 'limit', lim)).status === 200)
+  const osid = (await owner.req('GET', '/api/me')).data.session_id
+  d1(`UPDATE sessions SET passkey_at = '${new Date(Date.now() - 6 * 60e3).toISOString()}' WHERE id = ${osid}`)
+  const ow = await cmd(owner, 'tab-a', 'limit', lim)
+  check('P10 owner too: admin window open (12 h) but passkey 6 min ago = passkey_required', ow.status === 403 && ow.data.error === 'passkey_required' && !!ow.data.step_up, ow)
+  check('P10 ... while admin actions still pass', (await cmd(owner, 'tab-a', 'presence', { state: 'home' })).status === 200)
+  check('P11 screen: passkey action = not_for_screens', (await cmd(tvc, 'tab-a', 'limit', lim)).data.error === 'not_for_screens')
+  check('P11 screen identity never lists it', !(await tvc.req('GET', '/tab-a/echo', undefined, CORS)).data.identity.actions.includes('limit'))
+  check('freshen owner (keys, limit)', await freshen(owner, auth))
+  check('P12 key scope with a passkey action = 400', (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-a/limit'] })).data.error === 'bad_scope')
+  const scr = (await owner.req('GET', '/api/admin/people')).data.find((p) => p.kind === 'screen')
+  check('P13 no passkey invite for a fixed screen', !scr || (await owner.req('POST', `/api/admin/people/${scr.id}/passkey-invite`, {})).data.error === 'invite_not_allowed')
+  check('P14 the screen session cannot register a passkey', (await tvc.req('POST', '/api/passkey/create/options', {})).status === 403)
+}
+
 // the selector in a real browser (owner, resident and a freshly paired screen)
 const g5 = await owner.req('POST', '/api/passkey/get/options', {})
 await owner.req('POST', '/api/passkey/get/verify', await auth.get(g5.data))
@@ -790,7 +854,7 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
     (await owner.req('GET', '/tab-slow/echo', undefined, CORS)).status === 403)
   const vid = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
   check('see as: the tab gets a resident identity (groups, common actions only)', vid.person === ownerId && vid.groups.join() === 'residents' &&
-    vid.actions.join() === 'tv,ac,light,slow,boom', vid)
+    vid.actions.join() === 'tv,ac,light,slow,boom,limit', vid)
   const vp = await cmd(owner, 'tab-a', 'presence', { state: 'home' })
   check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')

@@ -27,6 +27,10 @@ export interface CommandSpec {
   shortcut: boolean
   // result fields the caller gets back (strings, numbers, booleans only)
   returns: string[]
+  // browser only: a passkey check on this very session within this many ms, for anyone who runs it
+  // (owner's rule for the TV volume limiter, 08/11: Face ID every time, residents too). Never for
+  // fixed screens or Shortcuts keys.
+  passkey: number | null
 }
 
 export type Catalog = Record<string, CommandSpec>
@@ -66,7 +70,7 @@ function parseParam(v: unknown): ParamSpec | null {
 // One action from the configuration. Anything malformed drops the action (never a looser one).
 function parseSpec(v: unknown): CommandSpec | null {
   if (!isObj(v)) return null
-  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns']
+  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey']
   if (Object.keys(v).some((k) => !allowed.includes(k))) return null
   if (v.level !== 'common' && v.level !== 'admin' && v.level !== 'sensitive') return null
   const level = v.level as Level
@@ -100,8 +104,18 @@ function parseSpec(v: unknown): CommandSpec | null {
 
   if (v.screens != null && typeof v.screens !== 'boolean') return null
   if (v.shortcut != null && typeof v.shortcut !== 'boolean') return null
-  const screens = v.screens === true && level === 'common'
-  const shortcut = v.shortcut !== false && level !== 'sensitive'
+
+  // "<n>m", 1 to 60 minutes, on common or admin actions; it rules out screens and keys, so asking
+  // for either next to it is a contradiction and drops the action
+  let passkey: number | null = null
+  if (v.passkey != null) {
+    const pm = typeof v.passkey === 'string' ? /^([1-9]\d?)m$/.exec(v.passkey) : null
+    if (!pm || Number(pm[1]) > 60 || level === 'sensitive') return null
+    if (v.screens === true || v.shortcut === true) return null
+    passkey = Number(pm[1]) * 60e3
+  }
+  const screens = v.screens === true && level === 'common' && !passkey
+  const shortcut = v.shortcut !== false && level !== 'sensitive' && !passkey
 
   let returns: string[] = []
   if (v.returns != null) {
@@ -109,7 +123,7 @@ function parseSpec(v: unknown): CommandSpec | null {
     if (!v.returns.every((r) => typeof r === 'string' && PARAM_RE.test(r) && !BAD.includes(r))) return null
     returns = [...new Set(v.returns as string[])]
   }
-  return { level, params, perHour, gap, screens, shortcut, returns }
+  return { level, params, perHour, gap, screens, shortcut, returns, passkey }
 }
 
 // The `commands` field of one tab. A bad action is dropped; a bad catalog is empty.
@@ -178,6 +192,31 @@ export interface Caller {
   adminFresh: boolean      // browser: passkey checked within the window for admin actions
                            // (ADMIN_COMMAND_PASSKEY in wrangler.toml: '12h'; '<n>m'/'<n>h' or 'session')
   scope: string[] | null   // shortcut: "<tab>/<action>" entries of the key
+  passkeyAt?: string | null // browser: this session's last passkey check (for actions with `passkey`)
+  rehearsal?: boolean      // browser: an admin seeing as another group (nothing reaches the house)
+}
+
+// Is the action's own passkey window (spec.passkey) open on this browser session? A rehearsal
+// counts as open: its commands never reach the tab, and the owner cannot do a Face ID while seeing as.
+export function passkeyWindowOk(spec: CommandSpec, c: Caller, nowMs = Date.now()): boolean {
+  if (!spec.passkey) return true
+  if (c.credential !== 'browser') return false
+  if (c.rehearsal) return true
+  const at = c.passkeyAt ? Date.parse(c.passkeyAt) : NaN
+  return Number.isFinite(at) && at <= nowMs + 60e3 && nowMs - at < spec.passkey
+}
+
+// identity.passkey_until: action -> when its window closes (ISO), only for actions with `passkey`
+// whose window is open on this session. A rehearsal shows them open for a full window from now.
+export function passkeyUntil(catalog: Catalog, c: Caller, nowMs = Date.now()): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (c.credential !== 'browser') return out
+  for (const [a, spec] of Object.entries(catalog)) {
+    if (!spec.passkey || !passkeyWindowOk(spec, c, nowMs)) continue
+    const from = c.rehearsal ? nowMs : Date.parse(c.passkeyAt!)
+    out[a] = new Date(from + spec.passkey).toISOString()
+  }
+  return out
 }
 
 // Was this session's last passkey check recent enough for an 'admin' command from a browser?
@@ -213,10 +252,10 @@ export function refusal(tab: string, action: string, spec: CommandSpec, c: Calle
     return null
   }
   if (c.credential === 'screen') return spec.level === 'common' && spec.screens ? null : 'not_for_screens'
-  if (spec.level === 'common') return null
-  if (!c.admin) return 'admin_only'
-  if (spec.level === 'admin') return c.adminFresh || c.strong ? null : 'passkey_required'
-  return c.strong ? null : 'passkey_required'
+  if (spec.level !== 'common' && !c.admin) return 'admin_only'
+  if (spec.level === 'admin' && !(c.adminFresh || c.strong)) return 'passkey_required'
+  if (spec.level === 'sensitive' && !c.strong) return 'passkey_required'
+  return passkeyWindowOk(spec, c) ? null : 'passkey_required'
 }
 
 // The actions this caller may run in the tab (sent to the tab as identity.actions). An admin's browser session also
@@ -225,7 +264,10 @@ export function refusal(tab: string, action: string, spec: CommandSpec, c: Calle
 export const allowedActions = (tab: string, catalog: Catalog, c: Caller): string[] =>
   Object.keys(catalog).filter((a) => {
     const why = refusal(tab, a, catalog[a], c)
-    return why === null || (why === 'passkey_required' && catalog[a].level === 'admin' && c.credential === 'browser' && c.admin)
+    if (why === null) return true
+    if (why !== 'passkey_required' || c.credential !== 'browser') return false
+    // the page shows it and asks for Face ID before sending
+    return (catalog[a].level === 'admin' && c.admin) || (catalog[a].level === 'common' && !!catalog[a].passkey)
   })
 
 // Only the declared result fields, and only plain values.

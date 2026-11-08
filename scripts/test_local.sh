@@ -31,7 +31,9 @@ cat > "$STATE/tabs.json" <<'EOF2'
               "slow": {"level": "common"},
               "boom": {"level": "common"},
               "presence": {"level": "admin", "params": {"state": {"enum": ["out", "home"]}}, "perHour": 30},
-              "wipe": {"level": "sensitive"}
+              "wipe": {"level": "sensitive"},
+              "limit": {"level": "common", "passkey": "5m", "params": {"on": {"bool": true}, "top": {"int": [10, 60]}}, "perHour": 30,
+                        "screens": false, "shortcut": false, "returns": ["state"]}
             }},
   "tab-b": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab B", "icon": "mic",
             "allow": ["microphone", "screen-wake-lock"], "entry": "passkey", "entryHours": 4,
