@@ -437,6 +437,7 @@ function backToOwner() {
     // no Face ID on this device, or it failed: sign out for real and sign in again by WhatsApp
     el('button', { type: 'button', class: 'screen-link', onclick: () => guarded(async () => {
       await rawApi('POST', '/api/logout', { real: true })
+      if (window.A5Tabs && window.A5Tabs.forget) window.A5Tabs.forget()
       store.set(false)
       location.assign(ACCOUNT)
     }) }, icon('logout'), el('span', {}, T.rehearsal.signOutReal), icon('chev', 'ico chev')),
@@ -626,14 +627,14 @@ function stepUpView(tab) {
 
 // ------------------------------------------------------------------ opening
 // No home page: "/" opens the last tab used on this device, else the first tab, else the account.
-async function openLastTab() {
-  const tab = await lastTabTarget()
+async function openLastTab(menu) {
+  const tab = await lastTabTarget(menu)
   location.replace(tab ? tab.path : ACCOUNT)
 }
 
 // the tab "/" opens: the last one used on this device, else the first tab, else the account
-async function lastTabTarget() {
-  const data = window.A5Tabs ? await window.A5Tabs.load() : null
+async function lastTabTarget(menu) {
+  const data = (menu && await menu) || (window.A5Tabs ? await window.A5Tabs.load() : null)
   if (!data) return null
   const last = window.A5Tabs.lastTab()
   return last === data.account.id ? data.account : data.tabs.find((t) => t.id === last) || data.tabs[0] || data.account
@@ -741,7 +742,7 @@ function renderIndex(current) {
   fill($index, profile, WIDE.matches ? null : alerts(),
     el('span', { class: 'section caps' }, T.you), rows(YOU),
     ME.admin ? [el('span', { class: 'section caps' }, T.house), rows(HOUSE)] : null,
-    el('button', { type: 'button', class: 'logout', onclick: () => guarded(async () => { if (ME.rehearsal) return rehearsalSignOut(); await rawApi('POST', '/api/logout', {}); start() }) }, icon('logout'), T.nav.logout))
+    el('button', { type: 'button', class: 'logout', onclick: () => guarded(async () => { if (ME.rehearsal) return rehearsalSignOut(); await rawApi('POST', '/api/logout', {}); if (window.A5Tabs && window.A5Tabs.forget) window.A5Tabs.forget(); start() }) }, icon('logout'), T.nav.logout))
 }
 
 // the small line and the end (count or badge) of each index row
@@ -1103,11 +1104,14 @@ async function start() {
   $index = null
   const ticket = new URLSearchParams(location.hash.slice(1)).get('screen_ticket')
   if (ticket) return guarded(() => screenTicketView(ticket.slice(0, 64)))
+  // "/" opens a tab: ask for the list together with the session, not after it
+  const menu = !onAccount() && !location.search && window.A5Tabs ? window.A5Tabs.load() : null
   try {
     ME = await rawApi('GET', '/api/me')
   } catch (e) {
     ME = null
     if (e instanceof ApiError && e.status === 401) {
+      if (window.A5Tabs && window.A5Tabs.forget) window.A5Tabs.forget()
       if (new URLSearchParams(location.search).get('screen') === '1') return guarded(pairScreenView)
       return loginView()
     }
@@ -1135,7 +1139,7 @@ async function start() {
   if (!onAccount()) {
     // the pairing QR lands on "/?pair=": hand it to the account page
     if (q.get('pair') && ME.admin) { location.replace(`${ACCOUNT}?pair=${encodeURIComponent(q.get('pair').slice(0, 12))}`); return }
-    return openLastTab()
+    return openLastTab(menu)
   }
   return guarded(() => account(q))
 }

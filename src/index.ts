@@ -104,6 +104,7 @@ type Row = Record<string, unknown>
 interface Person { id: number; name: string; phone: string; status: string; kind?: string }
 interface Group { id: string; name: string; tabs: string; is_admin: number }
 interface Who {
+  entryUsedAt?: string | null
   person: Person; sessionId: number; sessionCreatedAt: string; kind: 'browser' | 'screen'; groups: Group[]; admin: boolean; tabs: Set<string>
   passkeyAt: string | null; refreshCookie: string | null; commandsOkAt: string | null
   // Face ID made by a tab page itself (/<tab>/_passkey/verify): command windows only, never strong
@@ -274,13 +275,22 @@ async function ensureOwner(env: Env, phone: string): Promise<Person | null> {
 }
 
 // ------------------------------------------------------------------ sessions
-async function currentSession(req: Request, env: Env): Promise<Who | null> {
+// One D1 round trip per request (about 150 ms from Brazil to the database): the session, the
+// person, their groups, the "see as" group and, for a tab with Face ID on entry, the last entry
+// all come back in one query. Same checks as before, only fewer trips.
+async function currentSession(req: Request, env: Env, entryTab: string | null = null): Promise<Who | null> {
   const token = cookieValue(req, COOKIE)
   if (!token || token.length < 40) return null
+  const entryHours = entryTab ? policyOf(entryTab).entryHours : 0
   const s = await env.DB.prepare(
-    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.command_passkey_at, s.command_passkey_tab, s.commands_ok_at, s.view_as, p.* FROM sessions s JOIN people p ON p.id = s.person_id
+    `SELECT s.id AS sid, s.kind AS skind, s.created_at AS screated, s.last_used_at, s.passkey_at, s.command_passkey_at, s.command_passkey_tab, s.commands_ok_at, s.view_as, p.*,
+       (SELECT json_group_array(json_object('id', g.id, 'name', g.name, 'tabs', g.tabs, 'is_admin', g.is_admin))
+          FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE pg.person_id = s.person_id) AS groups_json,
+       (SELECT json_object('id', v.id, 'name', v.name, 'tabs', v.tabs, 'is_admin', v.is_admin) FROM groups v WHERE v.id = s.view_as) AS view_json,
+       (SELECT MAX(e.used_at) FROM tab_entries e WHERE e.session_id = s.id AND e.tab = ? AND e.used_at > ? AND e.granted_at >= s.created_at) AS entry_used_at
+     FROM sessions s JOIN people p ON p.id = s.person_id
      WHERE s.token_hash = ? AND s.expires_at > ?`,
-  ).bind(await sha256(token), now()).first<Row>()
+  ).bind(entryTab ?? '', inMs(-entryHours * 3600e3), await sha256(token), now()).first<Row>()
   if (!s || s.status !== 'active') return null
   const kind = s.skind === 'screen' ? 'screen' : 'browser'
   let refreshCookie: string | null = null
@@ -290,13 +300,13 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
     refreshCookie = sessionCookie(token, kind)
   }
   const person: Person = { id: Number(s.id), name: String(s.name), phone: String(s.phone), status: String(s.status), kind: String(s.kind) }
-  const real = await groupsOf(env, person.id)
+  const real = parseGroups(s.groups_json)
   // a screen account is never an admin, whatever its groups say
   const realAdmin = kind === 'browser' && person.kind !== 'screen' && real.some((g) => g.is_admin)
   // "see as" only ever narrows: kept only while the person is an admin and the group is not one
   let view: Group | null = null
-  if (realAdmin && s.view_as) {
-    const g = await env.DB.prepare('SELECT * FROM groups WHERE id = ?').bind(String(s.view_as)).first<Group>()
+  if (realAdmin && s.view_as && s.view_json) {
+    const g = parseGroups(`[${String(s.view_json)}]`)[0]
     if (g && !g.is_admin) view = g
   }
   const groups = view ? [view] : real
@@ -305,7 +315,17 @@ async function currentSession(req: Request, env: Env): Promise<Who | null> {
     passkeyAt: (s.passkey_at as string | null) ?? null, refreshCookie, commandsOkAt: (s.commands_ok_at as string | null) ?? null,
     commandPasskeyAt: (s.command_passkey_at as string | null) ?? null, commandPasskeyTab: (s.command_passkey_tab as string | null) ?? null,
     realAdmin, viewAs: view ? { id: view.id, name: view.name } : null,
+    entryUsedAt: entryTab ? ((s.entry_used_at as string | null) ?? null) : undefined,
   }
+}
+
+// groups as json_object rows: is_admin back to a number, tabs stays the stored JSON text
+function parseGroups(raw: unknown): Group[] {
+  let v: unknown
+  try { v = JSON.parse(String(raw ?? '[]')) } catch { return [] }
+  if (!Array.isArray(v)) return []
+  return v.filter((g) => g && typeof g === 'object' && typeof g.id === 'string')
+    .map((g) => ({ id: String(g.id), name: String(g.name), tabs: String(g.tabs ?? '[]'), is_admin: Number(g.is_admin) ? 1 : 0 }))
 }
 
 async function requireSession(req: Request, env: Env): Promise<Who> {
@@ -1253,6 +1273,11 @@ async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: strin
     }
     return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, backTo(url)), ...API_HEADERS } })
   }
+  // read with the session itself (currentSession), in the same trip
+  if (who.entryUsedAt !== undefined) {
+    if (who.entryUsedAt) return who.entryUsedAt
+    throw new HttpError(401, 'entry_required', { step_up: stepUpUrl(tab, `/${tab}/`) })
+  }
   const e = await env.DB.prepare('SELECT used_at FROM tab_entries WHERE session_id = ? AND tab = ? AND used_at > ? AND granted_at >= ? ORDER BY used_at DESC LIMIT 1')
     .bind(who.sessionId, tab, inMs(-policy.entryHours * 3600e3), who.sessionCreatedAt).first<{ used_at: string }>()
   if (e) return e.used_at
@@ -1340,7 +1365,11 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
   // the dot only makes sense with more than one tab besides the account; none while seeing as
   // someone else (the counts would still be the admin's own)
   const withBadges = selector && tabs.length > 1 && !who.viewAs
-  const badges = withBadges ? await Promise.all(tabs.map((t) => badgeOf(env, who, t))) : tabs.map(() => null)
+  // badges (each tab, 300 ms at most) and the "see as" list go out together
+  const [badges, viewOpts] = await Promise.all([
+    withBadges ? Promise.all(tabs.map((t) => badgeOf(env, who, t))) : tabs.map(() => null),
+    selector && who.realAdmin ? viewOptions(env) : [],
+  ])
   const cur = url.searchParams.get('current')
   return {
     selector,
@@ -1354,7 +1383,7 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
     who: selector ? { name: who.viewAs ? null : who.person.name, group: (who.groups.find((g) => g.is_admin) ?? who.groups[0])?.id ?? null } : null,
     account: { id: 'conta', path: ACCOUNT_PATH },
     view_as: who.viewAs,
-    view_options: selector && who.realAdmin ? await viewOptions(env) : [],
+    view_options: viewOpts,
   }
 }
 
@@ -1410,7 +1439,7 @@ async function accountPage(req: Request, env: Env, url: URL): Promise<Response> 
 async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<Response | null> {
   const service = tabService(env, tab)
   if (!service) return null
-  const who = await currentSession(req, env)
+  const who = await currentSession(req, env, policyOf(tab).entry === 'passkey' && !(isNavigation(req) && !isUpgrade(req)) ? tab : null)
   if (!who) {
     if (isNavigation(req)) return new Response(null, { status: 302, headers: { Location: `/?next=${encodeURIComponent(backTo(url))}`, ...API_HEADERS } })
     throw new HttpError(401, 'signed_out')

@@ -20,6 +20,19 @@
   // localStorage can be missing or throw (private mode, blocked storage): never fatal
   const lastTab = () => { try { return localStorage.getItem(KEY) } catch { return null } }
   const remember = (id) => { try { localStorage.setItem(KEY, id) } catch { /* nothing to keep */ } }
+  // the last list, kept on this device so the selector works the moment the page is drawn; the
+  // fresh one replaces it right after (names, paths and counts only, the same as /api/tabs)
+  const MENU = 'a5.menu'
+  const keep = (d) => { try { if (d && d.selector) { const { current, ...rest } = d; localStorage.setItem(MENU, JSON.stringify(rest)) } else localStorage.removeItem(MENU) } catch { /* nothing to keep */ } }
+  const forget = () => { try { localStorage.removeItem(MENU) } catch { /* nothing kept */ } }
+  function saved(here) {
+    try {
+      const d = JSON.parse(localStorage.getItem(MENU) || 'null')
+      if (!d || !d.selector || !Array.isArray(d.tabs) || !d.account) return null
+      d.current = here === d.account.id || d.tabs.some((t) => t.id === here) ? here : null
+      return d
+    } catch { return null }
+  }
 
   const backUrl = () => '/conta/?owner=1&next=' + encodeURIComponent(location.pathname + location.search)
 
@@ -35,7 +48,10 @@
     const q = current ? '?current=' + encodeURIComponent(current) : ''
     try {
       const r = await fetch('/api/tabs' + q, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
-      return r.ok ? await r.json() : null
+      if (r.status === 401) forget()
+      const d = r.ok ? await r.json() : null
+      if (d) keep(d)
+      return d
     } catch { return null }
   }
 
@@ -46,7 +62,9 @@
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Portal': '1' },
         body: JSON.stringify({ view_as: group }),
       })
-      return r.ok ? await r.json() : null
+      const d = r.ok ? await r.json() : null
+      if (d) keep(d)
+      return d
     } catch { return null }
   }
 
@@ -135,7 +153,8 @@
   async function mount(title) {
     if (!title || title.dataset.a5TabsOn) return
     title.dataset.a5TabsOn = 'pending'
-    let data = await load(pathTab())
+    const early = saved(pathTab())
+    let data = early || await load(pathTab())
     if (!data || !data.selector) { delete title.dataset.a5TabsOn; return }
     title.dataset.a5TabsOn = '1'
     if (data.current) remember(data.current)
@@ -340,6 +359,8 @@
     // no polling: counts come back when the page loads, the list opens or the page is seen again
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh() })
     paintDot()
+    // drawn from the kept list: the fresh one (counts, see as) right away
+    if (early) refresh()
   }
 
   // ---------------------------------------------------------------- pull to refresh
@@ -419,7 +440,7 @@
     document.addEventListener('touchcancel', reset, { passive: true })
   }
 
-  window.A5Tabs = { mount, load, lastTab, remember }
+  window.A5Tabs = { mount, load, lastTab, remember, forget }
   const auto = () => { const t = document.querySelector('[data-a5-tabs]'); if (t) mount(t) }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', auto)
   else auto()
