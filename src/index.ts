@@ -974,6 +974,14 @@ async function alertsOf(env: Env, who: Who) {
 }
 
 async function me(env: Env, who: Who) {
+  // independent reads, sent together: one trip instead of up to five
+  const [passkeys, invite, self, alerts, commandsOffNow] = await Promise.all([
+    who.viewAs || who.kind !== 'browser' ? 0 : passkeyCount(env, who.person.id),
+    !who.admin && !who.viewAs && who.kind === 'browser' ? pendingInvite(env, who.person.id) : null,
+    selfPasskeyState(env, who),
+    alertsOf(env, who),
+    who.admin ? commandsOff(env) : undefined,
+  ])
   return {
     person: { id: who.person.id, name: who.person.name },
     groups: who.groups.map((g) => ({ id: g.id, name: g.name })),
@@ -988,11 +996,11 @@ async function me(env: Env, who: Who) {
     credential: who.kind,
     strong: strongAdmin(who),
     // the made-up resident of a rehearsal has none
-    passkeys: who.viewAs || who.kind !== 'browser' ? 0 : await passkeyCount(env, who.person.id),
-    passkey_invite: !who.admin && !who.viewAs && who.kind === 'browser' ? !!(await pendingInvite(env, who.person.id)) : false,
-    ...(await selfPasskeyState(env, who)),
-    alerts: await alertsOf(env, who),
-    commands_off: who.admin ? await commandsOff(env) : undefined,
+    passkeys,
+    passkey_invite: !!invite,
+    ...self,
+    alerts,
+    commands_off: commandsOffNow,
   }
 }
 

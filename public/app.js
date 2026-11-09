@@ -667,13 +667,20 @@ const allowed = (k) => PARTS[k] && (PARTS[k].show ? PARTS[k].show() : (!PARTS[k]
 
 async function loadData() {
   const get = (p) => rawApi('GET', p)
-  D.devices = await get('/api/me/devices')
-  D.passkeys = ME.credential === 'browser' && !ME.rehearsal ? await get('/api/me/passkeys') : []
-  if (!ME.admin) return
-  const [people, groups, requests, all, machines, shortcuts, agents, agentReqs] = await Promise.all([
+  // everything at once: each call is a trip to the database, none needs another's answer
+  const admin = ME.admin ? Promise.all([
     get('/api/admin/people'), get('/api/admin/groups'), get('/api/admin/requests'), get('/api/admin/devices'),
     get('/api/admin/machines'), get('/api/me/shortcuts'), get('/api/admin/agents'), get('/api/admin/agent-requests'),
+  ]) : null
+  if (admin) admin.catch(() => {}) // a failure is thrown below, where it is awaited
+  const [devices, passkeys] = await Promise.all([
+    get('/api/me/devices'),
+    ME.credential === 'browser' && !ME.rehearsal ? get('/api/me/passkeys') : [],
   ])
+  D.devices = devices
+  D.passkeys = passkeys
+  if (!admin) return
+  const [people, groups, requests, all, machines, shortcuts, agents, agentReqs] = await admin
   Object.assign(D, { people: people.filter((p) => p.kind !== 'screen'), screens: people.filter((p) => p.kind === 'screen'),
     groups, requests, all, machines, shortcuts, agents, agentReqs })
 }
