@@ -57,7 +57,7 @@ Decoding: `JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(h.replace(/-
 
 ```ts
 interface PortalIdentity {
-  credential: 'browser' | 'screen' | 'machine' | 'shortcut'
+  credential: 'browser' | 'screen' | 'machine' | 'shortcut' | 'read_key'
   person: number | null      // null for machines
   name: string               // person or screen name, or the machine key label
   groups: string[]           // empty for machines
@@ -67,6 +67,7 @@ interface PortalIdentity {
   entered_at: string | null  // tabs with entry 'passkey': when this session entered with Face ID
   entry_until: string | null // ...and when that entry ends
   shortcut: number | null    // Shortcuts key id; only for shortcuts
+  read_key?: number          // read key id; only for read keys (READ_KEYS.md)
   actions: string[]          // commands this identity may send in the tab (COMMANDS.md)
   admin_until: string | null // when this session's window for admin commands closes, or null (COMMANDS.md)
   passkey_until: Record<string, string> // actions with their own `passkey` window that are open on this
@@ -78,6 +79,7 @@ interface PortalIdentity {
 - `screen`: a fixed display paired by code (section 5). Always in `residents`, never admin, never strong.
 - `machine`: a house bridge (section 6). No person, no groups.
 - `shortcut`: an Apple Shortcuts key (`pa5_atl_`). Reaches only `command()`, never `handle()`, `fetch()` or `badge()` (COMMANDS.md).
+- `read_key`: an owner's read key (`pa5_ler_`). Reaches only `handle()`, with `GET` on the paths in the tab's `readKey` (READ_KEYS.md).
 
 The tab trusts this object and nothing in the request that claims to be identity. A tab may still apply its own rules on top (for example, only the owner group).
 

@@ -68,6 +68,9 @@ for t, o in old.items():
         for f in ("screens", "shortcut", "perHour", "gap"):
             if eff(y, f) > eff(x, f): out.append(f"{t}/{c} {f}")
         if json.dumps(y.get("params"), sort_keys=True) != json.dumps(x.get("params"), sort_keys=True): out.append(f"{t}/{c} params")
+    # read keys: a new path or a higher hourly limit is looser (docs/READ_KEYS.md)
+    orr, nr = o.get("readKey"), n.get("readKey")
+    if nr and (not orr or set(nr.get("paths", [])) - set(orr.get("paths", [])) or nr.get("perHour", 0) > orr.get("perHour", 0)): out.append(f"{t} readKey")
 print(", ".join(out))
 PY
 )" || { echo "refused: the tab config check failed (is .tabs.local.json valid JSON?)" >&2; exit 1; }

@@ -760,6 +760,7 @@ check('another admin cannot revoke someone else\'s key', (await admin3.req('DELE
 check('owner revokes the key', (await owner.req('DELETE', `/api/me/shortcuts/${k2.data.id}`)).status === 200)
 check('revoked key = 401', (await sc('/_cmd/tab-a/light', undefined, KEYH(k2.data.key))).status === 401)
 
+
 // the brake
 check('weak admin pulls the brake', (await admin3.req('POST', '/api/admin/commands', { off: true })).status === 200)
 check('brake shown to admins', (await owner.req('GET', '/api/me')).data.commands_off === true && (await resident.req('GET', '/api/me')).data.commands_off === undefined)
@@ -1411,6 +1412,91 @@ rows = (await owner.req('GET', '/api/admin/audit')).data
 check('audit: agent refusals and key lifecycle', ['agent_refused', 'agent_key_created', 'agent_key_revoked', 'agent_renamed_screen', 'screen_changed'].every((x) => rows.some((a) => a.action === x)))
 
 }
+
+// L1/L2: read keys (pa5_ler_), docs/READ_KEYS.md. tab-b takes them on /echo and /audit, 8 an hour.
+const rk = (path, key, method = 'GET', headers = {}) => fetch(BASE + path, { method, headers: { ...KEYH(key), ...headers }, body: method === 'POST' ? '{}' : undefined })
+  .then(async (r) => ({ status: r.status, data: await r.json().catch(() => null), headers: r.headers }))
+check('resident cannot list or create read keys', (await resident.req('GET', '/api/me/readkeys')).status === 403 &&
+  (await resident.req('POST', '/api/me/readkeys', { label: 'x', tab: 'tab-b' })).status === 403)
+const wrk = await admin3.req('POST', '/api/me/readkeys', { label: 'x', tab: 'tab-b' })
+check('L1 creating a read key from a weak session = 403 passkey', wrk.status === 403 && wrk.data.passkey === true, wrk)
+check('freshen owner (read keys)', await freshen(owner, auth))
+check('read key on a tab without readKey = 400', (await owner.req('POST', '/api/me/readkeys', { label: 'x', tab: 'tab-a' })).data.error === 'bad_tab')
+check('read key without a label = 400', (await owner.req('POST', '/api/me/readkeys', { tab: 'tab-b' })).status === 400)
+const r1k = await owner.req('POST', '/api/me/readkeys', { label: 'Mac · contador', tab: 'tab-b' })
+check('read key created once, pa5_ler_ prefix, no end date', r1k.status === 200 && /^pa5_ler_[A-Za-z0-9_-]{43}$/.test(r1k.data.key) && !('expires_at' in r1k.data), r1k.data)
+const RK = r1k.data.key
+const rg = await rk('/tab-b/echo', RK)
+check('L1 GET on its path = 200, no entry asked', rg.status === 200 && rg.data.method === 'GET', rg)
+const rid = rg.data.identity
+check('L1 identity: read_key, key id, no session, never strong, no actions, no admin window', rid.credential === 'read_key' && rid.read_key === r1k.data.id &&
+  rid.session === null && rid.shortcut === null && rid.strong === false && rid.admin_until === null && rid.entered_at === null && rid.actions.length === 0 && rid.person === ownerId, rid)
+check('L1 the tab never sees the key or a cookie', !('authorization' in rg.data.headers) && !('cookie' in rg.data.headers))
+check('L1 answer carries no cookie and no-store', !rg.headers.get('set-cookie') && rg.headers.get('cache-control') === 'no-store')
+check('L1 cookie sent along is ignored (same read-key identity)', (await rk('/tab-b/echo', RK, 'GET', { Cookie: owner.cookie })).data?.identity?.credential === 'read_key')
+check('L1 POST on its own path = 403', (await rk('/tab-b/echo', RK, 'POST', { Origin: BASE, 'X-Portal': '1', 'Content-Type': 'application/json' })).data?.error === 'read_key_scope')
+check('L1 command from the page path = 403', (await rk('/tab-b/_cmd/jot', RK, 'POST', { Origin: BASE, 'X-Portal': '1' })).data?.error === 'read_key_scope')
+check('L1 shortcut command path = 403', (await rk('/_cmd/tab-b/jot', RK, 'POST')).data?.error === 'read_key_scope')
+check('L1 tab Face ID path = 403', (await rk('/tab-b/_passkey/options', RK, 'POST', { Origin: BASE, 'X-Portal': '1' })).data?.error === 'read_key_scope')
+check('L1 other path of the tab = 403', (await rk('/tab-b/', RK)).data?.error === 'read_key_scope' && (await rk('/tab-b/echo/x', RK)).status === 403)
+check('L1 another tab = 403', (await rk('/tab-a/echo', RK)).data?.error === 'read_key_scope')
+check('L1 portal API, account, see-as = 403', (await rk('/api/me', RK)).status === 403 && (await rk('/conta/', RK)).status === 403 &&
+  (await rk('/api/tabs', RK, 'POST', { Origin: BASE, 'X-Portal': '1' })).status === 403 && (await rk('/api/me/readkeys', RK)).status === 403)
+check('L1 socket = 403', (await upgradeStatus('/tab-b/echo', KEYH(RK))) === 403)
+check('L1 wrong or changed key = 401', (await rk('/tab-b/echo', 'pa5_ler_' + 'A'.repeat(43))).status === 401 &&
+  (await rk('/tab-b/echo', RK.slice(0, -1) + (RK.endsWith('A') ? 'B' : 'A'))).status === 401 && (await rk('/tab-b/echo', 'pa5_ler_short')).status === 401)
+check('L1 a shortcut key is no read key', (await rk('/tab-b/echo', k1.data.key)).status === 401)
+const ra = await rk('/tab-b/audit', RK)
+check('L1 second path of the policy = 200', ra.status === 200)
+rows = (await owner.req('GET', '/api/admin/audit')).data
+check('L1 every use audited with the key id (portal row + X-Tab-Audit)', rows.filter((r) => r.action === 'read_key_used' && JSON.parse(r.detail).read_key === r1k.data.id).length >= 3 &&
+  rows.some((r) => r.action === 'tab-b.turn_on' && r.strength === 'read_key' && JSON.parse(r.detail).read_key === r1k.data.id), rows.slice(0, 6))
+check('L1 refusals audited, never the key', rows.some((r) => r.action === 'read_key_refused' && JSON.parse(r.detail).reason === 'out_of_scope') && !rows.some((r) => String(r.detail).includes('pa5_ler_')))
+check('read key: first use from a new place warns the admins', (await owner.req('GET', '/api/me')).data.alerts.some((x) => x.kind === 'read_key_place'))
+let rl
+for (let i = 0; i < 8; i++) rl = await rk('/tab-b/echo', RK)
+check('L1 hourly limit of the tab policy = 429', rl.status === 429, rl.status)
+const rkl = (await owner.req('GET', '/api/me/readkeys')).data
+check('read key list: no key, no hash; tab-b available, tab-a not', !JSON.stringify(rkl).includes(RK) && !('key_hash' in rkl.keys[0]) &&
+  rkl.available.map((a) => a.tab).join() === 'tab-b' && rkl.keys.find((k) => k.id === r1k.data.id).today >= 5, rkl)
+// L2 (no end date): warn past 30 uses in a day and at a second IP in the same day
+const r2k = await owner.req('POST', '/api/me/readkeys', { label: 'daily', tab: 'tab-b' })
+const IP1 = { 'CF-Connecting-IP': '198.51.100.7' }
+check('L2 first use today = 200', (await rk('/tab-b/echo', r2k.data.key, 'GET', IP1)).status === 200)
+const dayAlerts = async (kind) => (await owner.req('GET', '/api/me')).data.alerts.filter((x) => x.kind === kind && x.label === 'daily').length
+check('L2 one IP: no IP warning', (await dayAlerts('read_key_ip')) === 0)
+await rk('/tab-b/echo', r2k.data.key, 'GET', { 'CF-Connecting-IP': '198.51.100.8' })
+check('L2 second IP the same day warns the admins', (await dayAlerts('read_key_ip')) === 1)
+await rk('/tab-b/echo', r2k.data.key, 'GET', IP1)
+check('L2 back to a known IP: no new warning', (await dayAlerts('read_key_ip')) === 1)
+d1(`UPDATE read_keys SET use_day_n = 30 WHERE id = ${r2k.data.id}`)
+check('L2 30 uses: no day warning yet', (await dayAlerts('read_key_day')) === 0)
+await rk('/tab-b/echo', r2k.data.key, 'GET', IP1)
+check('L2 31st use in the day warns the admins', (await dayAlerts('read_key_day')) === 1)
+await rk('/tab-b/echo', r2k.data.key, 'GET', IP1)
+check('L2 32nd: no second day warning', (await dayAlerts('read_key_day')) === 1)
+d1(`UPDATE read_keys SET use_day = '2000-01-01' WHERE id = ${r2k.data.id}`)
+await rk('/tab-b/echo', r2k.data.key, 'GET', { 'CF-Connecting-IP': '198.51.100.9' })
+check('L2 a new day starts the counters again (one IP, no warning)', (await dayAlerts('read_key_ip')) === 1 &&
+  (await owner.req('GET', '/api/me/readkeys')).data.keys.find((k) => k.id === r2k.data.id).today === 1)
+check('another admin cannot revoke the owner read key', (await admin3.req('DELETE', `/api/me/readkeys/${r2k.data.id}`)).status === 404)
+check('owner revokes a read key without Face ID', (await owner.req('DELETE', `/api/me/readkeys/${r2k.data.id}`)).status === 200 &&
+  (await rk('/tab-b/echo', r2k.data.key)).status === 401)
+// P2: refusals of a valid key are audited at most 30 an hour per key
+const r4k = await owner.req('POST', '/api/me/readkeys', { label: 'noisy', tab: 'tab-b' })
+for (let i = 0; i < 35; i++) await rk('/tab-a/echo', r4k.data.key)
+check('P2 still 403 past the audit cap', (await rk('/tab-a/echo', r4k.data.key)).status === 403)
+check('P2 refusals of one key: at most 30 audit rows an hour', d1Count(`SELECT COUNT(*) AS n FROM audit WHERE action = 'read_key_refused' AND detail LIKE '%"read_key":${r4k.data.id}%'`) === 30)
+check('owner revokes the noisy key', (await owner.req('DELETE', `/api/me/readkeys/${r4k.data.id}`)).status === 200)
+// an admin seeing as a resident cannot list or make read keys
+check('see as: admin3 goes in', (await admin3.req('POST', '/api/tabs', { view_as: 'residents' })).status === 200)
+check('see as: POST /api/me/readkeys = 403, list = 403', (await admin3.req('POST', '/api/me/readkeys', { label: 'x', tab: 'tab-b' })).status === 403 &&
+  (await admin3.req('GET', '/api/me/readkeys')).status === 403)
+const r3k = await owner.req('POST', '/api/me/readkeys', { label: 'moved', tab: 'tab-b' })
+d1(`UPDATE read_keys SET person_id = ${res.id} WHERE id = ${r3k.data.id}`)
+check('L1 key of someone outside the owner group = 401', (await rk('/tab-b/echo', r3k.data.key)).status === 401)
+check('owner revokes the first read key; it stops at once', (await owner.req('DELETE', `/api/me/readkeys/${r1k.data.id}`)).status === 200 &&
+  (await rk('/tab-b/echo', RK)).status === 401)
 
 // pairing start is capped per IP (last: it uses up the bucket)
 let pl

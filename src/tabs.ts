@@ -13,7 +13,7 @@
 
 import { type Catalog, type Command, parseCatalogStrict } from './commands'
 
-export type Credential = 'browser' | 'screen' | 'machine' | 'shortcut'
+export type Credential = 'browser' | 'screen' | 'machine' | 'shortcut' | 'read_key'
 
 export interface PortalIdentity {
   credential: Credential
@@ -23,6 +23,7 @@ export interface PortalIdentity {
   session: number | null     // browser or screen session id; null for machines and shortcuts
   machine: number | null     // machine key id; only for machines
   shortcut: number | null    // Shortcuts key id; only for shortcuts
+  read_key?: number          // read key id (docs/READ_KEYS.md); only for credential 'read_key'
   strong: boolean            // passkey checked on this session in the last 5 minutes
   entered_at: string | null  // tabs with entry 'passkey': when this session entered with Face ID
   entry_until: string | null // ...and when that entry ends: close this session's sockets then
@@ -80,7 +81,12 @@ export interface TabConfig extends TabPolicy {
   icon: string | null
   // actions the tab takes (docs/COMMANDS.md); empty = the tab takes no commands
   commands: Catalog
+  // GET paths a read key may fetch (docs/READ_KEYS.md); null = the tab takes no read keys
+  readKey: ReadKeyPolicy | null
 }
+
+export interface ReadKeyPolicy { paths: string[]; perHour: number }
+export const READ_KEY_MAX_PER_HOUR = 60
 
 // The TABS variable is generated at deploy time from a file kept out of git (scripts/deploy.sh):
 //   {"<tab>": {"binding": "TAB_X", "label": "...", "icon": "bolt", "allow": [...], "entry": "session",
@@ -107,7 +113,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(tab) || RESERVED_TABS.includes(tab)) return null
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   const o = v as Record<string, unknown>
-  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands']
+  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands', 'readKey']
   if (Object.keys(o).some((k) => !known.includes(k))) return null
   if (typeof o.binding !== 'string' || !/^[A-Z][A-Z0-9_]{0,40}$/.test(o.binding)) return null
   if (o.label != null && (typeof o.label !== 'string' || !o.label.trim() || o.label.length > 40 || /[\u0000-\u001f<>]/.test(o.label))) return null
@@ -124,6 +130,8 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   // one malformed action refuses the whole tab, like any other bad field
   const commands = parseCatalogStrict(o.commands ?? {})
   if (!commands) return null
+  const readKey = o.readKey == null ? null : parseReadKey(o.readKey)
+  if (o.readKey != null && !readKey) return null
   return {
     binding: o.binding, label: (o.label as string | undefined)?.trim() ?? null, hint: (o.hint as string | undefined)?.trim() ?? null, icon: (o.icon as string | undefined) ?? null,
     allow: [...new Set(o.allow as string[])],
@@ -133,7 +141,22 @@ function validTab(tab: string, v: unknown): TabConfig | null {
     // a cached page would skip the Face ID check on entry
     serviceWorker: entry === 'passkey' ? false : ((o.serviceWorker as boolean | undefined) ?? true),
     commands,
+    readKey,
   }
+}
+
+// {"paths": ["/_data"], "perHour": 30}: exact paths under /<tab>, never the portal's own
+// (_cmd, _passkey), at most 5, and an hourly limit per key (1 to READ_KEY_MAX_PER_HOUR).
+function parseReadKey(v: unknown): ReadKeyPolicy | null {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+  const o = v as Record<string, unknown>
+  if (Object.keys(o).some((k) => !['paths', 'perHour'].includes(k))) return null
+  if (!Array.isArray(o.paths) || !o.paths.length || o.paths.length > 5) return null
+  for (const p of o.paths)
+    if (typeof p !== 'string' || !/^(\/[a-z0-9_-]{1,40}){1,4}$/.test(p) || /^\/_(cmd|passkey)(\/|$)/.test(p)) return null
+  const n = o.perHour
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || n > READ_KEY_MAX_PER_HOUR) return null
+  return { paths: [...new Set(o.paths as string[])], perHour: n }
 }
 
 // The router reads the configuration once per isolate (re-parsed only if the variable changes).

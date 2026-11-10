@@ -688,6 +688,7 @@ async function loadData() {
   const admin = ME.admin ? Promise.all([
     get('/api/admin/people'), get('/api/admin/groups'), get('/api/admin/requests'), get('/api/admin/devices'),
     get('/api/admin/machines'), get('/api/me/shortcuts'), get('/api/admin/agents'), get('/api/admin/agent-requests'),
+    get('/api/me/readkeys'),
   ]) : null
   if (admin) admin.catch(() => {}) // a failure is thrown below, where it is awaited
   const [devices, passkeys] = await Promise.all([
@@ -697,9 +698,9 @@ async function loadData() {
   D.devices = devices
   D.passkeys = passkeys
   if (!admin) return
-  const [people, groups, requests, all, machines, shortcuts, agents, agentReqs] = await admin
+  const [people, groups, requests, all, machines, shortcuts, agents, agentReqs, readKeys] = await admin
   Object.assign(D, { people: people.filter((p) => p.kind !== 'screen'), screens: people.filter((p) => p.kind === 'screen'),
-    groups, requests, all, machines, shortcuts, agents, agentReqs })
+    groups, requests, all, machines, shortcuts, agents, agentReqs, readKeys })
 }
 
 // reload what the server knows and draw again (after every change)
@@ -793,7 +794,7 @@ function summary(k) {
 function alerts() {
   return (ME.alerts || []).map((a) => el('div', { class: 'alert' }, icon(a.kind === 'device' ? 'faceid' : 'alert'),
     el('div', {},
-      el('b', {}, (a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : a.kind === 'agent_ip' ? T.agentIpAlert : a.kind === 'passkey' ? T.passkeyAlert : a.kind === 'resident_login' ? T.residentLoginAlert : T.newDevice(ME.person.name)).replace(/:\s*$/, '')),
+      el('b', {}, (a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : a.kind === 'read_key_place' ? T.readKeys.placeAlert : a.kind === 'read_key_day' ? T.readKeys.dayAlert : a.kind === 'read_key_ip' ? T.readKeys.ipAlert : a.kind === 'agent_ip' ? T.agentIpAlert : a.kind === 'passkey' ? T.passkeyAlert : a.kind === 'resident_login' ? T.residentLoginAlert : T.newDevice(ME.person.name)).replace(/:\s*$/, '')),
       `${a.label || T.device}, ${shortWhen(a.created_at)}${a.place ? ', ' + city(a.place) : ''}${a.current ? T.thisDevice : ''}.`,
       el('div', { class: 'btn-row' },
         btn(T.itWasMe, async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await refresh() }, 'btn-sm'),
@@ -1094,7 +1095,27 @@ function partShortcuts(top) {
       btn(T.shortcuts.create, async () => {
         const r = await api('POST', '/api/me/shortcuts', { label: label.value, scope: picked(scope) })
         out.replaceChildren(keyOnce(T.shortcuts.copyOnce, r.key))
-      }, 'btn-primary btn-block pad-top', 'plus'), out)] : el('p', { class: 'muted small pad-top' }, T.shortcuts.noActions)]
+      }, 'btn-primary btn-block pad-top', 'plus'), out)] : el('p', { class: 'muted small pad-top' }, T.shortcuts.noActions),
+    readKeysPart()]
+}
+
+// Read keys (docs/READ_KEYS.md): an agent of the owner reads one tab's data, GET only; shown once
+function readKeysPart() {
+  const r = D.readKeys
+  if (!r || (!r.keys.length && !r.available.length)) return null
+  const live = r.keys.filter((k) => !k.revoked_at)
+  const label = textInput({ placeholder: T.readKeys.label, maxlength: 60 })
+  const tab = el('select', { class: 'text-input' }, r.available.map((a) => el('option', { value: a.tab }, a.label || a.tab)))
+  const out = el('div')
+  return [el('span', { class: 'caps' }, T.readKeys.title), el('p', { class: 'muted small' }, T.readKeys.intro(r.day_alert)),
+    live.length ? el('div', { class: 'group' }, live.map((k) => el('div', { class: 'item' },
+      line(screenIcon('key'), k.label, T.readKeys.line(k.tab, when(k.created_at), when(k.last_used_at), k.last_ip, k.today),
+        btn(T.revoke, async () => { await api('DELETE', `/api/me/readkeys/${k.id}`); await refresh() }, 'btn-sm btn-danger'))))) : el('div', { class: 'card pad muted' }, T.readKeys.none),
+    r.available.length ? el('div', { class: 'card pad' }, field(T.readKeys.labelCaps, label), r.available.length > 1 ? field(T.readKeys.tab, tab) : null,
+      btn(T.readKeys.create, async () => {
+        const k = await api('POST', '/api/me/readkeys', { label: label.value, tab: tab.value })
+        out.replaceChildren(keyOnce(T.readKeys.copyOnce, k.key))
+      }, 'btn-primary btn-block pad-top', 'plus'), out) : null]
 }
 
 function partAudit(top) {

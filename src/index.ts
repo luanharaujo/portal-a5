@@ -1363,7 +1363,7 @@ async function recordTabAudit(env: Env, req: Request, tab: string, h: Headers, w
     who, person: identity.person, strength: who ? strength(who) : identity.credential,
     action: ok ? `${tab}.${a.action}` : `${tab}.invalid_audit`,
     target: ok ? a.target : null,
-    detail: ok ? { ...(a.detail as object ?? {}), credential: identity.credential, ...(identity.machine ? { machine: identity.machine } : {}) } : null,
+    detail: ok ? { ...(a.detail as object ?? {}), credential: identity.credential, ...(identity.machine ? { machine: identity.machine } : {}), ...(identity.read_key ? { read_key: identity.read_key } : {}) } : null,
   })
 }
 
@@ -2230,12 +2230,140 @@ async function revokeAgentKey(env: Env, req: Request, who: Who, id: number) {
   await audit(env, req, { who, action: 'agent_key_revoked', target: String(k.label) })
 }
 
+// ------------------------------------------------------------------ read keys (docs/READ_KEYS.md)
+// "pa5_ler_" + 32 random bytes in base64url: a program of the owner group (an agent on the Mac)
+// reads one tab's data with GET, no session and no cookie. Any request that carries one is answered
+// here and only here, whatever its path: a valid key on anything but GET /<tab><path> from the tab's
+// readKey policy gets 403, so the key never reaches a portal API, a command or another tab.
+const READ_KEY_PREFIX = 'pa5_ler_'
+const isReadKeyShape = (k: string) => /^pa5_ler_[A-Za-z0-9_-]{43}$/.test(k)
+// no end date (owner's call, 10/11); instead every admin is warned past READ_KEY_DAY_ALERT uses in
+// one day, or at a second IP address in the same day (calendar day in UTC-3)
+const READ_KEY_DAY_ALERT = 30
+const brasiliaDay = () => new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10)
+const MAX_READ_KEYS = 5
+const READ_FAIL_PER_IP = 30
+
+const bearerOf = (req: Request) => /^Bearer (\S+)$/.exec(req.headers.get('Authorization') ?? '')?.[1] ?? ''
+const carriesReadKey = (req: Request) => (req.headers.get('Authorization') ?? '').includes(READ_KEY_PREFIX)
+const readKeyTabs = (env: Env) => Object.keys(tabBindings(env)).filter((t) => tabsConfig(env.TABS)[t]?.readKey)
+
+async function readKeyRequest(req: Request, env: Env, url: URL): Promise<Response> {
+  const raw = bearerOf(req)
+  const target = `${req.method} ${url.pathname}`.slice(0, 120)
+  let keyId: number | null = null
+  const refuse = async (reason: string, person: number | null = null, status = 401, code = 'bad_key'): Promise<never> => {
+    if (status === 401 && !(await underLimit(env, `ler-fail-ip:${clientIp(req)}`, READ_FAIL_PER_IP))) throw new HttpError(429, 'too_many_attempts')
+    // a valid key refused (scope, hourly limit): audited up to READ_FAIL_PER_IP rows an hour per key
+    if (status === 401 || keyId === null || (await underLimit(env, `ler-ref:${keyId}`, READ_FAIL_PER_IP)))
+      await audit(env, req, { person, strength: 'read_key', action: 'read_key_refused', target, detail: { reason, ...(keyId ? { read_key: keyId } : {}) } })
+    throw new HttpError(status, code)
+  }
+  if (!isReadKeyShape(raw)) return refuse('format')
+  // looked up by hash (unique index); the hash is the constant-time part
+  const k = await env.DB.prepare(
+    `SELECT k.id, k.label, k.tab, k.revoked_at, k.seen_places, k.use_day, k.use_day_n, k.use_day_ips, p.id AS pid, p.name, p.status, p.kind
+       FROM read_keys k JOIN people p ON p.id = k.person_id WHERE k.key_hash = ?`,
+  ).bind(await sha256(raw)).first<Row>()
+  if (!k) return refuse('unknown')
+  const pid = Number(k.pid), id = Number(k.id), tab = String(k.tab)
+  keyId = id
+  if (k.revoked_at) return refuse('revoked', pid)
+  if (k.status !== 'active' || k.kind === 'screen') return refuse('person_blocked', pid)
+  // the owner group, now (not only when the key was made)
+  const groups = await groupsOf(env, pid)
+  if (!groups.some((g) => g.id === OWNER_GROUP && g.is_admin)) return refuse('not_owner', pid)
+  // scope: GET, the key's own tab, one of its readKey paths; anything else (POST, _cmd, _passkey,
+  // /api, /conta, another tab) is refused with the key known
+  const policy = tabsConfig(env.TABS)[tab]?.readKey
+  const service = tabService(env, tab)
+  const sub = url.pathname.startsWith(`/${tab}/`) ? url.pathname.slice(tab.length + 1) : null
+  if (req.method !== 'GET' || !policy || !service || sub === null || !policy.paths.includes(sub) || isUpgrade(req))
+    return refuse('out_of_scope', pid, 403, 'read_key_scope')
+  if (!(await underLimit(env, `ler:${id}`, policy.perHour))) return refuse('hourly_limit', pid, 429, 'too_many_attempts')
+  // a key used from a city/network it never used before warns every admin
+  const where = placeKey(req)
+  let seen: string[] = []
+  try { seen = (JSON.parse(String(k.seen_places)) as unknown[]).filter((x): x is string => typeof x === 'string') } catch { /* none */ }
+  const newPlace = !seen.includes(where)
+  if (newPlace) seen = [...seen, where].slice(-20)
+  // the day's counters (Security's condition for a key with no end date)
+  const day = brasiliaDay(), ip = clientIp(req)
+  let ips: string[] = [], n = 1
+  if (k.use_day === day) {
+    try { ips = (JSON.parse(String(k.use_day_ips)) as unknown[]).filter((x): x is string => typeof x === 'string') } catch { /* none */ }
+    n = Number(k.use_day_n) + 1
+  }
+  const newIp = !ips.includes(ip)
+  if (newIp) ips = [...ips, ip].slice(-20)
+  await env.DB.prepare('UPDATE read_keys SET last_used_at = ?, last_ip = ?, last_place = ?, seen_places = ?, use_day = ?, use_day_n = ?, use_day_ips = ? WHERE id = ?')
+    .bind(now(), ip, place(req), JSON.stringify(seen), day, n, JSON.stringify(ips), id).run()
+  if (newPlace) await alertAdmins(env, req, String(k.label), 'read_key_place')
+  if (n === READ_KEY_DAY_ALERT + 1) await alertAdmins(env, req, String(k.label), 'read_key_day')
+  if (newIp && ips.length >= 2) await alertAdmins(env, req, String(k.label), 'read_key_ip')
+  const identity: PortalIdentity = {
+    credential: 'read_key', person: pid, name: String(k.name), groups: groups.map((g) => g.id), session: null, machine: null,
+    shortcut: null, read_key: id, strong: false, entered_at: null, entry_until: null, admin_until: null, actions: [], passkey_until: {},
+  }
+  const forwarded = new Request(url.toString(), { method: 'GET', headers: stripRequestHeaders(req.headers) })
+  const res = await service.handle(forwarded, identity)
+  // every use, whatever the tab says: who, which key, what path, what answer
+  await audit(env, req, { person: pid, strength: 'read_key', action: 'read_key_used', target: `${tab}${sub}`, detail: { read_key: id, status: res.status, day_n: n, ...(newPlace ? { new_place: true } : {}), ...(newIp && ips.length >= 2 ? { day_ips: ips.length } : {}) } })
+  await recordTabAudit(env, req, tab, res.headers, null, identity)
+  const out = new Response(res.body, { status: res.status, statusText: res.statusText, headers: res.headers })
+  sanitizeTabHeaders(out.headers, API_HEADERS, tab, null)
+  return out
+}
+
+async function listReadKeys(env: Env, who: Who) {
+  if (!who.admin) throw new HttpError(403, 'admin_only')
+  const keys = await env.DB.prepare(
+    'SELECT id, label, tab, created_at, last_used_at, last_ip, last_place, use_day, use_day_n, revoked_at FROM read_keys WHERE person_id = ? ORDER BY id DESC LIMIT 50',
+  ).bind(who.person.id).all<Row>()
+  const owner = who.groups.some((g) => g.id === OWNER_GROUP)
+  return {
+    // uses today (UTC-3 day); the counters of an older day mean none today
+    keys: keys.results.map(({ use_day, use_day_n, ...k }) => ({ ...k, today: use_day === brasiliaDay() ? Number(use_day_n) : 0 })),
+    available: owner ? readKeyTabs(env).filter((t) => canOpen(who, t)).map((t) => ({ tab: t, label: tabsConfig(env.TABS)[t]?.label ?? null, paths: tabsConfig(env.TABS)[t]!.readKey!.paths })) : [],
+    day_alert: READ_KEY_DAY_ALERT,
+  }
+}
+
+// Only a strong owner session (Face ID in the last minutes) makes one; shown once.
+async function addReadKey(env: Env, req: Request, who: Who) {
+  requireStrongAdmin(who)
+  if (!who.groups.some((g) => g.id === OWNER_GROUP)) throw new HttpError(403, 'owner_only')
+  const b = await body(req)
+  const label = text(b.label, 60)
+  if (!label) throw new HttpError(400, 'name_required')
+  const tab = typeof b.tab === 'string' ? b.tab : ''
+  if (!readKeyTabs(env).includes(tab) || !canOpen(who, tab)) throw new HttpError(400, 'bad_tab')
+  const live = await env.DB.prepare('SELECT COUNT(*) AS n FROM read_keys WHERE person_id = ? AND revoked_at IS NULL').bind(who.person.id).first<{ n: number }>()
+  if ((live?.n ?? 0) >= MAX_READ_KEYS) throw new HttpError(409, 'too_many_keys')
+  const key = READ_KEY_PREFIX + randomToken(32)
+  const r = await env.DB.prepare(
+    'INSERT INTO read_keys (person_id, label, tab, key_hash, created_at, created_session) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
+  ).bind(who.person.id, label, tab, await sha256(key), now(), who.sessionId).first<{ id: number }>()
+  await audit(env, req, { who, action: 'read_key_created', target: label, detail: { id: r!.id, tab } })
+  return { id: r!.id, label, tab, key }
+}
+
+// Taking access away never needs Face ID: any session of the key's owner revokes it.
+async function revokeReadKey(env: Env, req: Request, who: Who, id: number) {
+  const k = await env.DB.prepare('UPDATE read_keys SET revoked_at = ? WHERE id = ? AND person_id = ? AND revoked_at IS NULL RETURNING label')
+    .bind(now(), id, who.person.id).first<{ label: string }>()
+  if (!k) throw new HttpError(404, 'key_not_found')
+  await audit(env, req, { who, action: 'read_key_revoked', target: k.label, detail: { id } })
+}
+
 // ------------------------------------------------------------------ router
 async function handle(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url)
   const path = url.pathname
   const m = req.method
 
+  // a read key is answered on its own path and nowhere else (cookies ignored)
+  if (carriesReadKey(req)) return readKeyRequest(req, env, url)
   if (path === '/robo/login' && m === 'POST') return robotLogin(req, env)
   if (path.startsWith('/robo/')) throw new HttpError(404, 'not_found')
   let mb: RegExpMatchArray | null
@@ -2293,6 +2421,12 @@ async function handle(req: Request, env: Env): Promise<Response> {
     if (path === '/api/me/shortcuts' && m === 'POST') return out(await addShortcutKey(env, req, who))
     if ((mm = path.match(/^\/api\/me\/shortcuts\/(\d+)$/)) && m === 'DELETE') {
       await revokeShortcutKey(env, req, who, Number(mm[1]))
+      return out({ ok: true })
+    }
+    if (path === '/api/me/readkeys' && m === 'GET') return out(await listReadKeys(env, who))
+    if (path === '/api/me/readkeys' && m === 'POST') return out(await addReadKey(env, req, who))
+    if ((mm = path.match(/^\/api\/me\/readkeys\/(\d+)$/)) && m === 'DELETE') {
+      await revokeReadKey(env, req, who, Number(mm[1]))
       return out({ ok: true })
     }
     if ((mm = path.match(/^\/api\/me\/alerts\/(\d+)\/ack$/)) && m === 'POST') {
