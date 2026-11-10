@@ -2334,7 +2334,7 @@ async function listReadKeys(env: Env, who: Who) {
   const owner = who.groups.some((g) => g.id === OWNER_GROUP)
   return {
     // uses today (UTC-3 day); the counters of an older day mean none today
-    keys: keys.results.map(({ use_day, use_day_n, ...k }) => ({ ...k, today: use_day === brasiliaDay() ? Number(use_day_n) : 0 })),
+    keys: keys.results.map(({ use_day, use_day_n, ...k }) => ({ ...k, today: use_day === brasiliaDay() ? Number(use_day_n) : 0, day_alert: tabsConfig(env.TABS)[String(k.tab)]?.readKey?.dayAlert ?? READ_KEY_DAY_ALERT })),
     available: owner ? readKeyTabs(env).filter((t) => canOpen(who, t)).map((t) => ({ tab: t, label: tabsConfig(env.TABS)[t]?.label ?? null, paths: tabsConfig(env.TABS)[t]!.readKey!.paths })) : [],
     day_alert: READ_KEY_DAY_ALERT,
   }
