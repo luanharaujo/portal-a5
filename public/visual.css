@@ -160,6 +160,9 @@ a { color: inherit; }
 /* Face ID before entering a tab */
 .faceid-mark { width: 72px; height: 72px; border-radius: 22px; display: flex; align-items: center; justify-content: center; background: var(--sun-bg); color: var(--sun-ink); margin-bottom: 16px; }
 .faceid-mark .ico { width: 40px; height: 40px; stroke-width: 1.8; }
+/* the same, served in place at the tab's address (src/index.ts entryPage): the house stays soft behind */
+.a5-entry .scene img { filter: blur(3px) saturate(.9); transform: scale(1.04); }
+.a5-entry .sheet h1 [data-a5-tabs] { font: inherit; }
 
 /* pairing: code in boxes + QR (shown by the fixed screen) */
 .code-qr { display: flex; align-items: center; flex-wrap: wrap; margin: 22px 0 6px; }

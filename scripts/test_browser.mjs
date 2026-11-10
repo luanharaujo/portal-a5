@@ -49,8 +49,10 @@ export async function page(b, base, cookie, { touch = false, scheme = null } = {
   const { sessionId } = await b.send('Target.attachToTarget', { targetId, flatten: true })
   const s = (m, p) => b.send(m, p, sessionId)
   const log = []
+  const requests = [] // every request of this page: { url, type }
   b.listeners.push((m) => {
     if (m.sessionId !== sessionId) return
+    if (m.method === 'Network.requestWillBeSent') requests.push({ url: m.params.request.url, type: m.params.type })
     if (m.method === 'Log.entryAdded') log.push(m.params.entry.text)
     if (m.method === 'Runtime.exceptionThrown') log.push('exception: ' + m.params.exceptionDetails.text)
   })
@@ -101,7 +103,7 @@ export async function page(b, base, cookie, { touch = false, scheme = null } = {
     const { writeFileSync } = await import('node:fs')
     writeFileSync(file, Buffer.from(data, 'base64'))
   }
-  return { evaluate, waitFor, go, key, log, drag, lift, shot }
+  return { evaluate, waitFor, go, key, log, drag, lift, shot, send: s, requests }
 }
 
 // Pull to refresh on one page: true when a long pull reloads it (a marker set on the page is gone).
@@ -446,6 +448,60 @@ export async function agentPairChecks({ base, check, owner, prepare, approve }) 
     check('browser: first tap on Bloquear only asks again', armed && await o.evaluate(`!document.querySelector('main').textContent.includes(A5_TEXT.unblock)`), o.log)
     check('browser: screen paired by the agent lands on next', await sp.waitFor(`location.pathname + location.search === '/tab-a/?view=landscape'`, 8000), [await sp.evaluate('location.href'), sp.log])
   } finally {
+    b.close()
+  }
+}
+
+// Face ID on entry, in place (docs/TABS.md): a real WebAuthn call in Chrome, with the test's software
+// passkey loaded into a virtual authenticator. WebAuthn needs a domain as the RP id, so these pages
+// run on localhost (same server). Also measures the old way (the portal's step-up page) for the record.
+export async function entryChecks({ base, check, owner, cred, age, restore }) {
+  if (!existsSync(CHROME)) { console.log('skip entry browser checks: Chrome not found (set CHROME)'); return }
+  const lbase = base.replace('127.0.0.1', 'localhost')
+  const b = await launch()
+  let count = 1000 // each virtual authenticator starts above the last one (the server wants a growing count)
+  const withKey = async (p, key) => {
+    count += 1000
+    await p.send('WebAuthn.enable', { enableUI: false })
+    const { authenticatorId } = await p.send('WebAuthn.addVirtualAuthenticator', { options: {
+      protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } })
+    if (key) await p.send('WebAuthn.addCredential', { authenticatorId, credential: {
+      credentialId: key.id, isResidentCredential: false, rpId: 'localhost', privateKey: key.pkcs8, signCount: count } })
+  }
+  const TAB = `document.body && document.body.innerText.includes('entered_at')`
+  const run = async (path) => {
+    await age()
+    const p = await page(b, lbase, owner)
+    await withKey(p, cred)
+    const t0 = Date.now()
+    await p.go(path)
+    const ok = await p.waitFor(TAB, 10000)
+    const ms = Date.now() - t0
+    return { p, ok, ms, docs: p.requests.filter((r) => r.type === 'Document').map((r) => new URL(r.url).pathname + new URL(r.url).search), n: p.requests.length }
+  }
+  try {
+    const now = await run('/tab-b/')
+    check('browser: entry in place: the Face ID opens by itself and the same address then serves the tab', now.ok, [now.docs, now.p.log])
+    check('browser: entry in place: two page loads, both the tab address', now.docs.length === 2 && now.docs.every((d) => d === '/tab-b/'), now.docs)
+    check('browser: entry in place: no CSP violation or error', !now.p.log.some((t) => /Content Security Policy|exception/i.test(t)), now.p.log)
+    const old = await run('/?step_up=tab-b&next=' + encodeURIComponent('/tab-b/'))
+    check('browser: the portal step-up page still works for older tabs', old.ok, [old.docs, old.p.log])
+    console.log(`entry timing (local): in place ${now.ms} ms, ${now.docs.length} page loads, ${now.n} requests; ` +
+      `old step-up page ${old.ms} ms, ${old.docs.length + 1} page loads counting the redirect, ${old.n} requests`)
+
+    // cancelled (no passkey on this device): the page stays, with the tab list and one button
+    await age()
+    const c = await page(b, lbase, owner)
+    await withKey(c, null)
+    await c.go('/tab-b/')
+    const ON = `document.querySelector('[data-a5-tabs]')?.dataset.a5TabsOn === '1'`
+    check('browser: entry page: the title is the tab list (H1)', await c.waitFor(ON, 5000))
+    check('browser: entry page after a cancel: one button, then a new prompt from it',
+      await c.waitFor(`(() => { const g = document.getElementById('a5-entry-go'); return g && !g.hidden && g.textContent === A5_TEXT.entry.button })()`, 8000),
+      [await c.evaluate(`document.querySelector('main')?.innerText`), c.log])
+    check('browser: entry page: no CSP violation', !c.log.some((t) => /Content Security Policy/i.test(t)), c.log)
+  } finally {
+    await restore()
     b.close()
   }
 }

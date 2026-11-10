@@ -1301,12 +1301,47 @@ async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: strin
     const prior = await lastEntry(env, who, tab)
     const reuseMs = Math.min(policyOf(tab).entryHours * 3600e3, ENTRY_RELOAD_MS)
     if (prior && Date.parse(prior) > Date.now() - reuseMs) return prior
-    return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, backTo(url)), ...API_HEADERS } })
+    return (await entryPage(env, req, url, who, tab))
+      ?? new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, backTo(url)), ...API_HEADERS } })
   }
   const prior = await lastEntry(env, who, tab)
   if (prior) return prior
-  throw new HttpError(401, 'entry_required', { step_up: stepUpUrl(tab, `/${tab}/`) })
+  // a navigation to the tab's own address now asks the Face ID in place (entryPage)
+  throw new HttpError(401, 'entry_required', { step_up: `/${tab}/` })
 }
+
+// Face ID on entry, in place (house rule H2, 10/11): the navigation that needs an entry gets, at the
+// tab's own address, a portal page (public/entry.html) carrying a fresh challenge for "entry:<tab>".
+// Its script opens the Face ID prompt on load, verifies with /api/passkey/get/verify (which leaves the
+// usual 60 s grant) and reloads the same address, so the next navigation burns the grant and the tab
+// is served. Nothing of the tab is in this page: its handle() is not called before the entry. Only a
+// browser session with a passkey, not while seeing as; anything else keeps the portal's step-up page.
+async function entryPage(env: Env, req: Request, url: URL, who: Who, tab: string): Promise<Response | null> {
+  if (req.method !== 'GET' || who.kind !== 'browser' || who.viewAs) return null
+  const creds = await env.DB.prepare('SELECT credential_id FROM passkeys WHERE person_id = ?').bind(who.person.id).all<{ credential_id: string }>()
+  if (!creds.results.length) return null
+  const page = await env.ASSETS.fetch(new Request(url.origin + '/entry.html'))
+  if (!page.ok) return null
+  const options = {
+    challenge: await newChallenge(env, who, 'get', `entry:${tab}`),
+    rpId: rpOf(url).id,
+    allowCredentials: creds.results.map((c) => ({ type: 'public-key', id: c.credential_id })),
+    userVerification: 'required',
+    timeout: CHALLENGE_MS,
+  }
+  const label = tabsConfig(env.TABS)[tab]?.label || tab.charAt(0).toUpperCase() + tab.slice(1)
+  // JSON inside a non-executed script element: "<" escaped so nothing can close the element
+  const blob = JSON.stringify({ tab, options }).replace(/</g, '\\u003c')
+  const html = (await page.text())
+    .replace('__A5_LABEL__', () => escapeHtml(label))
+    .replace('__A5_ENTRY__', () => blob)
+  const headers: Record<string, string> = { ...PAGE_HEADERS, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+  const out = new Response(html, { status: 200, headers })
+  if (who.refreshCookie) out.headers.append('Set-Cookie', who.refreshCookie)
+  return out
+}
+
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
 
 // This session's last entry into the tab, when still inside entryHours; null otherwise.
 async function lastEntry(env: Env, who: Who, tab: string): Promise<string | null> {

@@ -3,7 +3,7 @@
 import { webcrypto as wc } from 'node:crypto'
 import http from 'node:http'
 import { execFileSync } from 'node:child_process'
-import { agentPairChecks, browserChecks } from './test_browser.mjs'
+import { agentPairChecks, browserChecks, entryChecks } from './test_browser.mjs'
 
 const BASE = process.env.BASE
 const ROBO_KEY = process.env.ROBO_KEY
@@ -77,6 +77,8 @@ async function makeAuthenticator() {
         publicKey: b64u(await wc.subtle.exportKey('spki', keys.publicKey)), publicKeyAlgorithm: -7,
       }
     },
+    // the same key for Chrome's virtual authenticator (scripts/test_browser.mjs, entryChecks)
+    async forChrome() { return { id: Buffer.from(credId).toString('base64'), pkcs8: Buffer.from(await wc.subtle.exportKey('pkcs8', keys.privateKey)).toString('base64') } },
     async get(opts, { origin = BASE, uv = true } = {}) {
       const clientData = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: opts.challenge, origin }))
       const flags = uv ? 0x05 : 0x01
@@ -301,6 +303,9 @@ function rawGet(path, headers) {
 }
 const upgradeStatus = async (path, headers) => (await rawGet(path, { Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': Buffer.from(wc.getRandomValues(new Uint8Array(16))).toString('base64'), ...headers })).status
 const navigate = (c, path) => rawGet(path, { ...NAV, ...(c.cookie ? { Cookie: c.cookie } : {}) })
+// Face ID on entry, in place: the portal's page at the tab's own address, with the options inside
+const entryPageOf = (r) => r.status === 200 && typeof r.data === 'string' && r.data.includes('id="a5-entry"')
+const entryData = (r) => JSON.parse(/<script type="application\/json" id="a5-entry">([^<]*)<\/script>/.exec(r.data)[1])
 const tabRevoked = async () => (await resident.req('GET', '/tab-a/revoked', undefined, CORS)).data
 
 // signed out
@@ -359,16 +364,25 @@ check('malformed tab audit recorded as invalid', rows.some((a) => a.action === '
 
 // Face ID on every entry into tab-b
 const nav1 = (await navigate(owner, '/tab-b/'))
-check('tab-b entry without Face ID -> step-up page', nav1.status === 302 && nav1.headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F', [nav1.status, nav1.headers.get('location')])
-check('tab-b step-up next keeps the query', (await navigate(owner, '/tab-b/?v=1')).headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F%3Fv%3D1')
+check('tab-b entry without Face ID -> Face ID page in place (200, same address)', entryPageOf(nav1), [nav1.status, nav1.headers.get('location')])
+{
+  const d = entryData(nav1)
+  check('entry page: options for this tab, nothing of the tab', d.tab === 'tab-b' && d.options.challenge && d.options.allowCredentials.length && d.options.userVerification === 'required' &&
+    !/identity|entered_at/.test(nav1.data), d)
+  check('entry page: no-store, the portal CSP, no inline script', nav1.headers.get('cache-control') === 'no-store' && /script-src 'self'/.test(nav1.headers.get('content-security-policy') || '') &&
+    !/<script(?![^>]*\b(src=|type="application\/json"))/.test(nav1.data))
+  check('entry page: title is the tab list button, with the tab label', /<h1><button type="button" data-a5-tabs>[^<]+<\/button><\/h1>/.test(nav1.data) && !nav1.data.includes('__A5_'))
+  check('entry page: shell, locale and entry scripts', ['/_shell/tabs.js', '/_shell/tabs.css', '/locale/pt-BR.js', '/_shell/entry.js'].every((f) => nav1.data.includes(f)))
+}
+check('tab-b entry page keeps the address with the query (no redirect)', entryPageOf(await navigate(owner, '/tab-b/?v=1')))
 function d1Count(sql) { return JSON.parse(execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--json', '--command', sql], { encoding: 'utf8' }))[0].results[0].n }
 const in1 = await owner.req('GET', '/tab-b/echo', undefined, CORS)
-check('tab-b request without entry = 401 entry_required', in1.status === 401 && in1.data.error === 'entry_required' && in1.data.step_up, in1.data)
+check('tab-b request without entry = 401 entry_required, step_up = the tab itself', in1.status === 401 && in1.data.error === 'entry_required' && in1.data.step_up === '/tab-b/', in1.data)
 check('tab-b socket without entry = 401', (await upgradeStatus('/tab-b/live', { Cookie: owner.cookie, Origin: BASE })) === 401)
 // a passkey check without the entry purpose does not open the tab
 const plain = await owner.req('POST', '/api/passkey/get/options', {})
 await owner.req('POST', '/api/passkey/get/verify', await auth.get(plain.data))
-check('plain passkey check is not an entry', (await navigate(owner, '/tab-b/')).status === 302)
+check('plain passkey check is not an entry', entryPageOf(await navigate(owner, '/tab-b/')))
 check('entry purpose for a session-only tab = 400', (await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:tab-a' })).status === 400)
 check('entry purpose for an unknown tab = 400', (await owner.req('POST', '/api/passkey/get/options', { purpose: 'entry:nothing' })).status === 400)
 check('resident cannot ask a tab-b entry', (await resident.req('POST', '/api/passkey/get/options', { purpose: 'entry:tab-b' })).status === 400)
@@ -762,17 +776,25 @@ check('refusal audited with its reason', !!refRow, refRow)
   const sidE = (await owner.req('GET', '/api/me')).data.session_id
   const usedE = d1json(`SELECT used_at FROM tab_entries WHERE session_id = ${sidE} AND tab = 'tab-b' ORDER BY used_at DESC LIMIT 1`)[0].used_at
   check('age the owner tab-b entry past 4 h', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
-  check('tab-b: navigation after the entry window = 302 step-up', (await navigate(owner, '/tab-b/')).status === 302)
+  const again = await navigate(owner, '/tab-b/')
+  check('tab-b: navigation after the entry window = Face ID page in place', entryPageOf(again))
+  // the in-place flow end to end: the page's own options -> verify -> reload of the same address = the tab
+  const ivr = await owner.req('POST', '/api/passkey/get/verify', await auth.get(entryData(again).options))
+  check('entry page options verify (entry grant)', ivr.status === 200 && ivr.data.next === '/tab-b/', ivr.data)
+  const inPlace = await navigate(owner, '/tab-b/')
+  check('reload after the in-place Face ID = the tab itself', inPlace.status === 200 && !!inPlace.data.identity?.entered_at, inPlace.data)
+  check('age it past 4 h again', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
   // a 4 h entry is reused by a navigation for 15 min only; the rest of the tab keeps the 4 h
   check('entry 20 min old', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 20 * 60e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
-  check('tab-b (4 h entry): navigation 20 min after the entry = 302', (await navigate(owner, '/tab-b/')).status === 302)
+  check('tab-b (4 h entry): navigation 20 min after the entry = Face ID page', entryPageOf(await navigate(owner, '/tab-b/')))
   check('tab-b (4 h entry): requests 20 min after the entry still = 200', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 200)
   check('entry 10 min old', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 10 * 60e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
   check('tab-b (4 h entry): navigation 10 min after the entry = 200', (await navigate(owner, '/tab-b/')).status === 200)
   check('age it past 4 h', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
   check('tab-b: request after the entry window = 401', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 401)
   check('put the entry back', d1(`UPDATE tab_entries SET used_at = '${usedE}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
-  check('tab-b: another session of an admin without its own entry = 302', (await navigate(admin3, '/tab-b/')).status === 302)
+  { const a3 = await navigate(admin3, '/tab-b/')
+    check('tab-b: another session of an admin without its own entry = Face ID again (in place, or the step-up page without a passkey)', entryPageOf(a3) || (a3.status === 302 && a3.headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F'), a3.status) }
 }
 
 // R1b: a keyWriteOnly action is the one way a key reaches a tab with Face ID on entry
@@ -1050,6 +1072,20 @@ check('screen for the browser test paired', !!tv3.cookie)
 const strongNow = async () => owner.req('POST', '/api/passkey/get/verify', await auth.get((await owner.req('POST', '/api/passkey/get/options', {})).data))
 await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie, strong: strongNow,
   approve: async (code) => check('browser pairing approved', (await owner.req('POST', '/api/admin/pair', { code, name: 'TV deep link' })).status === 200) })
+{
+  // Face ID on entry in place, in Chrome: the owner's tab-b entries aged past 4 h, then put back
+  const sidB = (await owner.req('GET', '/api/me')).data.session_id
+  const keep = d1json(`SELECT id, granted_at, used_at FROM tab_entries WHERE session_id = ${sidB} AND tab = 'tab-b'`)
+  // Chrome's virtual authenticator counts up; the software passkey keeps sending 0: put the count back
+  const count0 = d1json(`SELECT sign_count AS n FROM passkeys WHERE credential_id = '${auth.id}'`)[0].n
+  await entryChecks({ base: BASE, check, owner: owner.cookie, cred: await auth.forChrome(),
+    age: async () => d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}', granted_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidB} AND tab = 'tab-b'`),
+    restore: async () => {
+      d1(`DELETE FROM tab_entries WHERE session_id = ${sidB} AND tab = 'tab-b' AND id NOT IN (${keep.map((k) => k.id).join(',') || 0})`)
+      d1(`UPDATE passkeys SET sign_count = ${count0} WHERE credential_id = '${auth.id}'`)
+      for (const k of keep) d1(`UPDATE tab_entries SET granted_at = '${k.granted_at}', used_at = ${k.used_at ? `'${k.used_at}'` : 'NULL'} WHERE id = ${k.id}`)
+    } })
+}
 
 // ------------------------------------------------------------------ "see as" (an admin sees the portal as another group)
 {

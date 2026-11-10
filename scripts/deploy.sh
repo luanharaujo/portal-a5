@@ -115,7 +115,7 @@ npx tsc --noEmit
 # stylesheet URL in index.html, so the iOS Home Screen app never runs an old file kept under the
 # same URL (scripts/build_assets.py). The list of versioned files is checked after the deploy.
 mkdir -p .deploy
-python3 scripts/build_assets.py public .deploy/public > .deploy/assets.txt
+python3 scripts/build_assets.py public .deploy/public .deploy/assets_entry.txt > .deploy/assets.txt
 sed -i '' 's|^directory = "./public"$|directory = "./.deploy/public"|' "$CFG"
 grep -q '^directory = "./.deploy/public"$' "$CFG" || { echo "could not point assets to the build" >&2; exit 1; }
 
@@ -156,6 +156,11 @@ live() {
     got="$(curl -fsS -H 'Cache-Control: no-cache' "$URL$path?v=$v" | shasum -a 256 | cut -c1-12)" || return 1
     [ "$got" = "$v" ] || return 1
   done < .deploy/assets.txt
+  # the Face ID page served in place at a tab's address (signed-in only): its files, byte for byte
+  while read -r path v; do
+    got="$(curl -fsS -H 'Cache-Control: no-cache' "$URL$path?v=$v" | shasum -a 256 | cut -c1-12)" || return 1
+    [ "$got" = "$v" ] || return 1
+  done < .deploy/assets_entry.txt
 }
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do live && break; sleep 5; done
 live || { echo "DEPLOYED BUT NOT CONFIRMED: the public page still serves other files ($VERSION at $COMMIT)" >&2; exit 1; }

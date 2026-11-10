@@ -141,6 +141,14 @@ window.T = {
     screenTag: ' · tela',
     screenChip: 'tela',
   },
+  // Face ID on entry, in place at the tab's address (public/_shell/entry.js)
+  entry: {
+    why: 'Esta aba pede Face ID toda vez que você entra.',
+    button: 'Entrar com Face ID',
+    failed: 'Não deu certo. Tente de novo.',
+    offline: 'Sem conexão. Tente de novo.',
+    unsupported: 'Este navegador não tem Face ID.',
+  },
   stepUp: {
     title: (tab) => `Entrar na aba ${tab}`,
     why: 'Esta aba pede Face ID toda vez que você entra.',
