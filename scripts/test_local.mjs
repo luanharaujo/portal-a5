@@ -90,6 +90,13 @@ async function makeAuthenticator() {
   }
 }
 
+// ------------------------------------------------------------------ house rules check (scripts/check_rules.mjs)
+{
+  const rules = (f) => { try { execFileSync('node', ['scripts/check_rules.mjs', f], { stdio: 'ignore' }); return 0 } catch (e) { return e.status } }
+  check('house rules: the entry page passes', rules('public/entry.html') === 0)
+  check('house rules: a page without the shell fails', rules('test/rules_bad.html') === 1)
+}
+
 // ------------------------------------------------------------------ tests
 const anon = client()
 const home = await anon.req('GET', '/')

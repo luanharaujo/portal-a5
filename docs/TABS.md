@@ -11,6 +11,14 @@ These hold for every page served under the portal, a first mockup included. A pa
 - **H3. Fast.** As fast as the energy and controls tabs: first paint from one round trip, files under `?v=` with long cache, scripts `defer`, nothing external, no chained requests before drawing.
 - **H4. Fewest taps.** The common path takes the fewest taps possible; no confirmation for what can be undone; sensible defaults filled in.
 
+**Automatic check.** `scripts/check_rules.mjs` checks H1 and the static part of H3 on the HTML a tab serves (shell files in `<head>`, a title marked `data-a5-tabs`, `data-a5-pull="own"` only with a pull of its own, scripts `defer`, no inline script or style, nothing from another origin). Every tab runs it in its own deploy script, on the files it is about to publish, and stops when it fails:
+
+```sh
+node ~/repositories/portal-a5/scripts/check_rules.mjs dist/   # or web/, or one page
+```
+
+A tiny script that has to run before the first paint (picking a layout) may stay without `defer` when marked `data-a5-early` and at most 4 KB. H2 and H4 need a person: the portal's maintainer checks them before going live.
+
 ## 1. Shape of a tab
 
 A tab is a private Worker:
