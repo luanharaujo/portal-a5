@@ -2,6 +2,15 @@
 
 How a tab plugs into the portal. Written for whoever builds a tab. The portal side lives in `src/tabs.ts` (policy and header rules) and `src/index.ts` (router, screens, bridges).
 
+## 0. House rules (every page, no exceptions)
+
+These hold for every page served under the portal, a first mockup included. A page that breaks one does not go live. The portal's maintainer checks each new tab and each visible change before it goes live; new rules are added here.
+
+- **H1. Never a dead end.** Every screen and state of a page (inner screens, sheets, empty, error, loading) has pull to refresh and one visible tap back to the tab list. The standard way is section 9: the title marked `data-a5-tabs` plus `/_shell/tabs.css` and `/_shell/tabs.js`, which bring both. Never hide or replace the title on an inner screen.
+- **H2. Face ID straight away.** When something needs Face ID, the Apple prompt is the first thing the person sees: no "use Face ID" button, no confirm screen, no detour through another page first. Inside a tab, fetch the options before the tap and call `navigator.credentials.get` in the tap that asked for the action (COMMANDS.md). On a page whose only job is the check, call it on load (Safari allows one call without a gesture per navigation) and keep a button only as the fallback after a cancel.
+- **H3. Fast.** As fast as the energy and controls tabs: first paint from one round trip, files under `?v=` with long cache, scripts `defer`, nothing external, no chained requests before drawing.
+- **H4. Fewest taps.** The common path takes the fewest taps possible; no confirmation for what can be undone; sensible defaults filled in.
+
 ## 1. Shape of a tab
 
 A tab is a private Worker:
@@ -221,6 +230,7 @@ The tab never says who did it: the portal fills that in. Events with no request 
 - Commands: section 6 rules, and a security review of the tab and its bridge before they are switched on.
 - Ask the portal for its policy line (features, entry, credentials) and binding.
 - Title marked with `data-a5-tabs`, the selector's files and the home-screen app lines in `<head>` (section 9); `badge` if something waits for people there.
+- The house rules of section 0, checked by the portal's maintainer before going live.
 
 ## 9. Tab selector and pending counts
 

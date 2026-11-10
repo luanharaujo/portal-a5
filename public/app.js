@@ -406,19 +406,34 @@ async function welcomeView(fullName) {
 // ------------------------------------------------------------------ Face ID for an owner's command
 // The tab pages cannot run WebAuthn (their CSP): a tab sends the person here and gets them back.
 // Nothing is resent on the way back: the person taps the command again.
+// House rule H2: a page whose only job is a Face ID check asks for it on load (Safari allows one call
+// without a tap per navigation); the button stays only as the way back in after a cancel.
+function once(fn) {
+  let busy = false
+  return async () => { if (busy) return; busy = true; try { await fn() } finally { busy = false } }
+}
+function faceIdNow(go) {
+  if (!window.PublicKeyCredential) return
+  if (!document.hidden) return void go()
+  const onShow = () => { if (!document.hidden) { document.removeEventListener('visibilitychange', onShow); go() } }
+  document.addEventListener('visibilitychange', onShow)
+}
+
 function commandStepUpView(tab) {
   const n = nextPath()
   const next = n && n.startsWith(`/${tab}/`) ? n : `/${tab}/`
+  const go = once(() => guarded(async () => {
+    await passkeyCheck(`command:${tab}`)
+    location.href = next
+  }))
   cover([
     el('div', { class: 'faceid-mark' }, icon('faceid')),
     el('h1', {}, ME.admin ? T.commandStepUp.title : T.commandStepUp.titleAnyone),
     el('p', { class: 'sub' }, ME.admin ? T.commandStepUp.why : T.commandStepUp.whyAnyone),
-    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
-      await passkeyCheck(`command:${tab}`)
-      location.href = next
-    }) }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: go }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
     el('button', { type: 'button', class: 'back', onclick: () => location.assign(next) }, T.commandStepUp.later),
   ])
+  faceIdNow(go)
 }
 
 // back to the owner: Face ID first (the server asks for one made after going in)
@@ -607,16 +622,18 @@ async function screenTicketView(ticket) {
 // ------------------------------------------------------------------ Face ID before entering a tab (D9)
 function stepUpView(tab) {
   const next = nextPath() || `/${tab}/`
+  const go = once(() => guarded(async () => {
+    const r = await passkeyCheck(`entry:${tab}`)
+    location.href = next.startsWith(`/${tab}/`) ? next : r.next
+  }))
   cover([
     el('div', { class: 'faceid-mark' }, icon('faceid')),
     el('h1', {}, T.stepUp.title(tab.charAt(0).toUpperCase() + tab.slice(1))),
     el('p', { class: 'sub' }, T.stepUp.why),
-    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
-      const r = await passkeyCheck(`entry:${tab}`)
-      location.href = next.startsWith(`/${tab}/`) ? next : r.next
-    }) }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: go }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
     backLink(T.back, () => { if (history.length > 1) history.back(); else location.assign(ACCOUNT) }),
   ])
+  faceIdNow(go)
   // the tab's own name, when the list knows it
   if (window.A5Tabs) window.A5Tabs.load().then((d) => {
     const t = d && d.tabs.find((x) => x.id === tab)
