@@ -381,6 +381,11 @@ check('tab-b entry without Face ID -> Face ID page in place (200, same address)'
   check('entry page: title is the tab list button, with the tab label', /<h1><button type="button" data-a5-tabs>[^<]+<\/button><\/h1>/.test(nav1.data) && !nav1.data.includes('__A5_'))
   check('entry page: shell, locale and entry scripts', ['/_shell/tabs.js', '/_shell/tabs.css', '/locale/pt-BR.js', '/_shell/entry.js'].every((f) => nav1.data.includes(f)))
 }
+{
+  const cross = await rawGet('/tab-b/', { ...NAV, 'Sec-Fetch-Site': 'cross-site', Cookie: owner.cookie })
+  const same = await rawGet('/tab-b/', { ...NAV, 'Sec-Fetch-Site': 'same-origin', Cookie: owner.cookie })
+  check('entry page: Face ID opens by itself only from the portal or a typed address', entryPageOf(cross) && entryData(cross).auto === false && entryData(same).auto === true && entryData(nav1).auto === true)
+}
 check('tab-b entry page keeps the address with the query (no redirect)', entryPageOf(await navigate(owner, '/tab-b/?v=1')))
 function d1Count(sql) { return JSON.parse(execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--json', '--command', sql], { encoding: 'utf8' }))[0].results[0].n }
 const in1 = await owner.req('GET', '/tab-b/echo', undefined, CORS)

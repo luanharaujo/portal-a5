@@ -22,7 +22,8 @@
     method: 'POST', credentials: 'same-origin', cache: 'no-store',
     headers: { 'X-Portal': '1', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
-  const enter = () => location.replace(location.href)
+  // reload, not replace(href): with a #fragment in the address replace() would only move the fragment
+  const enter = () => location.reload()
 
   function say(text, button) {
     msg.textContent = text || ''
@@ -74,6 +75,8 @@
   go.addEventListener('click', ask)
   say(T.why, false)
   if (!window.PublicKeyCredential) { say(T.unsupported, false); return }
+  // the prompt opens by itself only when the person came from the portal or typed the address
+  if (data.auto === false) { say(T.why, true); return }
   if (!document.hidden) ask()
   else document.addEventListener('visibilitychange', function once() {
     if (document.hidden) return

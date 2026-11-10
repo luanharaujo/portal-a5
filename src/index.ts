@@ -1331,7 +1331,10 @@ async function entryPage(env: Env, req: Request, url: URL, who: Who, tab: string
   }
   const label = tabsConfig(env.TABS)[tab]?.label || tab.charAt(0).toUpperCase() + tab.slice(1)
   // JSON inside a non-executed script element: "<" escaped so nothing can close the element
-  const blob = JSON.stringify({ tab, options }).replace(/</g, '\\u003c')
+  // Face ID opens by itself only on a navigation from the portal itself or a typed address / home-screen app
+  const site = req.headers.get('Sec-Fetch-Site')
+  const auto = !site || site === 'same-origin' || site === 'none'
+  const blob = JSON.stringify({ tab, options, auto }).replace(/</g, '\\u003c')
   const html = (await page.text())
     .replace('__A5_LABEL__', () => escapeHtml(label))
     .replace('__A5_ENTRY__', () => blob)
