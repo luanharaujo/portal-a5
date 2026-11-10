@@ -512,8 +512,15 @@ function once(fn) {
   let busy = false
   return async () => { if (busy) return; busy = true; try { await fn() } finally { busy = false } }
 }
+function sameOriginReferrer() {
+  if (!document.referrer) return true
+  try { return new URL(document.referrer).origin === location.origin } catch { return false }
+}
 function faceIdNow(go, purpose) {
   if (!window.PublicKeyCredential) return
+  // opens by itself only when the person came from the portal or typed the address; a link from
+  // another site gets the button (pkKeep below leaves its options ready for the tap)
+  if (!sameOriginReferrer()) return void pkKeep(purpose, true)
   // after the first try (cancelled or failed) the button finds options ready, so its tap opens Face ID at once
   const first = () => go().then(() => pkKeep(purpose, true))
   if (!document.hidden) return void first()
