@@ -45,6 +45,8 @@ const SCREEN_DAYS = 365
 const PAIR_MINUTES = 5
 const PAIR_PICKUP_GRACE_MS = 5 * 60e3 // an approved pairing can be picked up until expires_at + 5 min
 const ENTRY_GRANT_MS = 60e3
+// a navigation reuses an entry at most this old (and never past entryHours)
+const ENTRY_RELOAD_MS = 15 * 60e3
 const BADGE_TIMEOUT_MS = 300
 const BADGE_CACHE_MS = 60e3
 const ACCOUNT_PATH = '/conta/'
@@ -1283,8 +1285,9 @@ const stepUpUrl = (tab: string, next: string) => `/?step_up=${tab}&next=${encode
 const backTo = (url: URL) => (url.pathname + url.search).length <= 512 ? url.pathname + url.search : url.pathname
 
 // Face ID on entry: a navigation burns a grant left by a passkey check made for this entry (60 s), or,
-// with no grant, goes on inside the window of this session's last entry (a reload, or back to the tab
-// from the menu: owner's request, 09/11); the window neither moves nor grows. Anything else inside the
+// with no grant, goes on when this session's last entry is at most min(entryHours, 15 min) old (a reload,
+// or back to the tab from the menu: owner's request, 09/11); the window neither moves nor grows. A tab
+// with a longer entry (4 h) still asks Face ID on a navigation after 15 min. Anything else inside the
 // tab needs the same: an entry from the last entryHours. Returns when the session entered.
 async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: string): Promise<string | Response> {
   if (isNavigation(req) && !isUpgrade(req)) {
@@ -1296,7 +1299,8 @@ async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: strin
       return t
     }
     const prior = await lastEntry(env, who, tab)
-    if (prior) return prior
+    const reuseMs = Math.min(policyOf(tab).entryHours * 3600e3, ENTRY_RELOAD_MS)
+    if (prior && Date.parse(prior) > Date.now() - reuseMs) return prior
     return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, backTo(url)), ...API_HEADERS } })
   }
   const prior = await lastEntry(env, who, tab)

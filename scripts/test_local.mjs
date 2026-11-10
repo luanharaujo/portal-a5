@@ -763,6 +763,13 @@ check('refusal audited with its reason', !!refRow, refRow)
   const usedE = d1json(`SELECT used_at FROM tab_entries WHERE session_id = ${sidE} AND tab = 'tab-b' ORDER BY used_at DESC LIMIT 1`)[0].used_at
   check('age the owner tab-b entry past 4 h', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
   check('tab-b: navigation after the entry window = 302 step-up', (await navigate(owner, '/tab-b/')).status === 302)
+  // a 4 h entry is reused by a navigation for 15 min only; the rest of the tab keeps the 4 h
+  check('entry 20 min old', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 20 * 60e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
+  check('tab-b (4 h entry): navigation 20 min after the entry = 302', (await navigate(owner, '/tab-b/')).status === 302)
+  check('tab-b (4 h entry): requests 20 min after the entry still = 200', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 200)
+  check('entry 10 min old', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 10 * 60e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
+  check('tab-b (4 h entry): navigation 10 min after the entry = 200', (await navigate(owner, '/tab-b/')).status === 200)
+  check('age it past 4 h', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
   check('tab-b: request after the entry window = 401', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 401)
   check('put the entry back', d1(`UPDATE tab_entries SET used_at = '${usedE}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
   check('tab-b: another session of an admin without its own entry = 302', (await navigate(admin3, '/tab-b/')).status === 302)
