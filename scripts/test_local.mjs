@@ -749,7 +749,7 @@ check('shortcut key opens nothing else: /api/me, a tab page, a bridge', (await f
 const kl = (await owner.req('GET', '/api/me/shortcuts')).data
 const kRow = kl.keys.find((k) => k.id === k1.data.id)
 check('key list: last use and place, never the key or its hash', kRow && !!kRow.last_used_at && !!kRow.last_ip && !JSON.stringify(kl).includes(k1.data.key) && !('key_hash' in kRow), kRow)
-check('key list offers keyable actions only (no sensitive, no Face ID tab)', kl.available.some((a) => a.tab === 'tab-a' && a.action === 'tv') && !kl.available.some((a) => a.action === 'wipe' || (a.tab === 'tab-b' && a.action !== 'jot')), kl.available)
+check('key list offers keyable actions only (no sensitive, no Face ID tab beyond its write-only actions)', kl.available.some((a) => a.tab === 'tab-a' && a.action === 'tv') && !kl.available.some((a) => a.action === 'wipe' || (a.tab === 'tab-b' && !['jot', 'named'].includes(a.action))), kl.available)
 // 30 an hour per key
 let kl30
 for (let i = 0; i < 30; i++) kl30 = await sc('/_cmd/tab-a/light')
@@ -855,6 +855,26 @@ check('refusal audited with its reason', !!refRow, refRow)
   const tvOther = audR.find((r) => r.action === 'command' && r.target === 'tab-a/tv' && r.person_id !== ownerId)
   check('R1b other commands keep their params', tvOther && JSON.parse(tvOther.detail).params.mode !== '***', tvOther)
   for (const id of [kj.data.id, kn.data.id]) await owner.req('DELETE', `/api/me/shortcuts/${id}`)
+}
+
+// letters-only text (a name from a bank e-mail): the tab gets the normalized value, the audit its length
+{
+  check('freshen owner (letters)', await freshen(owner, auth))
+  const kl = await owner.req('POST', '/api/me/shortcuts', { label: 'named', scope: ['tab-b/named'] })
+  check('letters: key holding only the named action', kl.status === 200, kl.data)
+  const n0 = (await cmdLog()).length
+  const l1 = await sc('/_cmd/tab-b/named', { name: '  Bakery   Cora\u0303o ', n: 0 }, KEYH(kl.data.key))
+  check('letters: normalized name = 200 {ok, id}', l1.status === 200 && JSON.stringify(Object.keys(l1.data).sort()) === '["id","ok"]', l1)
+  const ll = (await cmdLog()).at(-1)
+  check('letters: the tab got NFC, trimmed, single spaces', (await cmdLog()).length === n0 + 1 && ll.cmd.params.name === 'Bakery Cor\u00e3o' && ll.cmd.params.n === 0, ll.cmd)
+  check('letters: empty name = 200', (await sc('/_cmd/tab-b/named', { name: '', n: 1 }, KEYH(kl.data.key))).status === 200 && (await cmdLog()).at(-1).cmd.params.name === '')
+  const n2 = (await cmdLog()).length
+  for (const bad of ['Shop 24h', 'Smith & Co', 'a\nb', 'x'.repeat(61), 'Ana \u{1F600}'])
+    check(`letters: refused ${JSON.stringify(bad).slice(0, 20)} = 400 bad_param`, (await sc('/_cmd/tab-b/named', { name: bad, n: 1 }, KEYH(kl.data.key))).data?.error === 'bad_param')
+  check('letters: refusals never reached the tab', (await cmdLog()).length === n2)
+  const au = (await owner.req('GET', '/api/admin/audit')).data.find((r) => r.action === 'command' && r.target === 'tab-b/named')
+  check('letters: audit keeps the length only', au && JSON.parse(au.detail).params.name.startsWith('[text:') && !String(au.detail).includes('Bakery'), au)
+  await owner.req('DELETE', `/api/me/shortcuts/${kl.data.id}`)
 }
 
 // common action with its own passkey window (TV volume limiter, 08/11): Face ID every time, residents too

@@ -199,5 +199,42 @@ check('text key scope: alone in its tab = ok', checkScope(['z/create', 'z/set_du
 check('text key scope: with another tab = null', checkScope(['z/create', 'h/tv'], { z: tx, h: cat }, true, TXT) === null)
 check('text key scope: with a non-write-only action = null', checkScope(['z/create', 'z/other'], { z: { ...tx, other: cat.tv }, h: cat }, true, TXT) === null)
 
+// Letters-only text (a name from a bank e-mail): normalized, then letters and single spaces, up to N
+const P8 = { amount_cents: { int: [1, 100000000] }, direction: { enum: ['in', 'out'] }, at: { int: [0, 4102444800] },
+  kind: { enum: ['instant', 'wire', 'bill', 'card'] }, person: { int: [0, 50] }, ref: { int: [1, 9007199254740991] }, name: { text: 60, letters: true } }
+const lt = parseCatalog({
+  provisional: { level: 'admin', keyWriteOnly: true, perHour: 30, params: P8 },
+  eight: { level: 'admin', keyWriteOnly: true, params: { ...P8, extra: { bool: true } } },
+  nine: { level: 'admin', keyWriteOnly: true, params: { ...P8, extra: { bool: true }, more: { bool: true } } },
+  letters_false: { level: 'admin', keyWriteOnly: true, params: { n: { text: 60, letters: false } } },
+  letters_other: { level: 'admin', keyWriteOnly: true, params: { n: { text: 60, digits: true } } },
+  letters_alone: { level: 'admin', keyWriteOnly: true, params: { n: { letters: true } } },
+  letters_three: { level: 'admin', keyWriteOnly: true, params: { n: { text: 60, letters: true, x: 1 } } },
+  letters_big: { level: 'admin', keyWriteOnly: true, params: { n: { text: TEXT_MAX + 1, letters: true } } },
+  letters_plain: { level: 'admin', params: { n: { text: 60, letters: true } } },
+})
+check('letters: up to 8 params, malformed letters dropped', Object.keys(lt).sort().join() === 'eight,provisional', Object.keys(lt))
+check('letters: spec kept', lt.provisional.params.name.letters === true && lt.provisional.params.name.text === 60 && hasText(lt.provisional))
+const call = (name) => checkParams(lt.provisional, { amount_cents: 1250, direction: 'out', at: 1762800000, kind: 'instant', person: 0, ref: 77, name })
+const nm = (name) => { const r = call(name); return 'params' in r ? r.params.name : r.error }
+check('letters: plain name ok', nm('Corner Bakery') === 'Corner Bakery')
+check('letters: accents ok', nm('\u00c9mile Zo\u00eb \u00d1and\u00fa') === '\u00c9mile Zo\u00eb \u00d1and\u00fa')
+check('letters: NFC applied', nm('Zoe\u0308') === 'Zo\u00eb' && nm('Zoe\u0308').length === 3)
+check('letters: spaces trimmed and collapsed', nm('  Big    Bread   Shop  ') === 'Big Bread Shop')
+check('letters: empty ok', nm('') === '' && nm('   ') === '')
+check('letters: other params intact', call('X').params.person === 0 && call('X').params.ref === 77 && call('X').params.kind === 'instant')
+check('letters: digits refused', nm('Shop 24h') === 'bad_param')
+check('letters: punctuation refused', nm('Smith & Co.') === 'bad_param' && nm('a-b') === 'bad_param' && nm("D'Avila") === 'bad_param')
+check('letters: tab, newline, NBSP refused (not emptied)', nm('a\tb') === 'bad_param' && nm('a\nb') === 'bad_param' && nm('a\u00a0b') === 'bad_param' && nm('Ana\n') === 'bad_param')
+check('letters: control and zero-width refused', nm('a\u0000b') === 'bad_param' && nm('a\u200bb') === 'bad_param' && nm('a\u202eb') === 'bad_param')
+check('letters: emoji and lone surrogate refused', nm('Ana \ud83d\ude00') === 'bad_param' && nm('a\ud800') === 'bad_param')
+check('letters: combining mark without composed form refused', nm('q\u0303') === 'bad_param')
+check('letters: 60 after normalizing ok, 61 refused', nm('a'.repeat(60)) === 'a'.repeat(60) && nm('a'.repeat(61)) === 'bad_param')
+check('letters: size counted after normalizing', nm('  ' + 'a'.repeat(30) + '      ' + 'b'.repeat(29) + '  ') === 'a'.repeat(30) + ' ' + 'b'.repeat(29))
+check('letters: huge input refused', nm('a'.repeat(TEXT_MAX + 1)) === 'bad_param')
+check('letters: not a string refused', nm(5) === 'bad_param' && nm(null) === 'bad_param')
+check('letters: audit keeps the length only', redactParams(lt.provisional, call('Corner Bakery').params).name === '[text:13]')
+check('letters: unknown param refused', checkParams(lt.provisional, { ...call('X').params, extra: 1 }).error === 'unknown_param')
+
 console.log(failures ? `\n${failures} FAILED` : '\nall ok')
 process.exit(failures ? 1 : 0)

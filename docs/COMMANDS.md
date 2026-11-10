@@ -34,7 +34,7 @@ Each tab lists its actions under `commands`. The list lives in the deploy config
 | Field | Meaning | Default |
 |---|---|---|
 | `level` | `common`, `admin` or `sensitive` (section 3) | required |
-| `params` | up to 4; each is `{"enum": [...]}` (up to 16 values, `^[a-z0-9][a-z0-9_.-]{0,39}$`), `{"int": [min, max]}` or `{"bool": true}`. All are required. There is no free text except `{"text": <1..4000>}`, see below: free text never reaches a house bridge | none |
+| `params` | up to 8; each is `{"enum": [...]}` (up to 16 values, `^[a-z0-9][a-z0-9_.-]{0,39}$`), `{"int": [min, max]}` or `{"bool": true}`. All are required. There is no free text except `{"text": <1..4000>}`, see below: free text never reaches a house bridge | none |
 | `perHour` | per caller (person or key) per hour, 1 to 120 | 20 |
 | `gap` | `{"seconds", "key"?, "by"?}`: minimum time between two runs for everyone; `key` lets actions share one interval, `by` makes it per value of one parameter | none |
 | `screens` | fixed screens may send it (`common` only) | false |
@@ -47,6 +47,8 @@ Each tab lists its actions under `commands`. The list lives in the deploy config
 ### Text parameter (narrow door)
 
 `{"text": N}` (1 to 4000 characters, counted in code points) is allowed only when the action is `keyWriteOnly` and the tab's configuration says `"textParams": true` (otherwise the whole tab is refused). A tab gets `textParams` only after a security review, and never when its `command()` hands the call on to something that executes (a Pi, a Mac, an agent). It is for a tab that keeps the text as data and has no bridge that runs anything. The portal checks type, length, control characters (line breaks and tabs are fine) and lone surrogates. The value goes to the tab's `command()` and nowhere else: the audit and the `commands` table keep `[text:<length>]`. A key holding such an action may hold only write-only actions of that one tab; this is checked again at every call against the current catalog, not only when the key was made. The JSON body of any portal call is at most 16 KB, so long text goes in parts.
+
+`{"text": N, "letters": true}` is a narrower text, for a name (for example the counterpart of a bank transfer). The portal normalizes it first: NFC, runs of spaces become one, spaces at both ends go. The result must match `^[\p{L} ]*$` (letters and single spaces only) and be at most N code points, counted after normalizing; anything else (digits, punctuation, tabs, line breaks, non-breaking or zero-width spaces, emoji, a combining mark with no composed form) is refused with `bad_param`, never emptied or cut. Empty is fine. The tab's `command()` gets the normalized value. Everything else is as for `{"text": N}`: `keyWriteOnly` only, `textParams` on the tab, `[text:<length>]` in the audit.
 
 Prefer absolute states (`on`/`off`) to a toggle: a command repeated or arriving twice then does no harm. A reading (is the TV on?) is never a command: it goes in the tab's `state`, where the tab decides who sees it.
 

@@ -7,7 +7,8 @@
 // There is no free text, except one narrow door: a `text` parameter, only on keyWriteOnly actions of a
 // tab whose configuration says `textParams: true` (a tab that keeps the text as data, with no bridge
 // that runs anything). The value is checked here for size and control characters and never leaves
-// the tab: the audit and the commands table keep its length only.
+// the tab: the audit and the commands table keep its length only. With `letters: true` the text is
+// narrower still: normalized (NFC, spaces collapsed) and made of letters and spaces only.
 
 export type Level = 'common' | 'admin' | 'sensitive'
 
@@ -15,7 +16,7 @@ export type ParamSpec =
   | { enum: string[] }
   | { int: [number, number] }
   | { bool: true }
-  | { text: number }
+  | { text: number; letters?: true }
 
 export interface CommandSpec {
   level: Level
@@ -50,7 +51,7 @@ export const ACTION_RE = /^[a-z][a-z0-9_]{0,39}$/
 const PARAM_RE = /^[a-z][a-z0-9_]{0,23}$/
 const ENUM_RE = /^[a-z0-9][a-z0-9_.-]{0,39}$/
 const MAX_ACTIONS = 40
-const MAX_PARAMS = 4
+const MAX_PARAMS = 8
 const MAX_ENUM = 16
 export const TEXT_MAX = 4000
 const MAX_RETURNS = 8
@@ -64,6 +65,11 @@ const own = (o: Record<string, unknown>) => Object.keys(o).filter((k) => !BAD.in
 function parseParam(v: unknown): ParamSpec | null {
   if (!isObj(v)) return null
   const keys = Object.keys(v)
+  // the only two-key form: {"text": N, "letters": true}
+  if (keys.length === 2 && keys.includes('text') && keys.includes('letters')) {
+    if (v.letters !== true || typeof v.text !== 'number' || !Number.isSafeInteger(v.text) || v.text < 1 || v.text > TEXT_MAX) return null
+    return { text: v.text, letters: true }
+  }
   if (keys.length !== 1) return null
   if (Array.isArray(v.enum)) {
     const e = v.enum
@@ -187,6 +193,15 @@ export function checkParams(spec: CommandSpec, raw: unknown): { params: Record<s
     if (val === undefined) return { error: 'missing_param' }
     if ('enum' in p) {
       if (typeof val !== 'string' || !p.enum.includes(val)) return { error: 'bad_param' }
+    } else if ('text' in p && p.letters) {
+      // a name: NFC, trimmed, runs of spaces made one; then letters and single spaces only, up to N
+      // (refused, never emptied; empty is fine). The size is counted after normalizing, and the tab
+      // gets the normalized value.
+      if (typeof val !== 'string' || val.length > TEXT_MAX) return { error: 'bad_param' }
+      const name = val.normalize('NFC').replace(/ +/g, ' ').replace(/^ | $/g, '')
+      if ([...name].length > p.text || !/^[\p{L} ]*$/u.test(name)) return { error: 'bad_param' }
+      params[n] = name
+      continue
     } else if ('text' in p) {
       // letters, digits and punctuation; line breaks and tabs are fine, other control characters are not
       if (typeof val !== 'string' || [...val].length > p.text || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/.test(val) || /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(val)) return { error: 'bad_param' }
