@@ -160,13 +160,15 @@
     if (data.current) remember(data.current)
     pull()
 
-    if (title.tagName !== 'BUTTON') { title.setAttribute('role', 'button'); title.tabIndex = 0 }
+    const madeButton = title.tagName !== 'BUTTON'
+    if (madeButton) { title.setAttribute('role', 'button'); title.tabIndex = 0 }
     title.classList.add('a5-tabs-title')
     title.setAttribute('aria-haspopup', 'menu')
     title.setAttribute('aria-expanded', 'false')
     const sr = node('span', 'a5-tabs-sr', ', ' + (text().switchTab || ''))
     const dot = node('span', 'a5-tabs-dot')
-    title.append(arrow(), dot, sr)
+    const arr = arrow()
+    title.append(arr, dot, sr)
     // seen as someone else: a mark next to the title, always visible while the mode is on
     const mark = node('span', 'a5-tabs-viewas')
     mark.hidden = true
@@ -349,11 +351,29 @@
 
     async function refresh() {
       const d = await load(pathTab())
-      if (d && d.selector) { data = d; paintDot() }
+      if (off) return
+      if (d && d.selector) { data = d; paintDot() } else if (d && !d.selector) unmount()
     }
 
-    title.addEventListener('click', (ev) => { ev.preventDefault(); menu ? close() : open() })
+    // drawn from a list kept by a person's session, but this page has no selector now (a fixed screen
+    // on a browser that once had a person signed in): back to a plain title, no arrow, no pull
+    let off = false
+    function unmount() {
+      off = true
+      if (menu) close()
+      pullStop = true
+      arr.remove(); dot.remove(); sr.remove(); mark.remove()
+      title.classList.remove('a5-tabs-title')
+      title.removeAttribute('aria-haspopup'); title.removeAttribute('aria-expanded')
+      if (madeButton) { title.removeAttribute('role'); title.removeAttribute('tabindex') }
+      delete title.dataset.a5TabsOn
+      document.documentElement.removeAttribute('data-a5-viewas')
+      if (!portalPage()) band({ view_as: null })
+    }
+
+    title.addEventListener('click', (ev) => { if (off) return; ev.preventDefault(); menu ? close() : open() })
     title.addEventListener('keydown', (ev) => {
+      if (off) return
       if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'ArrowDown') { ev.preventDefault(); menu ? close() : open() }
     })
     // no polling: counts come back when the page loads, the list opens or the page is seen again
@@ -373,6 +393,7 @@
   const PULL_LIMIT = 80
   const PULL_MAX = 130
   let pullOn = false
+  let pullStop = false // the selector went away (unmount): no pull either
 
   function pull() {
     if (pullOn || !('ontouchstart' in window)) return
@@ -411,6 +432,7 @@
     }
     const reset = () => { y0 = null; pulled = 0; active = false; if (!loading && ind) show(0) }
     document.addEventListener('touchstart', (e) => {
+      if (pullStop) return
       if (loading || e.touches.length !== 1) { reset(); return }
       if (busy() || !atTop() || innerScrolled(e.target)) return
       if (!ind) build()

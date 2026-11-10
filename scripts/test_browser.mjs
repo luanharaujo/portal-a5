@@ -226,6 +226,12 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
       await sleep(800)
       const st = await s.evaluate(`(() => { const b = document.querySelector('[data-a5-tabs]'); return { on: b.dataset.a5TabsOn || null, svg: !!b.querySelector('svg'), popup: b.getAttribute('aria-haspopup') } })()`)
       check('browser: fixed screen keeps a plain title (no arrow, no menu)', st.on === null && !st.svg && st.popup === null, st)
+      // a browser that once had a person signed in keeps that person's menu: the fresh answer takes it away
+      await s.evaluate(`localStorage.setItem('a5.menu', JSON.stringify({ selector: true, tabs: [{ id: 'tab-a', label: 'Tab A', path: '/tab-a/' }, { id: 'tab-b', label: 'Tab B', path: '/tab-b/' }], account: { id: 'conta', label: 'Conta', path: '/conta/' } }))`)
+      await s.go('/tab-a/page')
+      await sleep(1200)
+      const st2 = await s.evaluate(`(() => { const b = document.querySelector('[data-a5-tabs]'); return { on: b.dataset.a5TabsOn || null, svg: !!b.querySelector('svg'), popup: b.getAttribute('aria-haspopup'), kept: localStorage.getItem('a5.menu') } })()`)
+      check('browser: fixed screen drops a menu kept from a person (plain title again, list forgotten)', st2.on === null && !st2.svg && st2.popup === null && st2.kept === null, st2)
       await s.go('/')
       check('browser: fixed screen "/" opens its tab', await s.waitFor(`location.pathname === '/tab-a/'`))
     }
