@@ -997,6 +997,9 @@ async function me(env: Env, who: Who) {
     session_id: who.sessionId,
     credential: who.kind,
     strong: strongAdmin(who),
+    // until when this session's last portal Face ID still counts for a write (5 minutes): the page
+    // asks Face ID on the tap itself when it is past, instead of trying the write first
+    fresh_until: fresh(who) ? new Date(Date.parse(who.passkeyAt as string) + PASSKEY_FRESH_MS).toISOString() : null,
     // the made-up resident of a rehearsal has none
     passkeys,
     passkey_invite: !!invite,
