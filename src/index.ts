@@ -1230,6 +1230,21 @@ async function listAllDevices(env: Env) {
   return r.results
 }
 
+// The params of a keyWriteOnly command in a Face ID tab (an expense, say) are the business of the
+// person who sent it: another admin reading the audit sees them masked.
+function hideWriteOnlyParams(env: Env, rows: Row[], who: Who): Row[] {
+  return rows.map((r) => {
+    if (r.action !== 'command' || r.person_id === who.person.id) return r
+    const [t, a] = String(r.target ?? '').split('/')
+    if (!t || !a || policyOf(t).entry !== 'passkey' || !catalogOf(env, t)[a]?.keyWriteOnly) return r
+    try {
+      const d = JSON.parse(String(r.detail)) as Row
+      if (d.params && typeof d.params === 'object') d.params = Object.fromEntries(Object.keys(d.params as Row).map((k) => [k, '***']))
+      return { ...r, detail: JSON.stringify(d) }
+    } catch { return { ...r, detail: null } }
+  })
+}
+
 async function listAudit(env: Env, url: URL) {
   const before = Number(url.searchParams.get('before')) || 9e15
   const r = await env.DB.prepare(
@@ -1267,10 +1282,11 @@ const stepUpUrl = (tab: string, next: string) => `/?step_up=${tab}&next=${encode
 // where to come back after sign-in or Face ID: same path and query (a same-origin path, never a full URL)
 const backTo = (url: URL) => (url.pathname + url.search).length <= 512 ? url.pathname + url.search : url.pathname
 
-// Face ID on entry: a navigation burns a grant left by a passkey check made for this entry (60 s); anything
-// else inside the tab needs an entry from the last entryHours. Returns when the session entered.
+// Face ID on entry: a navigation burns a grant left by a passkey check made for this entry (60 s), or,
+// with no grant, goes on inside the window of this session's last entry (a reload, or back to the tab
+// from the menu: owner's request, 09/11); the window neither moves nor grows. Anything else inside the
+// tab needs the same: an entry from the last entryHours. Returns when the session entered.
 async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: string): Promise<string | Response> {
-  const policy = policyOf(tab)
   if (isNavigation(req) && !isUpgrade(req)) {
     const t = now()
     const r = await env.DB.prepare('UPDATE tab_entries SET used_at = ? WHERE session_id = ? AND tab = ? AND used_at IS NULL AND granted_at > ? AND granted_at >= ?')
@@ -1279,17 +1295,22 @@ async function checkEntry(env: Env, req: Request, url: URL, who: Who, tab: strin
       await audit(env, req, { who, strength: 'strong', action: 'tab_entered', target: tab })
       return t
     }
+    const prior = await lastEntry(env, who, tab)
+    if (prior) return prior
     return new Response(null, { status: 302, headers: { Location: stepUpUrl(tab, backTo(url)), ...API_HEADERS } })
   }
-  // read with the session itself (currentSession), in the same trip
-  if (who.entryUsedAt !== undefined) {
-    if (who.entryUsedAt) return who.entryUsedAt
-    throw new HttpError(401, 'entry_required', { step_up: stepUpUrl(tab, `/${tab}/`) })
-  }
-  const e = await env.DB.prepare('SELECT used_at FROM tab_entries WHERE session_id = ? AND tab = ? AND used_at > ? AND granted_at >= ? ORDER BY used_at DESC LIMIT 1')
-    .bind(who.sessionId, tab, inMs(-policy.entryHours * 3600e3), who.sessionCreatedAt).first<{ used_at: string }>()
-  if (e) return e.used_at
+  const prior = await lastEntry(env, who, tab)
+  if (prior) return prior
   throw new HttpError(401, 'entry_required', { step_up: stepUpUrl(tab, `/${tab}/`) })
+}
+
+// This session's last entry into the tab, when still inside entryHours; null otherwise.
+async function lastEntry(env: Env, who: Who, tab: string): Promise<string | null> {
+  // read with the session itself (currentSession), in the same trip
+  if (who.entryUsedAt !== undefined) return who.entryUsedAt ?? null
+  const e = await env.DB.prepare('SELECT used_at FROM tab_entries WHERE session_id = ? AND tab = ? AND used_at > ? AND granted_at >= ? ORDER BY used_at DESC LIMIT 1')
+    .bind(who.sessionId, tab, inMs(-policyOf(tab).entryHours * 3600e3), who.sessionCreatedAt).first<{ used_at: string }>()
+  return e?.used_at ?? null
 }
 
 async function recordTabAudit(env: Env, req: Request, tab: string, h: Headers, who: Who | null, identity: PortalIdentity) {
@@ -1556,10 +1577,12 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   const policy = policyOf(tab)
   const groupsOk = c.key ? (c.key.tabs.has('*') || c.key.tabs.has(tab)) : canOpen(c.who!, tab)
   if (!groupsOk) return refuse(403, 'no_tab_access')
-  // a key never stands in for Face ID on entry
-  if (c.key && policy.entry === 'passkey') return refuse(403, 'not_for_shortcuts')
+  // a key never stands in for Face ID on entry: in such a tab it may only run an action the catalog
+  // marks keyWriteOnly, from a key holding that one action (refusal), and it reads nothing back
+  const entryPasskey = policy.entry === 'passkey'
+  if (c.key && entryPasskey && !spec.keyWriteOnly) return refuse(403, 'not_for_shortcuts')
   const caller: Caller = c.key
-    ? { credential: 'shortcut', admin: c.key.admin, strong: false, adminFresh: false, scope: c.key.scope }
+    ? { credential: 'shortcut', admin: c.key.admin, strong: false, adminFresh: false, scope: c.key.scope, entryPasskey }
     : callerOf(env, c.who!, tab)
   const why = refusal(tab, action, spec, caller)
   // an action with its own passkey window, for anyone: a person with no passkey at all is told so
@@ -1613,7 +1636,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     ? {
       credential: 'shortcut', person: person.id, name: person.name, groups: c.key.groups.map((g) => g.id), session: null,
       machine: null, shortcut: c.key.id, strong: false, entered_at: null, entry_until: null, admin_until: null,
-      actions: allowedActions(tab, catalogOf(env, tab), caller), passkey_until: {},
+      actions: entryPasskey ? [action] : allowedActions(tab, catalogOf(env, tab), caller), passkey_until: {},
     }
     : identityOf(env, tab, c.who!, policy, c.enteredAt)
 
@@ -1639,6 +1662,8 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     ...actor, action: 'command', target,
     detail: { id, params: cmd.params, credential, status, ...(error ? { error } : {}), ...(c.key ? { shortcut: c.key.id } : {}) },
   })
+  // a key on a write-only action gets {ok, id} and nothing else (no result, no error from the tab)
+  if (c.key && spec.keyWriteOnly) return json({ ok: status === 'done', id }, COMMAND_HTTP[status] ?? 502)
   const out: Row = { id, status, ok: status === 'done' }
   const ret = pickReturns(spec, result)
   if (ret) out.result = ret
@@ -1703,12 +1728,14 @@ async function shortcutCommand(req: Request, env: Env, tab: string, action: stri
   return runCommand(env, req, tab, action, { who: null, key, enteredAt: null })
 }
 
-// Actions an admin may put in a key: tabs without Face ID on entry, actions allowed in keys.
+// Actions an admin may put in a key: actions allowed in keys; in a tab with Face ID on entry, only
+// keyWriteOnly ones, each alone in its key (checkScope with keyPasskeyTabs).
 function keyCatalogs(env: Env, who: Who): Record<string, Catalog> {
   const out: Record<string, Catalog> = {}
-  for (const t of Object.keys(tabBindings(env))) if (canOpen(who, t) && policyOf(t).entry === 'session') out[t] = catalogOf(env, t)
+  for (const t of Object.keys(tabBindings(env))) if (canOpen(who, t)) out[t] = catalogOf(env, t)
   return out
 }
+const keyPasskeyTabs = (env: Env) => new Set(Object.keys(tabBindings(env)).filter((t) => policyOf(t).entry === 'passkey'))
 
 async function listShortcutKeys(env: Env, who: Who) {
   if (!who.admin) throw new HttpError(403, 'admin_only')
@@ -1717,7 +1744,7 @@ async function listShortcutKeys(env: Env, who: Who) {
   ).bind(who.person.id).all<Row>()
   const available: { tab: string; action: string; level: string }[] = []
   for (const [t, cat] of Object.entries(keyCatalogs(env, who)))
-    for (const [a, s] of Object.entries(cat)) if (checkScope([`${t}/${a}`], { [t]: cat }, who.admin)) available.push({ tab: t, action: a, level: s.level })
+    for (const [a, s] of Object.entries(cat)) if (checkScope([`${t}/${a}`], { [t]: cat }, who.admin, keyPasskeyTabs(env))) available.push({ tab: t, action: a, level: s.level })
   return {
     keys: keys.results.map((k) => ({ ...k, scope: (() => { try { return JSON.parse(String(k.scope)) } catch { return [] } })() })),
     available,
@@ -1729,7 +1756,7 @@ async function addShortcutKey(env: Env, req: Request, who: Who) {
   const b = await body(req)
   const label = text(b.label, 60)
   if (!label) throw new HttpError(400, 'name_required')
-  const scope = checkScope(b.scope, keyCatalogs(env, who), who.admin)
+  const scope = checkScope(b.scope, keyCatalogs(env, who), who.admin, keyPasskeyTabs(env))
   if (!scope) throw new HttpError(400, 'bad_scope')
   const live = await env.DB.prepare('SELECT COUNT(*) AS n FROM shortcut_keys WHERE person_id = ? AND revoked_at IS NULL').bind(who.person.id).first<{ n: number }>()
   if ((live?.n ?? 0) >= MAX_SHORTCUT_KEYS) throw new HttpError(409, 'too_many_keys')
@@ -2244,7 +2271,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
         if (path === '/api/admin/requests') return out(masked(await listRequests(env), who, ['typed_phone', 'sender_phone']))
         if (path === '/api/admin/devices') return out(await listAllDevices(env))
         if ((mm = path.match(/^\/api\/admin\/people\/(\d+)\/passkeys$/))) return out(await passkeysOf(env, Number(mm[1])))
-        if (path === '/api/admin/audit') return out(masked(await listAudit(env, url), who, ['detail']))
+        if (path === '/api/admin/audit') return out(masked(hideWriteOnlyParams(env, await listAudit(env, url), who), who, ['detail']))
         if (path === '/api/admin/pair') return out(await pairLookup(req, env, url))
         if (path === '/api/admin/machines') return out(await listMachines(env))
         if (path === '/api/admin/agents') return out(await listAgentKeys(env))

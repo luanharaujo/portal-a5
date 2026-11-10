@@ -127,11 +127,11 @@ Fail closed: there is no default policy. A tab whose entry misses `allow`, `entr
 
 For a tab with `entry: 'passkey'`:
 
-1. A navigation into the tab (`Sec-Fetch-Mode: navigate`) without a fresh grant gets 302 to `/?step_up=<tab>&next=<path and query>`.
+1. A navigation into the tab (`Sec-Fetch-Mode: navigate`) without a fresh grant, and outside the entry window of this session (step 5), gets 302 to `/?step_up=<tab>&next=<path and query>`.
 2. The portal page shows "confirm with Face ID", runs a passkey check with `purpose: "entry:<tab>"` and navigates back to `next`.
 3. The check leaves a single-use grant valid for 60 s. The next navigation burns it, the tab is served, and `identity.entered_at` is set.
 4. Any other request inside the tab (API, assets, streams, sockets) is accepted while the last entry is younger than `entryHours`; otherwise 401 `{"error":"entry_required","step_up":"/?step_up=<tab>&next=/<tab>/"}`. The page sends the person to `step_up`.
-5. Reloading the page is a new entry and asks Face ID again. A passkey check done for anything else (an admin action) never counts as an entry.
+5. Reloading the page, or coming back to the tab from the selector, inside the last entry's `entryHours` on this same session serves the tab without a new Face ID; `entered_at` and `entry_until` stay those of that entry (the window never moves or grows). After it, a navigation asks Face ID again. Another session (another device, or after signing in again) needs its own entry. A passkey check done for anything else (an admin action) never counts as an entry.
 
 The tab does not need its own "entered" bookkeeping; `entered_at`/`entry_until` are the answer. If it keeps one as a second barrier, it must be keyed so that a new session never inherits it (the portal never reuses a session id, but do not rely on that alone). A page socket opened inside the entry must be closed at `entry_until`. The portal refuses service worker registration for such a tab (a cached page would skip the entry check).
 

@@ -140,5 +140,32 @@ check('passkey_until: open windows only, ISO', pu.limit === new Date(N + 240e3).
 check('passkey_until: empty for screens and keys', Object.keys(passkeyUntil(pk, { ...screen, passkeyAt: at(0) }, N)).length === 0 && Object.keys(passkeyUntil(pk, key(['h/limit']), N)).length === 0)
 check('passkey: never in a key scope', checkScope(['h/limit'], { h: pk }, true) === null)
 
+// R1b: keyWriteOnly, the one way a key reaches a tab with Face ID on entry
+const wo = parseCatalog({
+  gasto: { level: 'admin', keyWriteOnly: true, params: { v: { int: [1, 100] } }, perHour: 30, screens: false, shortcut: true },
+  other: { level: 'admin' },
+  wo_no_key: { level: 'admin', keyWriteOnly: true, shortcut: false },
+  wo_sensitive: { level: 'sensitive', keyWriteOnly: true },
+  wo_returns: { level: 'admin', keyWriteOnly: true, returns: ['saldo'] },
+  wo_screens: { level: 'common', keyWriteOnly: true, screens: true },
+  wo_passkey: { level: 'common', keyWriteOnly: true, passkey: '5m' },
+  wo_string: { level: 'admin', keyWriteOnly: 'yes' },
+})
+check('keyWriteOnly: contradictions drop the action', Object.keys(wo).sort().join() === 'gasto,other', Object.keys(wo))
+check('keyWriteOnly: default closed', wo.other.keyWriteOnly === false && cat.tv.keyWriteOnly === false && wo.gasto.keyWriteOnly === true)
+const PK = new Set(['f'])
+check('keyWriteOnly scope: alone = ok', JSON.stringify(checkScope(['f/gasto'], { f: wo }, true, PK)) === '["f/gasto"]')
+check('keyWriteOnly scope: with another entry = null', checkScope(['f/gasto', 'h/tv'], { f: wo, h: cat }, true, PK) === null)
+check('keyWriteOnly scope: unmarked action of a Face ID tab = null', checkScope(['f/other'], { f: wo }, true, PK) === null)
+check('keyWriteOnly scope: not admin = null', checkScope(['f/gasto'], { f: wo }, false, PK) === null)
+const kPK = (scope) => ({ ...key(scope), admin: true, entryPasskey: true })
+check('keyWriteOnly refusal: one-action key = ok', refusal('f', 'gasto', wo.gasto, kPK(['f/gasto'])) === null)
+check('keyWriteOnly refusal: other action of the tab = not_for_shortcuts', refusal('f', 'other', wo.other, kPK(['f/other'])) === 'not_for_shortcuts')
+check('keyWriteOnly refusal: key without it = out_of_scope', refusal('f', 'gasto', wo.gasto, kPK(['h/tv'])) === 'out_of_scope')
+check('keyWriteOnly refusal: two-action key = out_of_scope', refusal('f', 'gasto', wo.gasto, kPK(['f/gasto', 'h/tv'])) === 'out_of_scope')
+check('keyWriteOnly actions: only that action', allowedActions('f', wo, kPK(['f/gasto'])).join() === 'gasto')
+check('keyWriteOnly on a session tab: no change for a key', refusal('h', 'gasto', wo.gasto, { ...key(['h/gasto', 'h/tv']), admin: true }) === null &&
+  checkScope(['h/gasto', 'h/tv'], { h: { ...cat, gasto: wo.gasto } }, true, PK) !== null)
+
 console.log(failures ? `\n${failures} FAILED` : '\nall ok')
 process.exit(failures ? 1 : 0)

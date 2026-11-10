@@ -361,6 +361,7 @@ check('malformed tab audit recorded as invalid', rows.some((a) => a.action === '
 const nav1 = (await navigate(owner, '/tab-b/'))
 check('tab-b entry without Face ID -> step-up page', nav1.status === 302 && nav1.headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F', [nav1.status, nav1.headers.get('location')])
 check('tab-b step-up next keeps the query', (await navigate(owner, '/tab-b/?v=1')).headers.get('location') === '/?step_up=tab-b&next=%2Ftab-b%2F%3Fv%3D1')
+function d1Count(sql) { return JSON.parse(execFileSync('npx', ['wrangler', 'd1', 'execute', 'portal_a5', '--local', '--persist-to', process.env.STATE, '--json', '--command', sql], { encoding: 'utf8' }))[0].results[0].n }
 const in1 = await owner.req('GET', '/tab-b/echo', undefined, CORS)
 check('tab-b request without entry = 401 entry_required', in1.status === 401 && in1.data.error === 'entry_required' && in1.data.step_up, in1.data)
 check('tab-b socket without entry = 401', (await upgradeStatus('/tab-b/live', { Cookie: owner.cookie, Origin: BASE })) === 401)
@@ -382,7 +383,10 @@ check('tab-a allows a service worker', (await resident.req('GET', '/tab-a/sw.js'
 const ppJ = nav2.headers.get('permissions-policy') || ''
 check('tab-b: microphone and wake lock on, camera off', ppJ.includes('microphone=(self)') && ppJ.includes('screen-wake-lock=(self)') && ppJ.includes('camera=()'), ppJ)
 check('tab-b inside: requests free after entry', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 200)
-check('tab-b: the grant is single use (reload asks again)', (await navigate(owner, '/tab-b/')).status === 302)
+const nav3 = await navigate(owner, '/tab-b/')
+check('tab-b: reload inside the entry window = 200, window neither moves nor grows (09/11)', nav3.status === 200 &&
+  nav3.data.identity.entered_at === nav2.data.identity.entered_at && nav3.data.identity.entry_until === nav2.data.identity.entry_until, nav3.data)
+check('tab-b: a reload leaves no grant behind and no new entry', d1Count(`SELECT COUNT(*) AS n FROM tab_entries WHERE tab = 'tab-b' AND used_at IS NOT NULL`) === 1)
 const jws = await openWs('/tab-b/live', { Cookie: owner.cookie, Origin: BASE })
 check('tab-b socket after entry carries identity', jws.ok && jws.data.identity.credential === 'browser' && !!jws.data.identity.entered_at && !('cookie' in jws.data.headers), jws)
 rows = (await owner.req('GET', '/api/admin/audit')).data
@@ -557,7 +561,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 
 check('C01 a tab with one malformed command is never routed', (await owner.req('GET', '/tab-badcmd/echo', undefined, CORS)).status === 404)
 const rEcho = (await resident.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
-check('identity.actions: resident gets common actions only (no presence, no sensitive)', rEcho.actions.join() === 'tv,ac,light,slow,boom,limit', rEcho.actions)
+check('identity.actions: resident gets common actions only (no presence, no sensitive)', rEcho.actions.join() === 'tv,ac,light,slow,boom,limit,note', rEcho.actions)
 check('identity.shortcut is null for a page', rEcho.shortcut === null)
 check('freshen owner', await freshen(owner, auth))
 const oEcho = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
@@ -718,7 +722,7 @@ check('shortcut key opens nothing else: /api/me, a tab page, a bridge', (await f
 const kl = (await owner.req('GET', '/api/me/shortcuts')).data
 const kRow = kl.keys.find((k) => k.id === k1.data.id)
 check('key list: last use and place, never the key or its hash', kRow && !!kRow.last_used_at && !!kRow.last_ip && !JSON.stringify(kl).includes(k1.data.key) && !('key_hash' in kRow), kRow)
-check('key list offers keyable actions only (no sensitive, no Face ID tab)', kl.available.some((a) => a.tab === 'tab-a' && a.action === 'tv') && !kl.available.some((a) => a.action === 'wipe' || a.tab === 'tab-b'), kl.available)
+check('key list offers keyable actions only (no sensitive, no Face ID tab)', kl.available.some((a) => a.tab === 'tab-a' && a.action === 'tv') && !kl.available.some((a) => a.action === 'wipe' || (a.tab === 'tab-b' && a.action !== 'jot')), kl.available)
 // 30 an hour per key
 let kl30
 for (let i = 0; i < 30; i++) kl30 = await sc('/_cmd/tab-a/light')
@@ -752,6 +756,63 @@ const shRow = rows.find((r) => r.action === 'command' && r.strength === 'shortcu
 check('shortcut command audited with the key id and person, never the key', shRow && shRow.person_id === ownerId && JSON.parse(shRow.detail).shortcut > 0 && !rows.some((r) => String(r.detail).includes('pa5_atl_')), shRow)
 const refRow = rows.find((r) => r.action === 'command_refused' && JSON.parse(r.detail).reason === 'admin_only')
 check('refusal audited with its reason', !!refRow, refRow)
+
+// entry window ends: a navigation asks Face ID again (09/11); put back after
+{
+  const sidE = (await owner.req('GET', '/api/me')).data.session_id
+  const usedE = d1json(`SELECT used_at FROM tab_entries WHERE session_id = ${sidE} AND tab = 'tab-b' ORDER BY used_at DESC LIMIT 1`)[0].used_at
+  check('age the owner tab-b entry past 4 h', d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
+  check('tab-b: navigation after the entry window = 302 step-up', (await navigate(owner, '/tab-b/')).status === 302)
+  check('tab-b: request after the entry window = 401', (await owner.req('GET', '/tab-b/echo', undefined, CORS)).status === 401)
+  check('put the entry back', d1(`UPDATE tab_entries SET used_at = '${usedE}' WHERE session_id = ${sidE} AND tab = 'tab-b'`))
+  check('tab-b: another session of an admin without its own entry = 302', (await navigate(admin3, '/tab-b/')).status === 302)
+}
+
+// R1b: a keyWriteOnly action is the one way a key reaches a tab with Face ID on entry
+{
+  check('freshen owner (R1b)', await freshen(owner, auth))
+  check('R1b write-only action next to another in a key = 400', (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-b/jot', 'tab-a/tv'] })).data.error === 'bad_scope')
+  check('R1b unmarked action of a Face ID tab still = 400', (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-b/ping'] })).data.error === 'bad_scope')
+  check('R1b resident cannot put the admin write-only action in a key', (await resident.req('POST', '/api/me/shortcuts', { label: 'x', scope: ['tab-b/jot'] })).status === 403)
+  const kj = await owner.req('POST', '/api/me/shortcuts', { label: 'jot', scope: ['tab-b/jot'] })
+  check('R1b key holding only the write-only action', kj.status === 200 && JSON.stringify(kj.data.scope) === '["tab-b/jot"]', kj.data)
+  const n1 = (await cmdLog()).length
+  const j1 = await sc('/_cmd/tab-b/jot', { cents: 250 }, KEYH(kj.data.key))
+  check('R1b key on the write-only action = 200 with {ok, id} only', j1.status === 200 && JSON.stringify(Object.keys(j1.data).sort()) === '["id","ok"]' && j1.data.ok === true && UUID.test(j1.data.id), j1)
+  log = await cmdLog()
+  const jl = log[log.length - 1]
+  check('R1b the tab got it once, identity.actions = that action only', log.length === n1 + 1 && jl.cmd.action === 'jot' && jl.identity.credential === 'shortcut' &&
+    JSON.stringify(jl.identity.actions) === '["jot"]' && jl.identity.strong === false, jl)
+  check('R1b same key on another action of the tab = 403', (await sc('/_cmd/tab-b/ping', undefined, KEYH(kj.data.key))).status === 403)
+  check('R1b key without that action in scope = 403 out_of_scope', (await sc('/_cmd/tab-b/jot', { cents: 1 })).data?.error === 'out_of_scope')
+  check('R1b bad params still = 400', (await sc('/_cmd/tab-b/jot', { cents: 5000 }, KEYH(kj.data.key))).status === 400)
+  check('R1b refusals never reached the tab', (await cmdLog()).length === n1 + 1)
+  check('R1b the key opens no page of the tab', (await fetch(BASE + '/tab-b/echo', { headers: { ...KEYH(kj.data.key), ...CORS } })).status === 401)
+  // a forged scope with a second entry (written straight to D1) is refused at use too
+  check('R1b forge a two-action scope in D1', d1(`UPDATE shortcut_keys SET scope = '["tab-b/jot","tab-a/light"]' WHERE id = ${kj.data.id}`))
+  check('R1b two-action key on the write-only action = 403', (await sc('/_cmd/tab-b/jot', { cents: 3 }, KEYH(kj.data.key))).status === 403 && (await cmdLog()).length === n1 + 1)
+  // marked action in a tab without Face ID on entry: no new access, only the trimmed answer to a key
+  const kn = await owner.req('POST', '/api/me/shortcuts', { label: 'note', scope: ['tab-a/note', 'tab-a/light'] })
+  check('R1b marked action on a session tab: key with two actions as before', kn.status === 200, kn.data)
+  const nn = await sc('/_cmd/tab-a/note', undefined, KEYH(kn.data.key))
+  check('R1b marked action on a session tab: key gets {ok, id}', nn.status === 200 && JSON.stringify(Object.keys(nn.data).sort()) === '["id","ok"]', nn)
+  log = await cmdLog()
+  check('R1b marked action on a session tab: identity.actions as for any key', JSON.stringify(log[log.length - 1].identity.actions) === '["light","note"]', log[log.length - 1].identity)
+  check('R1b marked action on a session tab: page answer unchanged', (await cmd(resident, 'tab-a', 'note')).data.status === 'done')
+  check('R1b marked action on a session tab: other actions still refused to the key', (await sc('/_cmd/tab-a/tv', { mode: 'on' }, KEYH(kn.data.key))).data?.error === 'out_of_scope')
+  // the expense params are the sender's: another admin sees them masked in the audit
+  const mine = (await owner.req('GET', '/api/admin/audit')).data.find((r) => r.action === 'command' && r.target === 'tab-b/jot')
+  check('R1b owner sees own write-only params', mine && JSON.parse(mine.detail).params.cents === 250, mine)
+  // a write-only command sent by someone else (written straight to D1): the owner sees its params masked
+  check('R1b plant another admin\'s write-only command in the audit', d1(`INSERT INTO audit (at, person_id, strength, action, target, detail) VALUES ('${new Date().toISOString()}', ${a2id}, 'shortcut', 'command', 'tab-b/jot', '{"id":"x","params":{"cents":777},"credential":"shortcut","status":"done"}')`))
+  check('freshen owner (R1b audit)', await freshen(owner, auth))
+  const audR = (await owner.req('GET', '/api/admin/audit')).data
+  const other = audR.find((r) => r.action === 'command' && r.target === 'tab-b/jot' && r.person_id === a2id)
+  check('R1b another person\'s write-only params are masked', other && JSON.parse(other.detail).params.cents === '***' && !String(other.detail).includes('777'), other)
+  const tvOther = audR.find((r) => r.action === 'command' && r.target === 'tab-a/tv' && r.person_id !== ownerId)
+  check('R1b other commands keep their params', tvOther && JSON.parse(tvOther.detail).params.mode !== '***', tvOther)
+  for (const id of [kj.data.id, kn.data.id]) await owner.req('DELETE', `/api/me/shortcuts/${id}`)
+}
 
 // common action with its own passkey window (TV volume limiter, 08/11): Face ID every time, residents too
 {
@@ -1014,7 +1075,7 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
     (await owner.req('GET', '/tab-slow/echo', undefined, CORS)).status === 403)
   const vid = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
   check('see as: the tab gets a resident identity (groups, common actions only)', vid.person === ownerId && vid.groups.join() === 'residents' &&
-    vid.actions.join() === 'tv,ac,light,slow,boom,limit', vid)
+    vid.actions.join() === 'tv,ac,light,slow,boom,limit,note', vid)
   const vp = await cmd(owner, 'tab-a', 'presence', { state: 'home' })
   check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')

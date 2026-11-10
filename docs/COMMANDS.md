@@ -41,6 +41,7 @@ Each tab lists its actions under `commands`. The list lives in the deploy config
 | `shortcut` | may go in a Shortcuts key (never `sensitive`) | true |
 | `returns` | result fields the caller gets back (strings up to 80, numbers, booleans) | none |
 | `passkey` | `"<n>m"` (1 to 60): on top of the level, a passkey check on this very browser session within that time, for anyone who runs it, admins included (section 3). Only on `common` or `admin`; never for screens or keys (`screens: true` or `shortcut: true` next to it drops the action) | none |
+| `keyWriteOnly` | `true`: the one way a Shortcuts key reaches a tab with Face ID on entry (section 5). The key holds this action alone, the tab sees `identity.actions` = this action only, and the key gets `{ok, id}` back, nothing more. Not with `shortcut: false`, `sensitive`, `passkey`, `screens: true` or `returns` (any of them drops the action). On a tab without Face ID on entry it changes nothing except that the key's answer is `{ok, id}` | false |
 
 Prefer absolute states (`on`/`off`) to a toggle: a command repeated or arriving twice then does no harm. A reading (is the TV on?) is never a command: it goes in the tab's `state`, where the tab decides who sees it.
 
@@ -140,6 +141,7 @@ Refusals before the tab: 404 `unknown_action` (or `not_found` for a tab that doe
 - 30 commands an hour per key, on top of each action's `perHour`. Failed key checks are capped per IP (30/h) and audited as `shortcut_refused`.
 - Revoked with one tap from any session of its owner, weak or strong (taking access away never needs Face ID).
 - A key never reads anything: the answer carries only the action's `returns`.
+- A tab with Face ID on entry refuses keys (`not_for_shortcuts`), except for an action marked `keyWriteOnly`, from a key whose scope is that one action (a key with anything else next to it gets `out_of_scope`; such a scope cannot be created). The answer is `{ok, id}` with the usual HTTP status; never the tab's `result` or `error`. The key opens no page of the tab.
 - A shortcut holding a key is never shared; the signed file stays out of synced folders beyond what is needed.
 
 ## 6. The brake
@@ -185,7 +187,7 @@ async command(cmd: Command, identity: PortalIdentity): Promise<CommandAnswer>
 
 ## 9. Audit
 
-One line per command: action `command`, target `<tab>/<action>`, detail `{id, params, credential, shortcut?, status, error?}`. Refusals before the tab are audited as `command_refused` with the reason. Key events: `shortcut_key_created`, `shortcut_key_revoked`, `shortcut_refused`, `shortcut_new_place`. Brake: `commands_off`, `commands_on`. Device release: `device_commands_allowed`. The audit list is admin only.
+One line per command: action `command`, target `<tab>/<action>`, detail `{id, params, credential, shortcut?, status, error?}`. Refusals before the tab are audited as `command_refused` with the reason. Key events: `shortcut_key_created`, `shortcut_key_revoked`, `shortcut_refused`, `shortcut_new_place`. Brake: `commands_off`, `commands_on`. Device release: `device_commands_allowed`. The audit list is admin only. The params of a `keyWriteOnly` command on a tab with Face ID on entry are shown only to the person who sent it; any other admin sees each value as `***`.
 
 ## Rehearsal ("see as")
 

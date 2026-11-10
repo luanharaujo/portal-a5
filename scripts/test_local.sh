@@ -33,11 +33,13 @@ cat > "$STATE/tabs.json" <<'EOF2'
               "presence": {"level": "admin", "params": {"state": {"enum": ["out", "home"]}}, "perHour": 30},
               "wipe": {"level": "sensitive"},
               "limit": {"level": "common", "passkey": "5m", "params": {"on": {"bool": true}, "top": {"int": [10, 60]}}, "perHour": 30,
-                        "screens": false, "shortcut": false, "returns": ["state"]}
+                        "screens": false, "shortcut": false, "returns": ["state"]},
+              "note": {"level": "common", "keyWriteOnly": true}
             }},
   "tab-b": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab B", "icon": "mic",
             "allow": ["microphone", "screen-wake-lock"], "entry": "passkey", "entryHours": 4,
-            "credentials": ["browser", "machine"], "serviceWorker": false, "commands": {"ping": {"level": "common"}}},
+            "credentials": ["browser", "machine"], "serviceWorker": false, "commands": {"ping": {"level": "common"},
+              "jot": {"level": "common", "keyWriteOnly": true, "params": {"cents": {"int": [1, 1000]}}, "perHour": 30, "screens": false, "shortcut": true}}},
   "tab-badcmd": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "allow": [], "entry": "session", "credentials": ["browser"],
             "commands": {"tv": {"level": "common"}, "rm": {"level": "root"}}},
   "tab-slow": {"service": "portal-a5-fake-tab", "entrypoint": "SlowTab", "allow": [], "entry": "session", "credentials": ["browser"]},

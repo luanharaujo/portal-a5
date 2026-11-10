@@ -31,6 +31,10 @@ export interface CommandSpec {
   // (owner's rule for the TV volume limiter, 08/11: Face ID every time, residents too). Never for
   // fixed screens or Shortcuts keys.
   passkey: number | null
+  // the one way a Shortcuts key reaches a tab with Face ID on entry: write-only, alone in its key,
+  // answered with {ok, id} only. Off unless the catalog says true; no effect on a tab without
+  // Face ID on entry, other than the trimmed answer to a key.
+  keyWriteOnly: boolean
 }
 
 export type Catalog = Record<string, CommandSpec>
@@ -70,7 +74,7 @@ function parseParam(v: unknown): ParamSpec | null {
 // One action from the configuration. Anything malformed drops the action (never a looser one).
 function parseSpec(v: unknown): CommandSpec | null {
   if (!isObj(v)) return null
-  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey']
+  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey', 'keyWriteOnly']
   if (Object.keys(v).some((k) => !allowed.includes(k))) return null
   if (v.level !== 'common' && v.level !== 'admin' && v.level !== 'sensitive') return null
   const level = v.level as Level
@@ -104,6 +108,11 @@ function parseSpec(v: unknown): CommandSpec | null {
 
   if (v.screens != null && typeof v.screens !== 'boolean') return null
   if (v.shortcut != null && typeof v.shortcut !== 'boolean') return null
+  if (v.keyWriteOnly != null && typeof v.keyWriteOnly !== 'boolean') return null
+  // a write-only key action that could not go in a key, or that also reads back or reaches a screen,
+  // is a contradiction: the action is dropped
+  if (v.keyWriteOnly === true &&
+    (v.shortcut === false || level === 'sensitive' || v.passkey != null || v.screens === true || v.returns != null)) return null
 
   // "<n>m", 1 to 60 minutes, on common or admin actions; it rules out screens and keys, so asking
   // for either next to it is a contradiction and drops the action
@@ -123,7 +132,7 @@ function parseSpec(v: unknown): CommandSpec | null {
     if (!v.returns.every((r) => typeof r === 'string' && PARAM_RE.test(r) && !BAD.includes(r))) return null
     returns = [...new Set(v.returns as string[])]
   }
-  return { level, params, perHour, gap, screens, shortcut, returns, passkey }
+  return { level, params, perHour, gap, screens, shortcut, returns, passkey, keyWriteOnly: v.keyWriteOnly === true }
 }
 
 // The `commands` field of one tab. A bad action is dropped; a bad catalog is empty.
@@ -192,6 +201,7 @@ export interface Caller {
   adminFresh: boolean      // browser: passkey checked within the window for admin actions
                            // (ADMIN_COMMAND_PASSKEY in wrangler.toml: '12h'; '<n>m'/'<n>h' or 'session')
   scope: string[] | null   // shortcut: "<tab>/<action>" entries of the key
+  entryPasskey?: boolean   // shortcut: the tab asks Face ID on entry (only keyWriteOnly actions, from a one-action key)
   passkeyAt?: string | null // browser: this session's last passkey check (for actions with `passkey`)
   rehearsal?: boolean      // browser: an admin seeing as another group (nothing reaches the house)
 }
@@ -247,7 +257,9 @@ export function adminWindowUntil(passkeyAt: string | null, setting: string | und
 export function refusal(tab: string, action: string, spec: CommandSpec, c: Caller): string | null {
   if (c.credential === 'shortcut') {
     if (!spec.shortcut || spec.level === 'sensitive') return 'not_for_shortcuts'
+    if (c.entryPasskey && !spec.keyWriteOnly) return 'not_for_shortcuts'
     if (!c.scope?.includes(`${tab}/${action}`)) return 'out_of_scope'
+    if (c.entryPasskey && c.scope.length !== 1) return 'out_of_scope'
     if (spec.level === 'admin' && !c.admin) return 'admin_only'
     return null
   }
@@ -299,8 +311,9 @@ export function readAnswer(v: unknown): CommandAnswer {
 export const SHORTCUT_KEY_PREFIX = 'pa5_atl_'
 export const isShortcutKeyShape = (k: string) => /^pa5_atl_[A-Za-z0-9_-]{43}$/.test(k)
 
-// Scope of a new key: "<tab>/<action>" entries that exist and may go in a key.
-export function checkScope(raw: unknown, catalogs: Record<string, Catalog>, admin: boolean): string[] | null {
+// Scope of a new key: "<tab>/<action>" entries that exist and may go in a key. In a tab with Face
+// ID on entry (passkeyTabs) only a keyWriteOnly action may, and it must be the key's only entry.
+export function checkScope(raw: unknown, catalogs: Record<string, Catalog>, admin: boolean, passkeyTabs: Set<string> = new Set()): string[] | null {
   if (!Array.isArray(raw) || !raw.length || raw.length > 12) return null
   const out: string[] = []
   for (const e of raw) {
@@ -310,6 +323,7 @@ export function checkScope(raw: unknown, catalogs: Record<string, Catalog>, admi
     const spec = catalogs[m[1]]?.[m[2]]
     if (!spec || !spec.shortcut || spec.level === 'sensitive') return null
     if (spec.level === 'admin' && !admin) return null
+    if (passkeyTabs.has(m[1]) && (!spec.keyWriteOnly || new Set(raw).size !== 1)) return null
     if (!out.includes(e)) out.push(e)
   }
   return out
