@@ -154,6 +154,7 @@ const cv = await owner.req('POST', '/api/passkey/create/verify', await auth.crea
 check('passkey registered', cv.status === 200, cv.data)
 me = (await owner.req('GET', '/api/me')).data
 check('session strong after registering', me.strong === true && me.passkeys === 1, me)
+check('/api/me: fresh_until about 5 minutes ahead while strong', me.fresh_until && Date.parse(me.fresh_until) - Date.now() > 4 * 60e3 && Date.parse(me.fresh_until) - Date.now() <= 5 * 60e3, me.fresh_until)
 
 // strong: writes ok
 const add = await owner.req('POST', '/api/admin/people', { name: '<img src=x onerror=alert(1)>', phone: RESIDENT, groups: ['residents'] })
@@ -1092,6 +1093,7 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   // Chrome's virtual authenticator counts up; the software passkey keeps sending 0: put the count back
   const count0 = d1json(`SELECT sign_count AS n FROM passkeys WHERE credential_id = '${auth.id}'`)[0].n
   await entryChecks({ base: BASE, check, owner: owner.cookie, cred: await auth.forChrome(),
+    stale: async () => d1(`UPDATE sessions SET passkey_at = '${new Date(Date.now() - 3600e3).toISOString()}' WHERE id = ${sidB}`),
     age: async () => d1(`UPDATE tab_entries SET used_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}', granted_at = '${new Date(Date.now() - 5 * 3600e3).toISOString()}' WHERE session_id = ${sidB} AND tab = 'tab-b'`),
     restore: async () => {
       d1(`DELETE FROM tab_entries WHERE session_id = ${sidB} AND tab = 'tab-b' AND id NOT IN (${keep.map((k) => k.id).join(',') || 0})`)

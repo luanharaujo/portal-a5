@@ -133,8 +133,34 @@ async function rawApi(method, path, body) {
   return data
 }
 
+// Writes that need a Face ID from the last 5 minutes (src/index.ts: requireStrongAdmin, removePasskey,
+// view_as). When the session is past that window, the tap asks Face ID first, with options fetched
+// before the tap, so nothing is awaited before navigator.credentials.get (house rule H2: iOS wants the
+// tap). The server still decides: a write that answers "passkey" anyway gets the Face ID and one retry.
+function needsFresh(method, path, body) {
+  if (!ME || method === 'GET' || ME.credential !== 'browser') return false
+  // leaving "see as" drops the session's Face ID on the way in, so coming back always asks one
+  if (ME.view_as) return path === '/api/tabs' && !!body && body.view_as === null
+  if (!ME.passkeys) return false
+  if (/^\/api\/me\/passkeys\/\d+$/.test(path)) return method === 'DELETE'
+  if (!ME.admin) return false
+  if (path === '/api/admin/commands') return !(body && body.off)
+  if (/^\/api\/admin\/agent-requests\/\d+\/refuse$/.test(path)) return false
+  if (path.startsWith('/api/admin/')) return true
+  if (path === '/api/me/shortcuts' || path === '/api/me/readkeys' || /^\/api\/me\/alerts\/\d+\/ack$/.test(path)) return method === 'POST'
+  const dev = /^\/api\/me\/devices\/(\d+)$/.exec(path)
+  return !!dev && method === 'DELETE' && Number(dev[1]) !== ME.session_id
+}
+
 // Admin writes may answer "confirm with Face ID": do the passkey check and retry once.
-async function api(method, path, body) {
+function api(method, path, body) {
+  if (needsFresh(method, path, body) && !freshNow() && pkReady('')) {
+    return passkeyCheck().then(() => apiTry(method, path, body))
+  }
+  return apiTry(method, path, body)
+}
+
+async function apiTry(method, path, body) {
   try {
     return await rawApi(method, path, body)
   } catch (e) {
@@ -157,8 +183,73 @@ async function guarded(fn) {
 const b64uToBuf = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)), (c) => c.charCodeAt(0)).buffer
 const bufToB64u = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 
-async function passkeyCreate() {
-  const o = await rawApi('POST', '/api/passkey/create/options', {})
+// Options fetched before the tap (house rule H2). The portal keeps one pending challenge per session
+// and kind ('get', 'create'), so each kind keeps only the last purpose asked: for 'get', '' (the
+// portal's own Face ID) or 'agent:<id>', 'entry:<tab>', 'command:<tab>'; 'create' for a new passkey.
+// They serve once and live 5 minutes on the server: fetched again after every use, every 4 minutes
+// while the page is in view and when it comes back into view.
+const PK_TTL_MS = 4 * 60e3
+const PK = { get: { purpose: null, o: null, at: 0, ask: null, timer: null, inUse: false }, create: { purpose: null, o: null, at: 0, ask: null, timer: null, inUse: false }, until: 0 }
+const pkSlot = (purpose) => (purpose === 'create' ? PK.create : PK.get)
+
+function pkWarm(purpose, force) {
+  if (!window.PublicKeyCredential || !ME || ME.credential !== 'browser') return
+  // never while a prompt of this kind is open: a new challenge would replace the one being answered
+  if (pkSlot(purpose).inUse) return
+  if (purpose !== 'create' && !ME.passkeys && !force) return
+  const slot = pkSlot(purpose)
+  clearTimeout(slot.timer)
+  slot.purpose = purpose; slot.o = null
+  const ask = purpose === 'create'
+    ? rawApi('POST', '/api/passkey/create/options', {})
+    : rawApi('POST', '/api/passkey/get/options', purpose ? { purpose } : {})
+  slot.ask = ask
+  ask.then((o) => { if (slot.ask === ask) { slot.o = o; slot.at = Date.now() } })
+    .catch(() => {}) // no passkey, not allowed, signed out, offline: the tap falls back to the old way
+    .finally(() => { if (slot.ask === ask) slot.ask = null })
+  slot.timer = setTimeout(() => { if (slot.purpose === purpose) (document.hidden ? (slot.o = null) : pkWarm(purpose, force)) }, PK_TTL_MS)
+}
+// keep options for this purpose ready, without asking again while they are (redraws happen often)
+function pkKeep(purpose, force) {
+  const slot = pkSlot(purpose)
+  if (slot.purpose === purpose && (slot.ask || pkReady(purpose))) return
+  pkWarm(purpose, force)
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return
+  for (const slot of [PK.get, PK.create]) if (slot.purpose !== null && !slot.ask && !pkReady(slot.purpose)) pkWarm(slot.purpose)
+})
+function pkReady(purpose) {
+  const slot = pkSlot(purpose)
+  return slot.purpose === purpose && !!slot.o && Date.now() - slot.at < PK_TTL_MS
+}
+// options for this purpose, taken (they serve once); null when none are ready
+function pkTake(purpose) {
+  if (!pkReady(purpose)) return null
+  const slot = pkSlot(purpose)
+  const o = slot.o
+  slot.o = null; slot.ask = null
+  return o
+}
+// around one prompt and its verify: nothing asks new options meanwhile; afterwards the next tap finds
+// fresh ones (only when this purpose was being kept ready)
+async function pkUse(purpose, run) {
+  const slot = pkSlot(purpose)
+  slot.inUse = true
+  try { return await run() } finally {
+    slot.inUse = false
+    if (slot.purpose === purpose) pkWarm(purpose, true)
+  }
+}
+// the server's Face ID window for writes (5 minutes), with a margin so a tap never races its end
+const freshNow = () => Date.now() < Math.max(PK.until, ME && ME.fresh_until ? Date.parse(ME.fresh_until) : 0) - 15e3
+
+function passkeyCreate() {
+  const ready = pkTake('create')
+  return pkUse('create', () => passkeyCreateWith(ready))
+}
+async function passkeyCreateWith(ready) {
+  const o = ready || await rawApi('POST', '/api/passkey/create/options', {})
   const cred = await navigator.credentials.create({
     publicKey: {
       ...o,
@@ -178,8 +269,13 @@ async function passkeyCreate() {
   PASSKEY_HERE.set()
 }
 
-async function passkeyCheck(purpose) {
-  const o = await rawApi('POST', '/api/passkey/get/options', purpose ? { purpose } : {})
+// Called in the tap: with options ready, navigator.credentials.get runs before anything is awaited.
+function passkeyCheck(purpose) {
+  const ready = pkTake(purpose || '')
+  return pkUse(purpose || '', () => passkeyCheckWith(purpose, ready))
+}
+async function passkeyCheckWith(purpose, ready) {
+  const o = ready || await rawApi('POST', '/api/passkey/get/options', purpose ? { purpose } : {})
   const cred = await navigator.credentials.get({
     publicKey: { ...o, challenge: b64uToBuf(o.challenge), allowCredentials: o.allowCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) })) },
   })
@@ -191,6 +287,7 @@ async function passkeyCheck(purpose) {
     signature: bufToB64u(r.signature),
   })
   PASSKEY_HERE.set()
+  if (!purpose) PK.until = Date.now() + 5 * 60e3
   return out
 }
 
@@ -199,6 +296,8 @@ async function passkeyCheck(purpose) {
 // the device refuses a second one, InvalidStateError, which means it is already here).
 async function passkeyHere() {
   try {
+    // a second key needs a Face ID first (src/index.ts canAddPasskey): ask it on the tap, not after a refusal
+    if (ME && ME.passkeys && !ME.passkey_invite && !freshNow() && pkReady('')) { await passkeyCheck(); await passkeyCreate(); return }
     await passkeyCreate().catch(async (e) => { if (!(e instanceof ApiError && e.data.passkey)) throw e; await passkeyCheck(); await passkeyCreate() })
   } catch (e) {
     if (e && e.name === 'InvalidStateError') { PASSKEY_HERE.set(); return }
@@ -360,6 +459,7 @@ function welcomeOrGo() {
 }
 
 function ownerFaceIdView() {
+  pkKeep('create')
   cover([
     steps(3, T.steps.faceId),
     el('div', { class: 'faceid-mark' }, icon('faceid')),
@@ -412,10 +512,12 @@ function once(fn) {
   let busy = false
   return async () => { if (busy) return; busy = true; try { await fn() } finally { busy = false } }
 }
-function faceIdNow(go) {
+function faceIdNow(go, purpose) {
   if (!window.PublicKeyCredential) return
-  if (!document.hidden) return void go()
-  const onShow = () => { if (!document.hidden) { document.removeEventListener('visibilitychange', onShow); go() } }
+  // after the first try (cancelled or failed) the button finds options ready, so its tap opens Face ID at once
+  const first = () => go().then(() => pkKeep(purpose, true))
+  if (!document.hidden) return void first()
+  const onShow = () => { if (!document.hidden) { document.removeEventListener('visibilitychange', onShow); first() } }
   document.addEventListener('visibilitychange', onShow)
 }
 
@@ -433,21 +535,22 @@ function commandStepUpView(tab) {
     el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: go }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
     el('button', { type: 'button', class: 'back', onclick: () => location.assign(next) }, T.commandStepUp.later),
   ])
-  faceIdNow(go)
+  faceIdNow(go, `command:${tab}`)
 }
 
 // back to the owner: Face ID first (the server asks for one made after going in)
 function backToOwner() {
   const next = nextPath()
+  const go = once(() => guarded(async () => {
+    await api('POST', '/api/tabs', { view_as: null })
+    store.set(false)
+    location.assign(next && !next.startsWith(ACCOUNT + '?') ? next : ACCOUNT)
+  }))
   cover([
     el('div', { class: 'faceid-mark' }, icon('faceid')),
     el('h1', {}, T.rehearsal.back),
     el('p', { class: 'sub' }, T.rehearsal.backWhy),
-    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: () => guarded(async () => {
-      await api('POST', '/api/tabs', { view_as: null })
-      store.set(false)
-      location.assign(next && !next.startsWith(ACCOUNT + '?') ? next : ACCOUNT)
-    }) }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
+    el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: go }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
     backLink(T.back, () => { history.replaceState(null, '', ACCOUNT); start() }),
     // no Face ID on this device, or it failed: sign out for real and sign in again by WhatsApp
     el('button', { type: 'button', class: 'screen-link', onclick: () => guarded(async () => {
@@ -457,6 +560,7 @@ function backToOwner() {
       location.assign(ACCOUNT)
     }) }, icon('logout'), el('span', {}, T.rehearsal.signOutReal), icon('chev', 'ico chev')),
   ], false, true)
+  faceIdNow(go, '')
 }
 
 function rehearsalSignOut() {
@@ -633,7 +737,7 @@ function stepUpView(tab) {
     el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: go }, icon('faceid'), el('span', {}, T.stepUp.confirm)),
     backLink(T.back, () => { if (history.length > 1) history.back(); else location.assign(ACCOUNT) }),
   ])
-  faceIdNow(go)
+  faceIdNow(go, `entry:${tab}`)
   // the tab's own name, when the list knows it
   if (window.A5Tabs) window.A5Tabs.load().then((d) => {
     const t = d && d.tabs.find((x) => x.id === tab)
@@ -738,6 +842,9 @@ function renderAccount() {
   const showPane = chosen || WIDE.matches
   document.body.classList.toggle('at-pane', chosen)
   renderIndex(showPane ? part : null)
+  // writes here may need the portal's Face ID: options ready before any tap (house rule H2)
+  if (!ME.view_as && !(part === 'agentes' && agentReqId) && (ME.admin || (showPane && part === 'faceid'))) pkKeep('')
+  if (showPane && part === 'faceid' && ME.passkey_can_add) pkKeep('create')
   if (!showPane) { $pane.replaceChildren(); return }
   const p = PARTS[part]
   const top = (title, intro, extra) => el('div', { class: 'pane-top' },
@@ -865,6 +972,8 @@ function addPasskeyView() {
     return cover([el('div', { class: 'faceid-mark' }, icon('faceid')), el('h1', {}, T.addFaceId.title), el('p', { class: 'sub' }, why),
       el('button', { type: 'button', class: 'btn btn-primary btn-block', onclick: back }, el('span', {}, T.back))])
   }
+  pkKeep('create')
+  if (ME.passkeys && !ME.passkey_invite) pkKeep('') // a second key asks Face ID first, on the same tap
   cover([
     el('div', { class: 'faceid-mark' }, icon('faceid')),
     el('h1', {}, T.addFaceId.title),
@@ -1035,6 +1144,7 @@ async function partAgentRequest(top, id) {
   const leave = () => { agentReqId = null; history.replaceState(null, '', ACCOUNT + '#agentes') }
   const groupLabel = (g) => (T.groupNames && T.groupNames[g]) || g
   const warn = (text) => el('div', { class: 'notice' }, icon('alert'), el('div', {}, text))
+  pkKeep(`agent:${r.id}`) // the approval is the Face ID itself: options ready for the tap
   fill($pane,
     top(r.kind === 'pair' ? T.agentReq.pairTitle(r.name) : T.agentReq.changeTitle(r.name), T.agentReq.asked(r.agent || T.agentReq.anAgent, when(r.created_at))),
     el('div', { class: 'card pad' },

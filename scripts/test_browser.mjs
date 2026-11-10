@@ -373,7 +373,8 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     check('browser: back to the owner mode asks for Face ID first', await v.waitFor(`location.pathname === '/conta/' && location.search.includes('owner=1') && !!document.querySelector('.sheet .faceid-mark')`, 5000))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_back_faceid.png')
     await strong() // stands in for Face ID on the phone (the software passkey of the battery)
-    await v.evaluate(`document.querySelector('.sheet .btn-primary').click()`)
+    // the page asks Face ID by itself on load (H2); with the session made strong above, a reload goes straight back
+    await v.evaluate(`location.reload()`)
     check('browser: back to the owner mode brings the owner back on the same page', await v.waitFor(`${ON} && location.pathname === '/conta/' && document.querySelector('.a5-tabs-viewas').hidden && !!document.querySelector('.index a.row[href="#pessoas"]')`, 5000))
     // the rehearsal row: seeing as a resident from the signed-out pages
     await v.evaluate(`document.querySelector('[data-a5-tabs]').click()`)
@@ -461,7 +462,7 @@ export async function agentPairChecks({ base, check, owner, prepare, approve }) 
 // Face ID on entry, in place (docs/TABS.md): a real WebAuthn call in Chrome, with the test's software
 // passkey loaded into a virtual authenticator. WebAuthn needs a domain as the RP id, so these pages
 // run on localhost (same server). Also measures the old way (the portal's step-up page) for the record.
-export async function entryChecks({ base, check, owner, cred, age, restore }) {
+export async function entryChecks({ base, check, owner, cred, age, stale, restore }) {
   if (!existsSync(CHROME)) { console.log('skip entry browser checks: Chrome not found (set CHROME)'); return }
   const lbase = base.replace('127.0.0.1', 'localhost')
   const b = await launch()
@@ -506,6 +507,30 @@ export async function entryChecks({ base, check, owner, cred, age, restore }) {
       await c.waitFor(`(() => { const g = document.getElementById('a5-entry-go'); return g && !g.hidden && g.textContent === A5_TEXT.entry.button })()`, 8000),
       [await c.evaluate(`document.querySelector('main')?.innerText`), c.log])
     check('browser: entry page: no CSP violation', !c.log.some((t) => /Content Security Policy/i.test(t)), c.log)
+
+    // House rule H2 on the account: a write that needs Face ID opens it on the tap itself, with the
+    // options fetched before (nothing awaited before navigator.credentials.get), then the write
+    await stale()
+    const a = await page(b, lbase, owner)
+    await withKey(a, cred)
+    await a.go('/conta/#grupos')
+    const SAVE = `[...document.querySelectorAll('.pane button')].find((x) => x.textContent === T.save)`
+    check('browser: account: Face ID options ready before any tap', await a.waitFor(`typeof PK === 'object' && PK.get.purpose === '' && !!PK.get.o && !!${SAVE}`, 8000),
+      [await a.evaluate(`JSON.stringify({ me: !!ME, fresh: ME && ME.fresh_until, purpose: PK.get.purpose, o: !!PK.get.o })`), a.log])
+    await a.evaluate(`(() => {
+      window.__calls = []
+      const f = window.fetch
+      window.fetch = (u, o) => { __calls.push('fetch ' + ((o && o.method) || 'GET') + ' ' + u); return f(u, o) }
+      const g = navigator.credentials.get.bind(navigator.credentials)
+      navigator.credentials.get = (o) => { __calls.push('get'); return g(o) }
+      ${SAVE}.click()
+      return true
+    })()`)
+    const wrote = await a.waitFor(`__calls.some((c) => c.startsWith('fetch POST /api/admin/groups/'))`, 8000)
+    const calls = JSON.parse(await a.evaluate(`JSON.stringify(__calls)`))
+    check('browser: account: the tap calls Face ID first, then verify, then the write (one Face ID, no refusal first)',
+      wrote && calls[0] === 'get' && calls[1] === 'fetch POST /api/passkey/get/verify' && calls.filter((c) => c === 'get').length === 1 &&
+      calls.filter((c) => c.startsWith('fetch POST /api/admin/groups/')).length === 1, [calls, a.log])
   } finally {
     await restore()
     b.close()
