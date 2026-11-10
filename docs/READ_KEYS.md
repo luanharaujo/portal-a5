@@ -12,10 +12,11 @@ A program of the owner (an agent on the Mac, for example) reads one tab's data o
 
 ## Limits and warnings
 
+- `readKey.dayAlert` is the day's warning threshold (default 30).
 - `readKey.perHour` uses per key (at most 60), then `429 too_many_attempts`.
 - Every admin gets a warning on the account page when a key is used:
   - for the first time from a city or network it never used (`read_key_place`);
-  - more than 30 times in one day (`read_key_day`, once a day);
+  - more than `dayAlert` times in one day, 30 by default (`read_key_day`, once a day);
   - from a second IP address in the same day (`read_key_ip`, at each new address that day).
   The day is the calendar day in UTC-3.
 - Every use is in the audit log as `read_key_used` (strength `read_key`, key id, path, answer status, uses that day); refusals as `read_key_refused` with the reason. The key itself never is.
@@ -41,7 +42,9 @@ No `Authorization` and no cookie reach the tab. The tab must:
 In `.tabs.local.json`, per tab:
 
 ```json
-"readKey": { "paths": ["/_data"], "perHour": 30 }
+"readKey": { "paths": ["/_data"], "perHour": 30, "dayAlert": 30 }
 ```
+
+`dayAlert` (30 to 1000, default 30) is the daily use above which `read_key_day` warns the admins; raise it only for a program that sweeps on a schedule (security review first).
 
 Paths are exact (`/[a-z0-9_-]` segments, at most 5 paths, never `/_cmd` or `/_passkey`). A tab without `readKey` takes no read keys. A deploy that adds a path or raises `perHour` counts as loosening (`PORTAL_A5_CONFIG_REMOVE=1`).

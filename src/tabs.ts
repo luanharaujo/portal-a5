@@ -11,7 +11,7 @@
 //                              ({count}), shown next to the tab selector. Only the number leaves.
 //   command(cmd, identity)     optional; one checked command for the house (docs/COMMANDS.md)
 
-import { type Catalog, type Command, parseCatalogStrict } from './commands'
+import { type Catalog, type Command, hasText, parseCatalogStrict } from './commands'
 
 export type Credential = 'browser' | 'screen' | 'machine' | 'shortcut' | 'read_key'
 
@@ -85,7 +85,9 @@ export interface TabConfig extends TabPolicy {
   readKey: ReadKeyPolicy | null
 }
 
-export interface ReadKeyPolicy { paths: string[]; perHour: number }
+export interface ReadKeyPolicy { paths: string[]; perHour: number; dayAlert: number }
+export const READ_KEY_DAY_ALERT_DEFAULT = 30
+export const READ_KEY_DAY_ALERT_MAX = 1000
 export const READ_KEY_MAX_PER_HOUR = 60
 
 // The TABS variable is generated at deploy time from a file kept out of git (scripts/deploy.sh):
@@ -113,7 +115,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(tab) || RESERVED_TABS.includes(tab)) return null
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   const o = v as Record<string, unknown>
-  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands', 'readKey']
+  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands', 'readKey', 'textParams']
   if (Object.keys(o).some((k) => !known.includes(k))) return null
   if (typeof o.binding !== 'string' || !/^[A-Z][A-Z0-9_]{0,40}$/.test(o.binding)) return null
   if (o.label != null && (typeof o.label !== 'string' || !o.label.trim() || o.label.length > 40 || /[\u0000-\u001f<>]/.test(o.label))) return null
@@ -130,6 +132,8 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   // one malformed action refuses the whole tab, like any other bad field
   const commands = parseCatalogStrict(o.commands ?? {})
   if (!commands) return null
+  if (o.textParams != null && typeof o.textParams !== 'boolean') return null
+  if (Object.values(commands).some(hasText) && o.textParams !== true) return null
   const readKey = o.readKey == null ? null : parseReadKey(o.readKey)
   if (o.readKey != null && !readKey) return null
   return {
@@ -150,13 +154,16 @@ function validTab(tab: string, v: unknown): TabConfig | null {
 function parseReadKey(v: unknown): ReadKeyPolicy | null {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   const o = v as Record<string, unknown>
-  if (Object.keys(o).some((k) => !['paths', 'perHour'].includes(k))) return null
+  if (Object.keys(o).some((k) => !['paths', 'perHour', 'dayAlert'].includes(k))) return null
   if (!Array.isArray(o.paths) || !o.paths.length || o.paths.length > 5) return null
   for (const p of o.paths)
     if (typeof p !== 'string' || !/^(\/[a-z0-9_-]{1,40}){1,4}$/.test(p) || /^\/_(cmd|passkey)(\/|$)/.test(p)) return null
   const n = o.perHour
   if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || n > READ_KEY_MAX_PER_HOUR) return null
-  return { paths: [...new Set(o.paths as string[])], perHour: n }
+  // the daily use that warns the admins (a key read by a program that sweeps every few minutes needs more)
+  const d = o.dayAlert ?? READ_KEY_DAY_ALERT_DEFAULT
+  if (typeof d !== 'number' || !Number.isInteger(d) || d < READ_KEY_DAY_ALERT_DEFAULT || d > READ_KEY_DAY_ALERT_MAX) return null
+  return { paths: [...new Set(o.paths as string[])], perHour: n, dayAlert: d }
 }
 
 // The router reads the configuration once per isolate (re-parsed only if the variable changes).

@@ -4,7 +4,10 @@
 // Each tab declares its actions in the TABS configuration (`commands`). The portal checks the
 // action, every parameter, the level and its own rate limits before the tab ever sees the call;
 // the tab's machine bridge checks all of it again against its own closed list.
-// There is no free text anywhere: a parameter is an enum, a bounded integer or a boolean.
+// There is no free text, except one narrow door: a `text` parameter, only on keyWriteOnly actions of a
+// tab whose configuration says `textParams: true` (a tab that keeps the text as data, with no bridge
+// that runs anything). The value is checked here for size and control characters and never leaves
+// the tab: the audit and the commands table keep its length only.
 
 export type Level = 'common' | 'admin' | 'sensitive'
 
@@ -12,6 +15,7 @@ export type ParamSpec =
   | { enum: string[] }
   | { int: [number, number] }
   | { bool: true }
+  | { text: number }
 
 export interface CommandSpec {
   level: Level
@@ -35,6 +39,9 @@ export interface CommandSpec {
   // answered with {ok, id} only. Off unless the catalog says true; no effect on a tab without
   // Face ID on entry, other than the trimmed answer to a key.
   keyWriteOnly: boolean
+  // only opens the tab's own Face ID window (`passkey`): the tab checks identity.passkey_until on its
+  // own routes; /_cmd refuses it before the tab is called
+  windowOnly: boolean
 }
 
 export type Catalog = Record<string, CommandSpec>
@@ -45,6 +52,7 @@ const ENUM_RE = /^[a-z0-9][a-z0-9_.-]{0,39}$/
 const MAX_ACTIONS = 40
 const MAX_PARAMS = 4
 const MAX_ENUM = 16
+export const TEXT_MAX = 4000
 const MAX_RETURNS = 8
 const DEFAULT_PER_HOUR = 20
 const MAX_PER_HOUR = 120
@@ -68,13 +76,23 @@ function parseParam(v: unknown): ParamSpec | null {
     return { int: [a as number, b as number] }
   }
   if (v.bool === true) return { bool: true }
+  if (typeof v.text === 'number' && Number.isSafeInteger(v.text) && v.text >= 1 && v.text <= TEXT_MAX) return { text: v.text }
   return null
+}
+
+export const hasText = (spec: CommandSpec) => Object.values(spec.params).some((p) => 'text' in p)
+
+// What the audit and the commands table keep of a call: text values become their length.
+export function redactParams(spec: CommandSpec, params: Record<string, string | number | boolean>): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {}
+  for (const [k, v] of Object.entries(params)) out[k] = spec.params[k] && 'text' in spec.params[k] && typeof v === 'string' ? `[text:${[...v].length}]` : v
+  return out
 }
 
 // One action from the configuration. Anything malformed drops the action (never a looser one).
 function parseSpec(v: unknown): CommandSpec | null {
   if (!isObj(v)) return null
-  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey', 'keyWriteOnly']
+  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey', 'keyWriteOnly', 'windowOnly']
   if (Object.keys(v).some((k) => !allowed.includes(k))) return null
   if (v.level !== 'common' && v.level !== 'admin' && v.level !== 'sensitive') return null
   const level = v.level as Level
@@ -114,6 +132,10 @@ function parseSpec(v: unknown): CommandSpec | null {
   if (v.keyWriteOnly === true &&
     (v.shortcut === false || level === 'sensitive' || v.passkey != null || v.screens === true || v.returns != null)) return null
 
+  // free text only in a write-only action (the key answers {ok, id}; nothing reads it back)
+  if (Object.values(params).some((p) => 'text' in p) && v.keyWriteOnly !== true) return null
+  if (v.windowOnly != null && (v.windowOnly !== true || v.passkey == null || v.keyWriteOnly === true)) return null
+
   // "<n>m", 1 to 60 minutes, on common or admin actions; it rules out screens and keys, so asking
   // for either next to it is a contradiction and drops the action
   let passkey: number | null = null
@@ -132,7 +154,7 @@ function parseSpec(v: unknown): CommandSpec | null {
     if (!v.returns.every((r) => typeof r === 'string' && PARAM_RE.test(r) && !BAD.includes(r))) return null
     returns = [...new Set(v.returns as string[])]
   }
-  return { level, params, perHour, gap, screens, shortcut, returns, passkey, keyWriteOnly: v.keyWriteOnly === true }
+  return { level, params, perHour, gap, screens, shortcut, returns, passkey, keyWriteOnly: v.keyWriteOnly === true, windowOnly: v.windowOnly === true }
 }
 
 // The `commands` field of one tab. A bad action is dropped; a bad catalog is empty.
@@ -165,6 +187,9 @@ export function checkParams(spec: CommandSpec, raw: unknown): { params: Record<s
     if (val === undefined) return { error: 'missing_param' }
     if ('enum' in p) {
       if (typeof val !== 'string' || !p.enum.includes(val)) return { error: 'bad_param' }
+    } else if ('text' in p) {
+      // letters, digits and punctuation; line breaks and tabs are fine, other control characters are not
+      if (typeof val !== 'string' || [...val].length > p.text || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/.test(val) || /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(val)) return { error: 'bad_param' }
     } else if ('int' in p) {
       if (typeof val !== 'number' || !Number.isSafeInteger(val) || val < p.int[0] || val > p.int[1]) return { error: 'bad_param' }
     } else if (typeof val !== 'boolean') return { error: 'bad_param' }
@@ -316,6 +341,9 @@ export const isShortcutKeyShape = (k: string) => /^pa5_atl_[A-Za-z0-9_-]{43}$/.t
 export function checkScope(raw: unknown, catalogs: Record<string, Catalog>, admin: boolean, passkeyTabs: Set<string> = new Set()): string[] | null {
   if (!Array.isArray(raw) || !raw.length || raw.length > 12) return null
   const out: string[] = []
+  // a key holding a text action is the Mac's: only write-only actions of that one tab next to it
+  const tabsIn = new Set<string>()
+  for (const e of raw) if (typeof e === 'string') tabsIn.add(e.split('/')[0])
   for (const e of raw) {
     if (typeof e !== 'string') return null
     const m = /^([a-z][a-z0-9-]{0,30})\/([a-z][a-z0-9_]{0,39})$/.exec(e)
@@ -323,6 +351,7 @@ export function checkScope(raw: unknown, catalogs: Record<string, Catalog>, admi
     const spec = catalogs[m[1]]?.[m[2]]
     if (!spec || !spec.shortcut || spec.level === 'sensitive') return null
     if (spec.level === 'admin' && !admin) return null
+    if (hasText(spec) && (tabsIn.size !== 1 || raw.some((x) => !catalogs[m[1]]?.[String(x).split('/')[1]]?.keyWriteOnly))) return null
     if (passkeyTabs.has(m[1]) && (!spec.keyWriteOnly || new Set(raw).size !== 1)) return null
     if (!out.includes(e)) out.push(e)
   }

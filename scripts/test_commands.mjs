@@ -167,5 +167,37 @@ check('keyWriteOnly actions: only that action', allowedActions('f', wo, kPK(['f/
 check('keyWriteOnly on a session tab: no change for a key', refusal('h', 'gasto', wo.gasto, { ...key(['h/gasto', 'h/tv']), admin: true }) === null &&
   checkScope(['h/gasto', 'h/tv'], { h: { ...cat, gasto: wo.gasto } }, true, PK) !== null)
 
+// Text parameters: a narrow door (keyWriteOnly only, tab opt-in, never kept in the audit)
+import { redactParams, hasText, TEXT_MAX } from '../src/commands.ts'
+const tx = parseCatalog({
+  create: { level: 'admin', keyWriteOnly: true, params: { title: { text: 120 }, note: { text: 1000 } }, perHour: 30 },
+  set_due: { level: 'admin', keyWriteOnly: true, params: { item: { int: [1, 99] } } },
+  text_plain: { level: 'admin', params: { t: { text: 10 } } },
+  text_big: { level: 'admin', keyWriteOnly: true, params: { t: { text: TEXT_MAX + 1 } } },
+  text_zero: { level: 'admin', keyWriteOnly: true, params: { t: { text: 0 } } },
+  text_float: { level: 'admin', keyWriteOnly: true, params: { t: { text: 1.5 } } },
+  text_two: { level: 'admin', keyWriteOnly: true, params: { t: { text: 5, u: 1 } } },
+  purge: { level: 'common', passkey: '5m', windowOnly: true },
+  win_nopass: { level: 'common', windowOnly: true },
+  win_wo: { level: 'admin', keyWriteOnly: true, windowOnly: true },
+})
+check('text: only keyWriteOnly actions with a sane size stay', Object.keys(tx).sort().join() === 'create,purge,set_due', Object.keys(tx))
+check('text: hasText', hasText(tx.create) && !hasText(tx.set_due))
+check('windowOnly: kept only with passkey', tx.purge.windowOnly === true && tx.purge.shortcut === false && tx.purge.screens === false)
+check('text: ok', 'params' in checkParams(tx.create, { title: 'Paint the room', note: '' }) && 'params' in checkParams(tx.create, { title: 'a\nb\tc', note: 'naive 😀' }))
+check('text: too long', checkParams(tx.create, { title: 'x'.repeat(121), note: '' }).error === 'bad_param')
+check('text: counted in characters', 'params' in checkParams(tx.create, { title: '😀'.repeat(120), note: '' }))
+check('text: not a string', checkParams(tx.create, { title: 5, note: '' }).error === 'bad_param' && checkParams(tx.create, { title: null, note: '' }).error === 'bad_param')
+check('text: NUL and control refused', checkParams(tx.create, { title: 'a\u0000b', note: '' }).error === 'bad_param' && checkParams(tx.create, { title: 'a\u001bb', note: '' }).error === 'bad_param')
+check('text: lone surrogate refused', checkParams(tx.create, { title: 'a\ud800b', note: '' }).error === 'bad_param')
+check('text: missing refused', checkParams(tx.create, { title: 'a' }).error === 'missing_param')
+const red = redactParams(tx.create, { title: 'Secret', note: '' })
+check('text: audit keeps the length only', red.title === '[text:6]' && red.note === '[text:0]' && !JSON.stringify(red).includes('Secret'), red)
+check('text: ints pass through redaction', redactParams(tx.set_due, { item: 3 }).item === 3)
+const TXT = new Set()
+check('text key scope: alone in its tab = ok', checkScope(['z/create', 'z/set_due'], { z: tx }, true, TXT) !== null)
+check('text key scope: with another tab = null', checkScope(['z/create', 'h/tv'], { z: tx, h: cat }, true, TXT) === null)
+check('text key scope: with a non-write-only action = null', checkScope(['z/create', 'z/other'], { z: { ...tx, other: cat.tv }, h: cat }, true, TXT) === null)
+
 console.log(failures ? `\n${failures} FAILED` : '\nall ok')
 process.exit(failures ? 1 : 0)

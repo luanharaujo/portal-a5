@@ -12,8 +12,8 @@ import {
   policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig,
 } from './tabs'
 import {
-  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, adminWindowUntil, allowedActions, passkeyUntil, checkParams, checkScope, gapKeyOf,
-  isShortcutKeyShape, pickReturns, readAnswer, refusal,
+  type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, adminWindowUntil, allowedActions, passkeyUntil, checkParams, checkScope, gapKeyOf, hasText,
+  isShortcutKeyShape, pickReturns, readAnswer, redactParams, refusal,
 } from './commands'
 
 export type { PortalIdentity } from './tabs'
@@ -1614,6 +1614,8 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
 
   const spec = catalogOf(env, tab)[action]
   if (!spec) return refuse(404, 'unknown_action')
+  // only opens the tab's own Face ID window: nothing to run
+  if (spec.windowOnly) return refuse(404, 'unknown_action')
   const b = await body(req)
   if (Object.keys(b).some((k) => k !== 'params')) return refuse(400, 'bad_params')
   const p = checkParams(spec, b.params)
@@ -1641,6 +1643,12 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
     return refuse(403, why, { step_up: `/?step_up=${tab}&purpose=command&next=${encodeURIComponent(`/${tab}/`)}` })
   }
   if (why) return refuse(403, why)
+  // a key with a text action is checked against today's catalog, not only the one it was made under:
+  // every entry must still be a write-only action of this tab
+  if (c.key && hasText(spec)) {
+    const cat = catalogOf(env, tab)
+    if (!c.key.scope.every((e) => e.startsWith(`${tab}/`) && cat[e.slice(tab.length + 1)]?.keyWriteOnly)) return refuse(403, 'out_of_scope')
+  }
   // (the 24 h hold on a new resident device, was dropped on 08/11: a person
   // the owner put in a group acts at once; every new resident sign-in is an alert to the admins instead)
   if (await commandsOff(env)) return refuse(503, 'commands_off')
@@ -1650,7 +1658,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   if (c.who?.viewAs) {
     if (!(await underLimit(env, `cmd-rehearsal:p${person.id}`, REHEARSAL_COMMANDS_PER_HOUR))) return refuse(429, 'too_many_commands')
     const id = crypto.randomUUID()
-    await audit(env, req, { ...actor, action: 'command', target, detail: { id, params: p.params, credential, status: 'done', simulated: true } })
+    await audit(env, req, { ...actor, action: 'command', target, detail: { id, params: redactParams(spec, p.params), credential, status: 'done', simulated: true } })
     return json({ id, status: 'done', ok: true, simulated: true }, 200)
   }
 
@@ -1675,7 +1683,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   await env.DB.prepare(
     `INSERT INTO commands (id, at, tab, action, params, credential, person_id, session_id, shortcut_id, gap_key, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent')`,
-  ).bind(id, at, tab, action, JSON.stringify(cmd.params), credential, person.id, c.who?.sessionId ?? null, c.key?.id ?? null, gapKey).run()
+  ).bind(id, at, tab, action, JSON.stringify(redactParams(spec, cmd.params)), credential, person.id, c.who?.sessionId ?? null, c.key?.id ?? null, gapKey).run()
 
   const identity: PortalIdentity = c.key
     ? {
@@ -1705,7 +1713,7 @@ async function runCommand(env: Env, req: Request, tab: string, action: string,
   await env.DB.prepare('UPDATE commands SET status = ?, finished_at = ? WHERE id = ?').bind(status, now(), id).run()
   await audit(env, req, {
     ...actor, action: 'command', target,
-    detail: { id, params: cmd.params, credential, status, ...(error ? { error } : {}), ...(c.key ? { shortcut: c.key.id } : {}) },
+    detail: { id, params: redactParams(spec, cmd.params), credential, status, ...(error ? { error } : {}), ...(c.key ? { shortcut: c.key.id } : {}) },
   })
   // a key on a write-only action gets {ok, id} and nothing else (no result, no error from the tab)
   if (c.key && spec.keyWriteOnly) return json({ ok: status === 'done', id }, COMMAND_HTTP[status] ?? 502)
@@ -2302,7 +2310,7 @@ async function readKeyRequest(req: Request, env: Env, url: URL): Promise<Respons
   await env.DB.prepare('UPDATE read_keys SET last_used_at = ?, last_ip = ?, last_place = ?, seen_places = ?, use_day = ?, use_day_n = ?, use_day_ips = ? WHERE id = ?')
     .bind(now(), ip, place(req), JSON.stringify(seen), day, n, JSON.stringify(ips), id).run()
   if (newPlace) await alertAdmins(env, req, String(k.label), 'read_key_place')
-  if (n === READ_KEY_DAY_ALERT + 1) await alertAdmins(env, req, String(k.label), 'read_key_day')
+  if (n === policy.dayAlert + 1) await alertAdmins(env, req, String(k.label), 'read_key_day')
   if (newIp && ips.length >= 2) await alertAdmins(env, req, String(k.label), 'read_key_ip')
   const identity: PortalIdentity = {
     credential: 'read_key', person: pid, name: String(k.name), groups: groups.map((g) => g.id), session: null, machine: null,
