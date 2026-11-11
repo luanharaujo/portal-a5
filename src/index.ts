@@ -9,7 +9,7 @@
 import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
 import {
   type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
-  policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig,
+  policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig, tabsText,
 } from './tabs'
 import {
   type Caller, type Catalog, SHORTCUT_KEY_PREFIX, adminWindowOk, adminWindowUntil, allowedActions, passkeyUntil, checkParams, checkScope, gapKeyOf, hasText,
@@ -1263,7 +1263,7 @@ async function listAudit(env: Env, url: URL) {
 // Tab name -> binding name, from the TABS configuration (validated in tabs.ts; a tab named like a
 // portal page, or with a bad policy, is dropped).
 function tabBindings(env: Env): Record<string, string> {
-  return Object.fromEntries(Object.entries(tabsConfig(env.TABS)).map(([t, c]) => [t, c.binding]))
+  return Object.fromEntries(Object.entries(tabsConfig(tabsText(env))).map(([t, c]) => [t, c.binding]))
 }
 
 function tabService(env: Env, tab: string): TabService | null {
@@ -1332,7 +1332,7 @@ async function entryPage(env: Env, req: Request, url: URL, who: Who, tab: string
     userVerification: 'required',
     timeout: CHALLENGE_MS,
   }
-  const label = tabsConfig(env.TABS)[tab]?.label || tab.charAt(0).toUpperCase() + tab.slice(1)
+  const label = tabsConfig(tabsText(env))[tab]?.label || tab.charAt(0).toUpperCase() + tab.slice(1)
   // JSON inside a non-executed script element: "<" escaped so nothing can close the element
   // Face ID opens by itself only on a navigation from the portal itself or a typed address / home-screen app
   const site = req.headers.get('Sec-Fetch-Site')
@@ -1449,7 +1449,7 @@ async function tabsMenu(env: Env, who: Who, url: URL) {
     selector,
     current: cur === 'conta' || (cur && tabs.includes(cur)) ? cur : null,
     tabs: tabs.map((t, i) => {
-      const c = tabsConfig(env.TABS)[t]
+      const c = tabsConfig(tabsText(env))[t]
       return { id: t, path: `/${t}/`, label: c?.label ?? null, hint: c?.hint ?? null, icon: c?.icon ?? null, badge: badges[i], entry: policyOf(t).entry }
     }),
     // the header line of the list: this person's own name and group, nothing about anyone else;
@@ -1567,7 +1567,7 @@ async function routeTab(req: Request, env: Env, url: URL, tab: string): Promise<
 
 // ------------------------------------------------------------------ commands (docs/COMMANDS.md)
 // The tab's actions, from its configuration (validated in tabs.ts; a bad catalog drops the tab).
-const catalogOf = (env: Env, tab: string): Catalog => tabsConfig(env.TABS)[tab]?.commands ?? {}
+const catalogOf = (env: Env, tab: string): Catalog => tabsConfig(tabsText(env))[tab]?.commands ?? {}
 
 // identity.actions and every command use the same rule: this session's own last Face ID, from the
 // portal (passkey_at) or from a tab page (command_passkey_at, only for commands of that same tab).
@@ -2257,7 +2257,7 @@ const READ_FAIL_PER_IP = 30
 
 const bearerOf = (req: Request) => /^Bearer (\S+)$/.exec(req.headers.get('Authorization') ?? '')?.[1] ?? ''
 const carriesReadKey = (req: Request) => (req.headers.get('Authorization') ?? '').includes(READ_KEY_PREFIX)
-const readKeyTabs = (env: Env) => Object.keys(tabBindings(env)).filter((t) => tabsConfig(env.TABS)[t]?.readKey)
+const readKeyTabs = (env: Env) => Object.keys(tabBindings(env)).filter((t) => tabsConfig(tabsText(env))[t]?.readKey)
 
 async function readKeyRequest(req: Request, env: Env, url: URL): Promise<Response> {
   const raw = bearerOf(req)
@@ -2286,7 +2286,7 @@ async function readKeyRequest(req: Request, env: Env, url: URL): Promise<Respons
   if (!groups.some((g) => g.id === OWNER_GROUP && g.is_admin)) return refuse('not_owner', pid)
   // scope: GET, the key's own tab, one of its readKey paths; anything else (POST, _cmd, _passkey,
   // /api, /conta, another tab) is refused with the key known
-  const policy = tabsConfig(env.TABS)[tab]?.readKey
+  const policy = tabsConfig(tabsText(env))[tab]?.readKey
   const service = tabService(env, tab)
   const sub = url.pathname.startsWith(`/${tab}/`) ? url.pathname.slice(tab.length + 1) : null
   if (req.method !== 'GET' || !policy || !service || sub === null || !policy.paths.includes(sub) || isUpgrade(req))
@@ -2334,8 +2334,8 @@ async function listReadKeys(env: Env, who: Who) {
   const owner = who.groups.some((g) => g.id === OWNER_GROUP)
   return {
     // uses today (UTC-3 day); the counters of an older day mean none today
-    keys: keys.results.map(({ use_day, use_day_n, ...k }) => ({ ...k, today: use_day === brasiliaDay() ? Number(use_day_n) : 0, day_alert: tabsConfig(env.TABS)[String(k.tab)]?.readKey?.dayAlert ?? READ_KEY_DAY_ALERT })),
-    available: owner ? readKeyTabs(env).filter((t) => canOpen(who, t)).map((t) => ({ tab: t, label: tabsConfig(env.TABS)[t]?.label ?? null, paths: tabsConfig(env.TABS)[t]!.readKey!.paths })) : [],
+    keys: keys.results.map(({ use_day, use_day_n, ...k }) => ({ ...k, today: use_day === brasiliaDay() ? Number(use_day_n) : 0, day_alert: tabsConfig(tabsText(env))[String(k.tab)]?.readKey?.dayAlert ?? READ_KEY_DAY_ALERT })),
+    available: owner ? readKeyTabs(env).filter((t) => canOpen(who, t)).map((t) => ({ tab: t, label: tabsConfig(tabsText(env))[t]?.label ?? null, paths: tabsConfig(tabsText(env))[t]!.readKey!.paths })) : [],
     day_alert: READ_KEY_DAY_ALERT,
   }
 }
@@ -2529,7 +2529,7 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    tabsConfig(env.TABS) // policyOf() reads what this loads
+    tabsConfig(tabsText(env)) // policyOf() reads what this loads
     try {
       return await handle(req, env)
     } catch (e) {

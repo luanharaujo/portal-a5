@@ -166,6 +166,16 @@ function parseReadKey(v: unknown): ReadKeyPolicy | null {
   return { paths: [...new Set(o.paths as string[])], perHour: n, dayAlert: d }
 }
 
+// The configuration arrives in pieces (TABS, TABS_2, ... up to TABS_9) because Cloudflare caps
+// each text variable at about 5 KB; scripts/make_config.py splits it and this joins it back.
+export function tabsText(env: object): string | undefined {
+  const v = env as Record<string, unknown>
+  if (typeof v.TABS !== 'string') return undefined
+  let s = v.TABS
+  for (let n = 2; n <= 9 && typeof v['TABS_' + n] === 'string'; n++) s += v['TABS_' + n] as string
+  return s
+}
+
 // The router reads the configuration once per isolate (re-parsed only if the variable changes).
 let loadedRaw: string | undefined
 let loaded: Record<string, TabConfig> = {}

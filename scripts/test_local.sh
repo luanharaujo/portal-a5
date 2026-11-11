@@ -52,8 +52,10 @@ cat > "$STATE/tabs.json" <<'EOF2'
   "tab-nopolicy": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "No policy"}
 }
 EOF2
-python3 scripts/make_config.py "$STATE/tabs.json" > "$TESTCFG" 2>/dev/null
+# a small TABS_CHUNK splits the test config into TABS, TABS_2...: the worker must join them
+TABS_CHUNK=700 python3 scripts/make_config.py "$STATE/tabs.json" > "$TESTCFG" 2>/dev/null
 grep -q '^TABS = "{\\"tab-a' "$TESTCFG" || { echo "FAIL could not write the test config"; exit 1; }
+grep -q '^TABS_3 = ' "$TESTCFG" || { echo "FAIL the test config was not split"; exit 1; }
 
 npx wrangler d1 migrations apply portal_a5 --local --persist-to "$STATE" >/dev/null
 # residents see the first test tab (a fresh database gives them none)

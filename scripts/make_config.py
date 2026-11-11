@@ -28,7 +28,15 @@ for tab, c in tabs.items():
     services.append(f'\n[[services]]\nbinding = "{binding}"\nservice = "{service}"\nentrypoint = "{entry}"\n')
 
 assert len(re.findall(r'^TABS = .*$', s, flags=re.M)) == 1, 'wrangler.toml needs exactly one TABS line'
-# a JSON string is a valid TOML basic string
-s = re.sub(r'^TABS = .*$', lambda m: 'TABS = ' + json.dumps(json.dumps(config, ensure_ascii=True)), s, flags=re.M)
+# Cloudflare caps a text variable at about 5 KB, so the JSON goes in pieces: TABS, TABS_2, TABS_3...
+# The worker joins them in order before parsing (src/tabs.ts, tabsText). TABS_CHUNK lets the tests
+# force a split. A JSON string is a valid TOML basic string.
+raw = json.dumps(config, ensure_ascii=True, separators=(',', ':'))
+size = int(os.environ.get('TABS_CHUNK', '4000'))
+assert 100 <= size <= 4500, 'TABS_CHUNK out of range'
+parts = [raw[i:i + size] for i in range(0, len(raw), size)]
+assert 1 <= len(parts) <= 9, 'tabs configuration too large'
+lines = ['TABS = ' + json.dumps(parts[0])] + [f'TABS_{n} = ' + json.dumps(p) for n, p in enumerate(parts[1:], 2)]
+s = re.sub(r'^TABS = .*$', lambda m: '\n'.join(lines), s, flags=re.M)
 sys.stdout.write(s + ''.join(services))
 print(f'tabs: {", ".join(config) or "none"}', file=sys.stderr)
