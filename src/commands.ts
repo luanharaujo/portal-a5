@@ -4,11 +4,12 @@
 // Each tab declares its actions in the TABS configuration (`commands`). The portal checks the
 // action, every parameter, the level and its own rate limits before the tab ever sees the call;
 // the tab's machine bridge checks all of it again against its own closed list.
-// There is no free text, except one narrow door: a `text` parameter, only on keyWriteOnly actions of a
-// tab whose configuration says `textParams: true` (a tab that keeps the text as data, with no bridge
-// that runs anything). The value is checked here for size and control characters and never leaves
-// the tab: the audit and the commands table keep its length only. With `letters: true` the text is
-// narrower still: normalized (NFC, spaces collapsed) and made of letters and spaces only.
+// There is no free text, except one narrow door: a `text` parameter, only in a tab whose configuration
+// says `textParams: true` (a tab that keeps the text as data, with no bridge that runs anything), and
+// only on a keyWriteOnly action or on a page-only action (no key, no screen, not sensitive, no
+// windowOnly). The value is checked here for size and control characters and never leaves the tab:
+// the audit and the commands table keep its length only. `min` sets a smallest size; with
+// `letters: true` the text is narrower still: normalized (NFC, spaces collapsed), letters and spaces only.
 
 export type Level = 'common' | 'admin' | 'sensitive'
 
@@ -16,7 +17,7 @@ export type ParamSpec =
   | { enum: string[] }
   | { int: [number, number] }
   | { bool: true }
-  | { text: number; letters?: true }
+  | { text: number; letters?: true; min?: number }
 
 export interface CommandSpec {
   level: Level
@@ -69,6 +70,12 @@ function parseParam(v: unknown): ParamSpec | null {
   if (keys.length === 2 && keys.includes('text') && keys.includes('letters')) {
     if (v.letters !== true || typeof v.text !== 'number' || !Number.isSafeInteger(v.text) || v.text < 1 || v.text > TEXT_MAX) return null
     return { text: v.text, letters: true }
+  }
+  // and {"text": N, "min": M}, 1 <= M <= N, both counted in code points
+  if (keys.length === 2 && keys.includes('text') && keys.includes('min')) {
+    if (typeof v.text !== 'number' || !Number.isSafeInteger(v.text) || v.text < 1 || v.text > TEXT_MAX) return null
+    if (typeof v.min !== 'number' || !Number.isSafeInteger(v.min) || v.min < 1 || v.min > v.text) return null
+    return { text: v.text, min: v.min }
   }
   if (keys.length !== 1) return null
   if (Array.isArray(v.enum)) {
@@ -138,8 +145,10 @@ function parseSpec(v: unknown): CommandSpec | null {
   if (v.keyWriteOnly === true &&
     (v.shortcut === false || level === 'sensitive' || v.passkey != null || v.screens === true || v.returns != null)) return null
 
-  // free text only in a write-only action (the key answers {ok, id}; nothing reads it back)
-  if (Object.values(params).some((p) => 'text' in p) && v.keyWriteOnly !== true) return null
+  // free text only in a write-only action (the key answers {ok, id}; nothing reads it back) or in an
+  // action only the tab's own page sends: never a key, never a screen, never sensitive, never windowOnly
+  if (Object.values(params).some((p) => 'text' in p) && v.keyWriteOnly !== true &&
+    (v.shortcut !== false || v.screens === true || level === 'sensitive' || v.windowOnly != null)) return null
   if (v.windowOnly != null && (v.windowOnly !== true || v.passkey == null || v.keyWriteOnly === true)) return null
 
   // "<n>m", 1 to 60 minutes, on common or admin actions; it rules out screens and keys, so asking
@@ -204,7 +213,7 @@ export function checkParams(spec: CommandSpec, raw: unknown): { params: Record<s
       continue
     } else if ('text' in p) {
       // letters, digits and punctuation; line breaks and tabs are fine, other control characters are not
-      if (typeof val !== 'string' || [...val].length > p.text || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/.test(val) || /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(val)) return { error: 'bad_param' }
+      if (typeof val !== 'string' || [...val].length > p.text || [...val].length < (p.min ?? 0) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]/.test(val) || /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(val)) return { error: 'bad_param' }
     } else if ('int' in p) {
       if (typeof val !== 'number' || !Number.isSafeInteger(val) || val < p.int[0] || val > p.int[1]) return { error: 'bad_param' }
     } else if (typeof val !== 'boolean') return { error: 'bad_param' }
@@ -304,6 +313,8 @@ export function refusal(tab: string, action: string, spec: CommandSpec, c: Calle
     return null
   }
   if (c.credential === 'screen') return spec.level === 'common' && spec.screens ? null : 'not_for_screens'
+  // "see as" never sends free text, not even simulated: the owner's words stay out of a rehearsal
+  if (c.rehearsal && hasText(spec)) return 'not_in_rehearsal'
   if (spec.level !== 'common' && !c.admin) return 'admin_only'
   if (spec.level === 'admin' && !(c.adminFresh || c.strong)) return 'passkey_required'
   if (spec.level === 'sensitive' && !c.strong) return 'passkey_required'

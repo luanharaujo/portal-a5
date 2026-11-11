@@ -34,8 +34,10 @@ cat > "$STATE/tabs.json" <<'EOF2'
               "wipe": {"level": "sensitive"},
               "limit": {"level": "common", "passkey": "5m", "params": {"on": {"bool": true}, "top": {"int": [10, 60]}}, "perHour": 30,
                         "screens": false, "shortcut": false, "returns": ["state"]},
-              "note": {"level": "common", "keyWriteOnly": true}
-            }},
+              "note": {"level": "common", "keyWriteOnly": true},
+              "annotate": {"level": "admin", "params": {"n": {"int": [1, 2147483647]}, "words": {"text": 140, "min": 1}}, "perHour": 60, "screens": false, "shortcut": false, "returns": ["id"]},
+              "annotate_del": {"level": "admin", "params": {"n": {"int": [1, 2147483647]}}, "perHour": 60, "screens": false, "shortcut": false, "returns": ["id"]}
+            }, "textParams": true},
   "tab-b": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab B", "icon": "mic",
             "allow": ["microphone", "screen-wake-lock"], "entry": "passkey", "entryHours": 4,
             "credentials": ["browser", "machine"], "serviceWorker": false, "readKey": {"paths": ["/echo", "/audit"], "perHour": 8},

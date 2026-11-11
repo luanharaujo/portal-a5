@@ -385,6 +385,7 @@ window.T = {
     bad_param: 'Valor inválido para este comando.',
     not_for_screens: 'Esta tela não pode mandar esse comando.',
     not_for_shortcuts: 'Esse comando não vale para atalhos.',
+    not_in_rehearsal: 'No ensaio esse comando não vale.',
     read_key_scope: 'Essa chave só lê os dados da aba.',
     owner_only: 'Só o dono cria essa chave.',
     bad_tab: 'Escolha uma aba.',

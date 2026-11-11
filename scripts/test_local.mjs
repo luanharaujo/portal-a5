@@ -877,6 +877,28 @@ check('refusal audited with its reason', !!refRow, refRow)
   await owner.req('DELETE', `/api/me/shortcuts/${kl.data.id}`)
 }
 
+// page-only text (owner's note on a row, 11/11): the owner's page sends it, no key, no screen, length only in the audit
+{
+  check('freshen owner (page text)', await freshen(owner, auth))
+  const n0 = (await cmdLog()).length
+  const ok1 = await cmd(owner, 'tab-a', 'annotate', { n: 7, words: 'Lunch at the fair' })
+  check('page text: owner sends it = 200', ok1.status === 200 && ok1.data.status === 'done', ok1)
+  const last = (await cmdLog()).at(-1)
+  check('page text: the tab got the text as sent', (await cmdLog()).length === n0 + 1 && last.cmd.action === 'annotate' && last.cmd.params.words === 'Lunch at the fair' && last.cmd.params.n === 7, last)
+  check('page text: delete sends', (await cmd(owner, 'tab-a', 'annotate_del', { n: 7 })).status === 200)
+  const n1 = (await cmdLog()).length
+  for (const [label, params] of [['empty', { n: 7, words: '' }], ['141', { n: 7, words: 'a'.repeat(141) }], ['NUL', { n: 7, words: 'a\u0000b' }],
+    ['U+2028', { n: 7, words: 'a\u2028b' }], ['lone surrogate', { n: 7, words: 'a\ud800b' }], ['not a string', { n: 7, words: 5 }]])
+    check(`page text: ${label} = 400 bad_param`, (await cmd(owner, 'tab-a', 'annotate', params)).data?.error === 'bad_param')
+  check('page text: extra param = 400 unknown_param', (await cmd(owner, 'tab-a', 'annotate', { n: 7, words: 'ok', kind: 'work' })).data?.error === 'unknown_param')
+  check('page text: refusals never reached the tab', (await cmdLog()).length === n1)
+  const au = (await owner.req('GET', '/api/admin/audit')).data.find((r) => r.action === 'command' && r.target === 'tab-a/annotate')
+  check('page text: audit keeps the length only', au && JSON.parse(au.detail).params.words === '[text:17]' && !String(au.detail).includes('fair'), au)
+  for (const a of ['annotate', 'annotate_del'])
+    check(`page text: no key may hold ${a}`, (await owner.req('POST', '/api/me/shortcuts', { label: 'x', scope: [`tab-a/${a}`] })).status === 400)
+  check('page text: a resident cannot send it', (await cmd(resident, 'tab-a', 'annotate', { n: 7, words: 'x' })).status === 403)
+}
+
 // common action with its own passkey window (TV volume limiter, 08/11): Face ID every time, residents too
 {
   const lim = { on: true, top: 30 }
@@ -1154,6 +1176,7 @@ await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident
   const vid = (await owner.req('GET', '/tab-a/echo', undefined, CORS)).data.identity
   check('see as: the tab gets a resident identity (groups, common actions only)', vid.person === ownerId && vid.groups.join() === 'residents' &&
     vid.actions.join() === 'tv,ac,light,slow,boom,limit,note', vid)
+  check('see as: a page-only text action is refused before the tab', (await cmd(owner, 'tab-a', 'annotate', { n: 7, words: 'x' })).status === 403)
   const vp = await cmd(owner, 'tab-a', 'presence', { state: 'home' })
   check('see as: admin command refused', vp.status === 403 && vp.data.error === 'admin_only', vp)
   check('see as: sensitive command refused', (await cmd(owner, 'tab-a', 'wipe')).data.error === 'admin_only')

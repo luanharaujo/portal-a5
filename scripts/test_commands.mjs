@@ -236,5 +236,48 @@ check('letters: not a string refused', nm(5) === 'bad_param' && nm(null) === 'ba
 check('letters: audit keeps the length only', redactParams(lt.provisional, call('Corner Bakery').params).name === '[text:13]')
 check('letters: unknown param refused', checkParams(lt.provisional, { ...call('X').params, extra: 1 }).error === 'unknown_param')
 
+// Page-only text (owner's note on a row, 11/11): {text, min}, shortcut false, no screens, not sensitive, no windowOnly
+const pg = parseCatalog({
+  annotate: { level: 'admin', params: { n: { int: [1, 2147483647] }, words: { text: 140, min: 1 } }, perHour: 60, screens: false, shortcut: false, returns: ['id'] },
+  annotate_del: { level: 'admin', params: { n: { int: [1, 2147483647] } }, perHour: 60, screens: false, shortcut: false, returns: ['id'] },
+  memo: { level: 'common', params: { t: { text: 20 } }, shortcut: false },
+  pg_shortcut: { level: 'admin', params: { t: { text: 20 } }, shortcut: true },
+  pg_default: { level: 'admin', params: { t: { text: 20 } } },
+  pg_screen: { level: 'common', params: { t: { text: 20 } }, shortcut: false, screens: true },
+  pg_sensitive: { level: 'sensitive', params: { t: { text: 20 } }, shortcut: false },
+  pg_window: { level: 'common', passkey: '5m', windowOnly: true, params: { t: { text: 20 } }, shortcut: false },
+  min_zero: { level: 'admin', params: { t: { text: 20, min: 0 } }, shortcut: false },
+  min_over: { level: 'admin', params: { t: { text: 20, min: 21 } }, shortcut: false },
+  min_float: { level: 'admin', params: { t: { text: 20, min: 1.5 } }, shortcut: false },
+  min_str: { level: 'admin', params: { t: { text: 20, min: '1' } }, shortcut: false },
+  min_letters: { level: 'admin', params: { t: { text: 20, min: 1, letters: true } }, shortcut: false },
+  min_alone: { level: 'admin', params: { t: { min: 1 } }, shortcut: false },
+  min_other: { level: 'admin', params: { t: { text: 20, max: 1 } }, shortcut: false },
+})
+check('page text: only page-only actions with a sane spec stay', Object.keys(pg).sort().join() === 'annotate,annotate_del,memo', Object.keys(pg))
+check('page text: spec kept', pg.annotate.params.words.text === 140 && pg.annotate.params.words.min === 1 && !pg.annotate.shortcut && !pg.annotate.screens && !pg.annotate.keyWriteOnly && hasText(pg.annotate))
+check('page text: strict catalog with a bad one is refused whole', parseCatalogStrict({ annotate: { level: 'admin', params: { words: { text: 140, min: 1 } }, shortcut: false }, bad: { level: 'admin', params: { t: { text: 20 } } } }) === null)
+const ann = (words, extra = {}) => { const r = checkParams(pg.annotate, { n: 7, words, ...extra }); return 'params' in r ? r.params.words : r.error }
+check('page text: ok, kept as sent', ann('Lunch with the festival client') === 'Lunch with the festival client' && ann('x') === 'x')
+check('page text: 140 code points ok, 141 refused', ann('😀'.repeat(140)) === '😀'.repeat(140) && ann('a'.repeat(141)) === 'bad_param')
+check('page text: empty refused (min 1)', ann('') === 'bad_param')
+check('page text: control refused', ann('a\u0000b') === 'bad_param' && ann('a\u2028b') === 'bad_param' && ann('a\u001bb') === 'bad_param' && ann('a\u2029b') === 'bad_param')
+check('page text: lone surrogate refused', ann('a\ud800b') === 'bad_param' && ann('a\udc00') === 'bad_param')
+check('page text: not a string refused', ann(5) === 'bad_param' && ann(null) === 'bad_param')
+check('page text: extra param refused', ann('ok', { kind: 'work' }) === 'unknown_param')
+check('page text: min counted in code points', checkParams({ ...pg.annotate, params: { words: { text: 10, min: 2 } } }, { words: '😀' }).error === 'bad_param' &&
+  'params' in checkParams({ ...pg.annotate, params: { words: { text: 10, min: 2 } } }, { words: '😀😀' }))
+check('page text: audit keeps the length only', redactParams(pg.annotate, { n: 7, words: 'Owner secret note' }).words === '[text:17]' && redactParams(pg.annotate, { n: 7, words: 'x' }).n === 7)
+const ownerRehearsal = { ...ownerDevice, admin: false, rehearsal: true }
+check('page text: owner browser may run both', refusal('f', 'annotate', pg.annotate, ownerDevice) === null && refusal('f', 'annotate_del', pg.annotate_del, ownerDevice) === null)
+for (const a of ['annotate', 'annotate_del']) {
+  check(`page text: no key gets ${a} (refusal)`, refusal('f', a, pg[a], key([`f/${a}`])) === 'not_for_shortcuts' && refusal('f', a, pg[a], kPK([`f/${a}`])) === 'not_for_shortcuts')
+  check(`page text: no key holds ${a} (scope, any tab kind)`, checkScope([`f/${a}`], { f: pg }, true, PK) === null && checkScope([`f/${a}`], { f: pg }, true, new Set()) === null)
+  check(`page text: no screen sends ${a}`, refusal('f', a, pg[a], { credential: 'screen', admin: false, strong: false, adminFresh: false, scope: null }) === 'not_for_screens')
+  check(`page text: not while seeing as (${a})`, refusal('f', a, pg[a], ownerRehearsal) !== null && !allowedActions('f', pg, ownerRehearsal).includes(a))
+}
+check('page text: a common text action is refused while seeing as', refusal('f', 'memo', pg.memo, { ...ownerDevice, rehearsal: true }) === 'not_in_rehearsal' &&
+  !allowedActions('f', pg, { ...ownerDevice, rehearsal: true }).includes('memo') && refusal('f', 'memo', pg.memo, ownerDevice) === null)
+
 console.log(failures ? `\n${failures} FAILED` : '\nall ok')
 process.exit(failures ? 1 : 0)
