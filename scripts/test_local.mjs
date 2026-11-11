@@ -1125,7 +1125,16 @@ await owner.req('POST', '/api/admin/pair', { code: ps3.data.code, name: 'TV brow
 await tv3.req('POST', '/api/pair/status', { secret: ps3.data.secret })
 check('screen for the browser test paired', !!tv3.cookie)
 // a fresh Face ID check on the owner's session (the software passkey)
-const strongNow = async () => owner.req('POST', '/api/passkey/get/verify', await auth.get((await owner.req('POST', '/api/passkey/get/options', {})).data))
+// The page may ask for its own options at the same moment (it keeps them ready for the Face ID button), which
+// replaces this session's challenge: try again until the check lands.
+const strongNow = async () => {
+  for (let i = 0; i < 4; i++) {
+    const r = await owner.req('POST', '/api/passkey/get/verify', await auth.get((await owner.req('POST', '/api/passkey/get/options', {})).data))
+    if (r.status === 200) return r
+    console.log(`note: strong check try ${i + 1} = ${r.status} ${r.data?.error ?? ''}`)
+    await new Promise((res) => setTimeout(res, 300))
+  }
+}
 await browserChecks({ base: BASE, check, owner: owner.cookie, resident: resident.cookie, screen: tv3.cookie, strong: strongNow,
   approve: async (code) => check('browser pairing approved', (await owner.req('POST', '/api/admin/pair', { code, name: 'TV deep link' })).status === 200) })
 {
