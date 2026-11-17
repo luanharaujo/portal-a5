@@ -6,6 +6,7 @@
 #   portal-a5-cloudflare          API token (Workers Scripts: Edit + D1: Edit, this account only)
 #   portal-a5-robot-key          ROBOT_LOGIN_KEY ("pa5_robo_" + 32 random bytes)
 #   portal-a5-owner-phone       OWNER_PHONE (digits, country code first)
+#   github-webhook-actions      GITHUB_WEBHOOK_SECRET (optional; GitHub App webhook)
 # The account id (not a secret, but kept out of git) comes from CLOUDFLARE_ACCOUNT_ID or from
 # the git-ignored file .deploy.local (a line CLOUDFLARE_ACCOUNT_ID=<id>).
 # Secrets go to wrangler through stdin only: never arguments, never files.
@@ -149,6 +150,12 @@ VERSION="$(sed -n 's/.*Current Version ID: *//p' .deploy/last_deploy.txt | head 
 kc portal-a5-robot-key | grep -q '^pa5_robo_' || { echo "robot key must start with pa5_robo_" >&2; exit 1; }
 kc portal-a5-robot-key | npx wrangler secret put ROBOT_LOGIN_KEY -c "$CFG" >/dev/null
 kc portal-a5-owner-phone | npx wrangler secret put OWNER_PHONE -c "$CFG" >/dev/null
+# GitHub App webhook secret (POST /_hooks/github); the route answers 503 until it is set
+if security find-generic-password -s github-webhook-actions -w >/dev/null 2>&1; then
+  kc github-webhook-actions | npx wrangler secret put GITHUB_WEBHOOK_SECRET -c "$CFG" >/dev/null
+else
+  echo "note: no Keychain item github-webhook-actions; /_hooks/github stays off" >&2
+fi
 printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$COMMIT" "$VERSION" >> .deploy/deployed.log
 
 # 6. live only when the public page, fetched without cache, names the new files and each one

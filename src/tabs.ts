@@ -47,7 +47,7 @@ export interface TabService {
 }
 
 // Names a tab can never take: portal pages and routes living at /<name>/.
-export const RESERVED_TABS = ['api', 'robo', 'conta', 'locale', 'vendor']
+export const RESERVED_TABS = ['api', 'robo', 'conta', 'locale', 'vendor', 'github']
 
 // The shared tab selector every tab page may load. These exact files (and /api/tabs) are the
 // only portal paths a tab page may script from or connect to.

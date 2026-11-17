@@ -6,6 +6,7 @@
 //   strong session  the same session after a passkey check (Face ID / Touch ID).
 //                   Every admin write needs a passkey check from the last 5 minutes.
 
+export { GithubHook } from './github_hook'
 import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
 import {
   type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
@@ -36,6 +37,9 @@ export interface Env {
   // 'refuse' (default): an agent request (and its approval) only counts when the agent calls from
   // home, the last address of a live machine key; 'warn': allowed, flagged in red to the admin.
   AGENT_HOME?: string
+  GITHUB_HOOK?: DurableObjectNamespace
+  // secret of the GitHub App webhook (HMAC-SHA256 of the raw body, header X-Hub-Signature-256)
+  GITHUB_WEBHOOK_SECRET?: string
   [binding: string]: unknown
 }
 
@@ -51,6 +55,10 @@ const BADGE_TIMEOUT_MS = 300
 const BADGE_CACHE_MS = 60e3
 const ACCOUNT_PATH = '/conta/'
 const MACHINE_KEY_PREFIX = 'pa5_maq_'
+// built-in bridge with no tab behind it: /_bridge/github reaches the GithubHook object
+const GITHUB_BRIDGE = 'github'
+const HOOK_MAX_BODY = 1_000_000
+const HOOK_FAIL_PER_IP = 30, HOOK_PER_HOUR = 600
 const AGENT_KEY_PREFIX = 'pa5_adm_'
 const AGENT_PAIR_MINUTES = 15
 const AGENT_PENDING_MAX = 5
@@ -491,8 +499,10 @@ async function listMachines(env: Env) {
 async function addMachine(env: Env, req: Request, who: Who) {
   const b = await body(req)
   const tab = String(b.tab ?? '')
-  if (!tabBindings(env)[tab]) throw new HttpError(400, 'unknown_tab')
-  if (!policyOf(tab).credentials.includes('machine')) throw new HttpError(409, 'tab_takes_no_machine')
+  if (tab !== GITHUB_BRIDGE) {
+    if (!tabBindings(env)[tab]) throw new HttpError(400, 'unknown_tab')
+    if (!policyOf(tab).credentials.includes('machine')) throw new HttpError(409, 'tab_takes_no_machine')
+  }
   const label = text(b.label, 40)
   if (!label) throw new HttpError(400, 'name_required')
   const key = MACHINE_KEY_PREFIX + randomToken(32)
@@ -512,8 +522,9 @@ async function revokeMachine(env: Env, req: Request, who: Who, id: number) {
 
 // GET /_bridge/<tab> with Upgrade: websocket and X-A5-Machine-Key. The key opens one tab only.
 async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
-  const service = tabService(env, tab)
-  if (!service || !policyOf(tab).credentials.includes('machine')) throw new HttpError(404, 'not_found')
+  const builtin = tab === GITHUB_BRIDGE
+  const service = builtin ? null : tabService(env, tab)
+  if (builtin ? !env.GITHUB_HOOK : !service || !policyOf(tab).credentials.includes('machine')) throw new HttpError(404, 'not_found')
   if (req.method !== 'GET' || !isUpgrade(req)) throw new HttpError(426, 'websocket_required')
   const key = req.headers.get('X-A5-Machine-Key') ?? ''
   const refuse = async (reason: string) => {
@@ -542,7 +553,39 @@ async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
     credential: 'machine', person: null, name: String(m.label), groups: [], session: null, machine: id, shortcut: null,
     strong: false, entered_at: null, entry_until: null, admin_until: null, actions: [], passkey_until: {},
   }
-  return forwardSocket(env, req, service, tab, identity, null)
+  if (builtin) return env.GITHUB_HOOK!.get(env.GITHUB_HOOK!.idFromName('main')).fetch(new Request(req.url, { method: 'GET', headers: { Upgrade: 'websocket' } }))
+  return forwardSocket(env, req, service!, tab, identity, null)
+}
+
+// POST /_hooks/github: the GitHub App webhook. Signature first (HMAC-SHA256 of the raw body, compared
+// in constant time by subtle.verify); only workflow_run/completed (and ping) pass. Nothing of the body
+// is kept or forwarded: the Mac gets {"t":"actions"} and nothing else.
+async function githubHook(req: Request, env: Env): Promise<Response> {
+  const secret = env.GITHUB_WEBHOOK_SECRET ?? ''
+  if (secret.length < 16 || !env.GITHUB_HOOK) throw new HttpError(503, 'not_configured')
+  if (req.method !== 'POST') throw new HttpError(405, 'post_only')
+  const bad = async () => {
+    if (!(await underLimit(env, `hook-fail-ip:${clientIp(req)}`, HOOK_FAIL_PER_IP))) throw new HttpError(429, 'too_many_attempts')
+    throw new HttpError(401, 'bad_signature')
+  }
+  const len = Number(req.headers.get('Content-Length') ?? '0')
+  if (len > HOOK_MAX_BODY) throw new HttpError(413, 'too_large')
+  const sig = /^sha256=([0-9a-f]{64})$/.exec(req.headers.get('X-Hub-Signature-256') ?? '')
+  if (!sig) return bad()
+  const raw = await req.arrayBuffer()
+  if (raw.byteLength > HOOK_MAX_BODY) throw new HttpError(413, 'too_large')
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+  const mac = Uint8Array.from(sig[1].match(/../g)!, (h) => parseInt(h, 16))
+  if (!(await crypto.subtle.verify('HMAC', key, mac, raw))) return bad()
+  const event = req.headers.get('X-GitHub-Event')
+  if (event === 'ping') return json({ ok: true })
+  if (event !== 'workflow_run') return json({ ok: true, ignored: true })
+  let action: unknown = null
+  try { action = (JSON.parse(new TextDecoder().decode(raw)) as { action?: unknown }).action } catch { /* not JSON: ignored */ }
+  if (action !== 'completed') return json({ ok: true, ignored: true })
+  if (!(await underLimit(env, 'hook-total', HOOK_PER_HOUR))) throw new HttpError(429, 'too_many_events')
+  await env.GITHUB_HOOK.get(env.GITHUB_HOOK.idFromName('main')).fetch('https://hook/notify', { method: 'POST' })
+  return json({ ok: true })
 }
 
 // ------------------------------------------------------------------ login (browser side)
@@ -993,6 +1036,7 @@ async function me(env: Env, who: Who) {
     rehearsal: !!who.viewAs,
     tabs: who.tabs.has('*') ? Object.keys(tabBindings(env)) : [...who.tabs],
     all_tabs: who.admin ? Object.keys(tabBindings(env)) : [],
+    bridge_only: who.admin && env.GITHUB_HOOK ? [GITHUB_BRIDGE] : [],
     screen_tabs: who.admin ? Object.keys(tabBindings(env)).filter((t) => policyOf(t).credentials.includes('screen')) : [],
     session_id: who.sessionId,
     credential: who.kind,
@@ -2375,6 +2419,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
   // a read key is answered on its own path and nowhere else (cookies ignored)
   if (carriesReadKey(req)) return readKeyRequest(req, env, url)
+  if (path === '/_hooks/github') return githubHook(req, env)
+  if (path.startsWith('/_hooks')) throw new HttpError(404, 'not_found')
   if (path === '/robo/login' && m === 'POST') return robotLogin(req, env)
   if (path.startsWith('/robo/')) throw new HttpError(404, 'not_found')
   let mb: RegExpMatchArray | null

@@ -519,6 +519,44 @@ rows = (await owner.req('GET', '/api/admin/audit')).data
 check('audit has bridge_connected and bridge_refused', rows.some((a) => a.action === 'bridge_connected') && rows.some((a) => a.action === 'bridge_refused'))
 check('owner revokes the machine key', (await owner.req('DELETE', `/api/admin/machines/${mk.data.id}`)).status === 200)
 check('revoked key = 401', (await upgradeStatus('/_bridge/tab-a', KEY)) === 401)
+
+// GitHub webhook -> Mac (built-in bridge, no tab behind it)
+{
+  const HS = process.env.HOOK_SECRET
+  const hk = await owner.req('POST', '/api/admin/machines', { tab: 'github', label: 'Mac · github' })
+  check('github machine key created', hk.status === 200 && /^pa5_maq_/.test(hk.data.key), hk.data)
+  check('github is a reserved tab name', (await owner.req('GET', '/api/me')).data.bridge_only?.[0] === 'github')
+  const GK = { 'X-A5-Machine-Key': hk.data.key }
+  check('github bridge: tab-a key refused', (await upgradeStatus('/_bridge/github', KEY)) === 401)
+  check('github bridge: no key = 401', (await upgradeStatus('/_bridge/github', {})) === 401)
+  check('github bridge: key does not open tab-a', (await upgradeStatus('/_bridge/tab-a', GK)) === 401)
+  check('github bridge: without upgrade = 426', (await rawGet('/_bridge/github', GK)).status === 426)
+  const hmac = async (body, secret = HS) => 'sha256=' + Buffer.from(await wc.subtle.sign('HMAC', await wc.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), new TextEncoder().encode(body))).toString('hex')
+  const post = async (event, payload, sig) => {
+    const body = JSON.stringify(payload)
+    return fetch(BASE + '/_hooks/github', { method: 'POST', body, headers: { 'Content-Type': 'application/json', 'X-GitHub-Event': event, ...(sig === null ? {} : { 'X-Hub-Signature-256': sig ?? (await hmac(body)) }) } })
+  }
+  const msgs = []
+  const gws = new WebSocket(WS_BASE + '/_bridge/github', { headers: GK })
+  gws.onmessage = (e) => msgs.push(String(e.data))
+  await new Promise((r) => { gws.onopen = r; setTimeout(r, 4000) })
+  const waitMsgs = async (n) => { for (let i = 0; i < 30 && msgs.length < n; i++) await new Promise((r) => setTimeout(r, 100)) }
+  check('webhook: wrong signature = 401', (await post('workflow_run', { action: 'completed' }, await hmac('{"action":"completed"}', 'other_secret_value'))).status === 401)
+  check('webhook: no signature = 401', (await post('workflow_run', { action: 'completed' }, null)).status === 401)
+  check('webhook: malformed signature = 401', (await post('workflow_run', { action: 'completed' }, 'sha256=zz')).status === 401)
+  check('webhook: GET = 405 or 401', [401, 405].includes((await fetch(BASE + '/_hooks/github')).status))
+  check('webhook: ping = 200, nothing sent', (await post('ping', { zen: 'x' })).status === 200 && msgs.length === 0, msgs)
+  check('webhook: other event ignored', (await post('push', { ref: 'x' })).status === 200 && msgs.length === 0, msgs)
+  check('webhook: workflow_run requested ignored', (await post('workflow_run', { action: 'requested' })).status === 200 && msgs.length === 0, msgs)
+  const ok = await post('workflow_run', { action: 'completed', repository: { full_name: 'someone/secret-repo' } })
+  await waitMsgs(1)
+  check('webhook: valid completed = 200 and one bare notice', ok.status === 200 && msgs.length === 1 && msgs[0] === '{"t":"actions"}', msgs)
+  gws.close()
+  await new Promise((r) => setTimeout(r, 300))
+  check('webhook: no listener = still 200 (dropped)', (await post('workflow_run', { action: 'completed' })).status === 200)
+  check('webhook: other path under /_hooks = 404', (await fetch(BASE + '/_hooks/other', { method: 'POST' })).status === 404)
+  check('github key revoked, bridge closed', (await owner.req('DELETE', `/api/admin/machines/${hk.data.id}`)).status === 200 && (await upgradeStatus('/_bridge/github', GK)) === 401)
+}
 check('tab told to close the revoked bridge', (await tabRevoked()).some((r) => r.machine === mk.data.id))
 
 // changing a person's groups or taking a tab from a group makes the tabs re-check sockets

@@ -9,7 +9,9 @@ LOG="$STATE/wrangler.log"
 VARS="$STATE/test.vars"
 
 # fake values only; real ones never touch disk
-printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\n' "$(openssl rand -hex 32)" > "$VARS"
+printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\nGITHUB_WEBHOOK_SECRET=test_hook_%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 16)" > "$VARS"
+HOOK_SECRET="$(sed -n 's/^GITHUB_WEBHOOK_SECRET=//p' "$VARS")"
+export HOOK_SECRET
 KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 
 # The portal plus a fake tab worker bound as several tabs (test/fake_tab), written through the

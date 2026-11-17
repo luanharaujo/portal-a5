@@ -1173,7 +1173,7 @@ async function partAgentRequest(top, id) {
 }
 
 function partBridges(top) {
-  const tabNames = ME.all_tabs || []
+  const tabNames = [...(ME.all_tabs || []), ...(ME.bridge_only || [])]
   const tab = el('select', { class: 'text-input' }, tabNames.map((t) => el('option', { value: t }, tabLabels[t] || t)))
   const label = textInput({ placeholder: T.bridges.label, maxlength: 40 })
   const out = el('div')

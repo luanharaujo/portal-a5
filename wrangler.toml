@@ -25,6 +25,15 @@ PAIR_OTHER_IP = "refuse"
 # Missing or malformed: 5 minutes.
 ADMIN_COMMAND_PASSKEY = "12h"
 
+# Relay of the GitHub App webhook to the Mac (src/github_hook.ts); keeps nothing.
+[[durable_objects.bindings]]
+name = "GITHUB_HOOK"
+class_name = "GithubHook"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GithubHook"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "portal_a5"
@@ -39,5 +48,6 @@ migrations_dir = "migrations"
 # Secrets (never in this file):
 #   ROBOT_LOGIN_KEY  "pa5_robo_" + 32 random bytes; shared with the WhatsApp reader,
 #                     accepted only on POST /robo/login (header X-A5-Robot-Key)
+#   GITHUB_WEBHOOK_SECRET  GitHub App webhook secret (Keychain github-webhook-actions); POST /_hooks/github
 #   OWNER_PHONE       the owner's number: target of the wa.me link and the first admin
 # Local: .dev.vars (git-ignored). Remote: scripts/deploy.sh pipes them from the Keychain.
