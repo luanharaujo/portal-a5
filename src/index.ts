@@ -58,7 +58,9 @@ const MACHINE_KEY_PREFIX = 'pa5_maq_'
 // built-in bridge with no tab behind it: /_bridge/github reaches the GithubHook object
 const GITHUB_BRIDGE = 'github'
 const HOOK_MAX_BODY = 1_000_000
-const HOOK_FAIL_PER_IP = 30, HOOK_PER_HOUR = 600
+const HOOK_FAIL_PER_IP = 30, HOOK_PER_HOUR = 600, HOOK_ALERTS_PER_HOUR = 120
+// Dependabot alert actions that mean "something is open now"; dismissed/fixed and the rest are ignored
+const ALERT_ACTIONS = new Set(['created', 'reopened', 'reintroduced', 'auto_reopened'])
 const AGENT_KEY_PREFIX = 'pa5_adm_'
 const AGENT_PAIR_MINUTES = 15
 const AGENT_PENDING_MAX = 5
@@ -579,12 +581,15 @@ async function githubHook(req: Request, env: Env): Promise<Response> {
   if (!(await crypto.subtle.verify('HMAC', key, mac, raw))) return bad()
   const event = req.headers.get('X-GitHub-Event')
   if (event === 'ping') return json({ ok: true })
-  if (event !== 'workflow_run') return json({ ok: true, ignored: true })
+  if (event !== 'workflow_run' && event !== 'dependabot_alert') return json({ ok: true, ignored: true })
   let action: unknown = null
   try { action = (JSON.parse(new TextDecoder().decode(raw)) as { action?: unknown }).action } catch { /* not JSON: ignored */ }
-  if (action !== 'completed') return json({ ok: true, ignored: true })
-  if (!(await underLimit(env, 'hook-total', HOOK_PER_HOUR))) throw new HttpError(429, 'too_many_events')
-  await env.GITHUB_HOOK.get(env.GITHUB_HOOK.idFromName('main')).fetch('https://hook/notify', { method: 'POST' })
+  // only the event kind reaches the Mac: it reads the details from the GitHub API itself
+  const alert = event === 'dependabot_alert'
+  if (alert ? !(typeof action === 'string' && ALERT_ACTIONS.has(action)) : action !== 'completed') return json({ ok: true, ignored: true })
+  // separate budgets, so a burst of one kind never silences the other
+  if (!(await underLimit(env, alert ? 'hook-alerts' : 'hook-total', alert ? HOOK_ALERTS_PER_HOUR : HOOK_PER_HOUR))) throw new HttpError(429, 'too_many_events')
+  await env.GITHUB_HOOK.get(env.GITHUB_HOOK.idFromName('main')).fetch(alert ? 'https://hook/alert' : 'https://hook/notify', { method: 'POST' })
   return json({ ok: true })
 }
 

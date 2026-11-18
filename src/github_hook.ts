@@ -4,6 +4,7 @@
 import { DurableObject } from 'cloudflare:workers'
 
 const NOTICE = '{"t":"actions"}'
+const ALERT = '{"t":"alerta"}'
 
 export class GithubHook extends DurableObject {
   constructor(ctx: DurableObjectState, env: never) {
@@ -21,7 +22,8 @@ export class GithubHook extends DurableObject {
       return new Response(null, { status: 101, webSocket: pair[0] })
     }
     if (req.method === 'POST') {
-      for (const ws of this.ctx.getWebSockets()) { try { ws.send(NOTICE) } catch { /* dropped */ } }
+      const msg = new URL(req.url).pathname === '/alert' ? ALERT : NOTICE
+      for (const ws of this.ctx.getWebSockets()) { try { ws.send(msg) } catch { /* dropped */ } }
       return new Response(null, { status: 204 })
     }
     return new Response(null, { status: 405 })
