@@ -58,7 +58,7 @@ const MACHINE_KEY_PREFIX = 'pa5_maq_'
 // built-in bridge with no tab behind it: /_bridge/github reaches the GithubHook object
 const GITHUB_BRIDGE = 'github'
 const HOOK_MAX_BODY = 1_000_000
-const HOOK_FAIL_PER_IP = 30, HOOK_PER_HOUR = 600, HOOK_ALERTS_PER_HOUR = 120
+const HOOK_FAIL_PER_IP = 30, HOOK_PER_HOUR = 600, HOOK_ALERTS_PER_HOUR = 120, HOOK_START_PER_HOUR = 120
 // Dependabot alert actions that mean "something is open now"; dismissed/fixed and the rest are ignored
 const ALERT_ACTIONS = new Set(['created', 'reopened', 'reintroduced', 'auto_reopened'])
 const AGENT_KEY_PREFIX = 'pa5_adm_'
@@ -560,8 +560,8 @@ async function bridge(req: Request, env: Env, tab: string): Promise<Response> {
 }
 
 // POST /_hooks/github: the GitHub App webhook. Signature first (HMAC-SHA256 of the raw body, compared
-// in constant time by subtle.verify); only workflow_run/completed (and ping) pass. Nothing of the body
-// is kept or forwarded: the Mac gets {"t":"actions"} and nothing else.
+// in constant time by subtle.verify); only workflow_run completed/requested (and ping) pass. Nothing of the body
+// is kept or forwarded: the Mac gets {"t":"actions"}, {"t":"actions_inicio"} or {"t":"alerta"} and nothing else.
 async function githubHook(req: Request, env: Env): Promise<Response> {
   const secret = env.GITHUB_WEBHOOK_SECRET ?? ''
   if (secret.length < 16 || !env.GITHUB_HOOK) throw new HttpError(503, 'not_configured')
@@ -586,10 +586,13 @@ async function githubHook(req: Request, env: Env): Promise<Response> {
   try { action = (JSON.parse(new TextDecoder().decode(raw)) as { action?: unknown }).action } catch { /* not JSON: ignored */ }
   // only the event kind reaches the Mac: it reads the details from the GitHub API itself
   const alert = event === 'dependabot_alert'
-  if (alert ? !(typeof action === 'string' && ALERT_ACTIONS.has(action)) : action !== 'completed') return json({ ok: true, ignored: true })
+  const start = !alert && action === 'requested'
+  if (alert ? !(typeof action === 'string' && ALERT_ACTIONS.has(action)) : action !== 'completed' && !start) return json({ ok: true, ignored: true })
   // separate budgets, so a burst of one kind never silences the other
-  if (!(await underLimit(env, alert ? 'hook-alerts' : 'hook-total', alert ? HOOK_ALERTS_PER_HOUR : HOOK_PER_HOUR))) throw new HttpError(429, 'too_many_events')
-  await env.GITHUB_HOOK.get(env.GITHUB_HOOK.idFromName('main')).fetch(alert ? 'https://hook/alert' : 'https://hook/notify', { method: 'POST' })
+  const kind = alert ? 'alert' : start ? 'start' : 'notify'
+  const budget = alert ? ['hook-alerts', HOOK_ALERTS_PER_HOUR] as const : start ? ['hook-inicio', HOOK_START_PER_HOUR] as const : ['hook-total', HOOK_PER_HOUR] as const
+  if (!(await underLimit(env, budget[0], budget[1]))) throw new HttpError(429, 'too_many_events')
+  await env.GITHUB_HOOK.get(env.GITHUB_HOOK.idFromName('main')).fetch(`https://hook/${kind}`, { method: 'POST' })
   return json({ ok: true })
 }
 
