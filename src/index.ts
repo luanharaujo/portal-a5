@@ -1634,7 +1634,7 @@ function callerOf(env: Env, who: Who, tab: string): Caller {
   const at = commandPasskeyAt(who, tab)
   return {
     credential: who.kind, admin: who.admin, strong: strongAdmin(who), adminFresh: adminWindowOk(at, env.ADMIN_COMMAND_PASSKEY), scope: null,
-    passkeyAt: at, rehearsal: !!who.viewAs,
+    passkeyAt: at, rehearsal: !!who.viewAs, person: who.person.id,
   }
 }
 

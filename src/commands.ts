@@ -41,6 +41,7 @@ export interface CommandSpec {
   // answered with {ok, id} only. Off unless the catalog says true; no effect on a tab without
   // Face ID on entry, other than the trimmed answer to a key.
   keyWriteOnly: boolean
+  persons: number[]        // read-only actions for named people (person ids); empty = anyone the level allows
   // only opens the tab's own Face ID window (`passkey`): the tab checks identity.passkey_until on its
   // own routes; /_cmd refuses it before the tab is called
   windowOnly: boolean
@@ -105,7 +106,7 @@ export function redactParams(spec: CommandSpec, params: Record<string, string | 
 // One action from the configuration. Anything malformed drops the action (never a looser one).
 function parseSpec(v: unknown): CommandSpec | null {
   if (!isObj(v)) return null
-  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey', 'keyWriteOnly', 'windowOnly']
+  const allowed = ['level', 'params', 'perHour', 'gap', 'screens', 'shortcut', 'returns', 'passkey', 'keyWriteOnly', 'windowOnly', 'persons']
   if (Object.keys(v).some((k) => !allowed.includes(k))) return null
   if (v.level !== 'common' && v.level !== 'admin' && v.level !== 'sensitive') return null
   const level = v.level as Level
@@ -151,6 +152,17 @@ function parseSpec(v: unknown): CommandSpec | null {
     (v.shortcut !== false || v.screens === true || level === 'sensitive' || v.windowOnly != null)) return null
   if (v.windowOnly != null && (v.windowOnly !== true || v.passkey == null || v.keyWriteOnly === true)) return null
 
+  // persons: 1 to 4 person ids; only on an admin action that is page-only (shortcut false, never a
+  // screen, no passkey/keyWriteOnly/windowOnly/returns): the action is a reading for those people
+  let persons: number[] = []
+  if (v.persons != null) {
+    if (!Array.isArray(v.persons) || v.persons.length < 1 || v.persons.length > 4) return null
+    if (!v.persons.every((x) => Number.isSafeInteger(x) && (x as number) > 0)) return null
+    if (level !== 'admin' || v.shortcut !== false || v.screens === true || v.passkey != null ||
+      v.keyWriteOnly != null || v.windowOnly != null || v.returns != null) return null
+    persons = [...new Set(v.persons as number[])]
+  }
+
   // "<n>m", 1 to 60 minutes, on common or admin actions; it rules out screens and keys, so asking
   // for either next to it is a contradiction and drops the action
   let passkey: number | null = null
@@ -169,7 +181,7 @@ function parseSpec(v: unknown): CommandSpec | null {
     if (!v.returns.every((r) => typeof r === 'string' && PARAM_RE.test(r) && !BAD.includes(r))) return null
     returns = [...new Set(v.returns as string[])]
   }
-  return { level, params, perHour, gap, screens, shortcut, returns, passkey, keyWriteOnly: v.keyWriteOnly === true, windowOnly: v.windowOnly === true }
+  return { level, params, perHour, gap, screens, shortcut, returns, passkey, keyWriteOnly: v.keyWriteOnly === true, windowOnly: v.windowOnly === true, persons }
 }
 
 // The `commands` field of one tab. A bad action is dropped; a bad catalog is empty.
@@ -253,6 +265,7 @@ export interface Caller {
   entryPasskey?: boolean   // shortcut: the tab asks Face ID on entry (only keyWriteOnly actions, from a one-action key)
   passkeyAt?: string | null // browser: this session's last passkey check (for actions with `passkey`)
   rehearsal?: boolean      // browser: an admin seeing as another group (nothing reaches the house)
+  person?: number | null   // browser: the signed-in person (for actions with `persons`)
 }
 
 // Is the action's own passkey window (spec.passkey) open on this browser session? A rehearsal
@@ -315,6 +328,8 @@ export function refusal(tab: string, action: string, spec: CommandSpec, c: Calle
   if (c.credential === 'screen') return spec.level === 'common' && spec.screens ? null : 'not_for_screens'
   // "see as" never sends free text, not even simulated: the owner's words stay out of a rehearsal
   if (c.rehearsal && hasText(spec)) return 'not_in_rehearsal'
+  // an action for named people: anyone else, and "see as", never gets it (not even as a hint)
+  if (spec.persons.length && (c.rehearsal || c.person == null || !spec.persons.includes(c.person))) return 'admin_only'
   if (spec.level !== 'common' && !c.admin) return 'admin_only'
   if (spec.level === 'admin' && !(c.adminFresh || c.strong)) return 'passkey_required'
   if (spec.level === 'sensitive' && !c.strong) return 'passkey_required'

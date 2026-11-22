@@ -281,3 +281,26 @@ check('page text: a common text action is refused while seeing as', refusal('f',
 
 console.log(failures ? `\n${failures} FAILED` : '\nall ok')
 process.exit(failures ? 1 : 0)
+
+// persons: a reading for named people (page-only, admin, never a key, a screen or "see as")
+{
+  const pc = parseCatalog({
+    fam: { level: 'admin', shortcut: false, persons: [1] },
+    bad_common: { level: 'common', shortcut: false, persons: [1] },
+    bad_key: { level: 'admin', persons: [1] },
+    bad_screen: { level: 'admin', shortcut: false, screens: true, persons: [1] },
+    bad_pk: { level: 'admin', shortcut: false, passkey: '5m', persons: [1] },
+    bad_id: { level: 'admin', shortcut: false, persons: [0] },
+    bad_empty: { level: 'admin', shortcut: false, persons: [] },
+    bad_many: { level: 'admin', shortcut: false, persons: [1, 2, 3, 4, 5] },
+    bad_str: { level: 'admin', shortcut: false, persons: ['1'] },
+  })
+  check('persons: only the well-formed action stays', JSON.stringify(Object.keys(pc)) === '["fam"]', Object.keys(pc))
+  const br = (o) => ({ credential: 'browser', admin: true, strong: false, adminFresh: false, scope: null, passkeyAt: null, ...o })
+  check('persons: listed person sees it, Face ID window closed too', allowedActions('t', pc, br({ person: 1 })).includes('fam'))
+  check('persons: another admin never sees it', !allowedActions('t', pc, br({ person: 2 })).includes('fam') && refusal('t', 'fam', pc.fam, br({ person: 2, adminFresh: true })) === 'admin_only')
+  check('persons: no person = refused', refusal('t', 'fam', pc.fam, br({ person: null, adminFresh: true })) === 'admin_only')
+  check('persons: seeing as = refused', !allowedActions('t', pc, br({ person: 1, rehearsal: true })).includes('fam'))
+  check('persons: a key never gets it', refusal('t', 'fam', pc.fam, { credential: 'shortcut', admin: true, strong: false, adminFresh: false, scope: ['t/fam'], person: 1 }) === 'not_for_shortcuts')
+  check('persons: a screen never gets it', refusal('t', 'fam', pc.fam, { credential: 'screen', admin: false, strong: false, adminFresh: false, scope: null }) === 'not_for_screens')
+}
