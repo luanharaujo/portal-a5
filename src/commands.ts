@@ -41,7 +41,7 @@ export interface CommandSpec {
   // answered with {ok, id} only. Off unless the catalog says true; no effect on a tab without
   // Face ID on entry, other than the trimmed answer to a key.
   keyWriteOnly: boolean
-  persons: number[]        // read-only actions for named people (person ids); empty = anyone the level allows
+  persons: number[]        // actions only for named people (person ids); empty = anyone the level allows
   // only opens the tab's own Face ID window (`passkey`): the tab checks identity.passkey_until on its
   // own routes; /_cmd refuses it before the tab is called
   windowOnly: boolean
@@ -153,7 +153,7 @@ function parseSpec(v: unknown): CommandSpec | null {
   if (v.windowOnly != null && (v.windowOnly !== true || v.passkey == null || v.keyWriteOnly === true)) return null
 
   // persons: 1 to 4 person ids; only on an admin action that is page-only (shortcut false, never a
-  // screen, no passkey/keyWriteOnly/windowOnly/returns): the action is a reading for those people
+  // screen, no passkey/keyWriteOnly/windowOnly/returns): only those people run it
   let persons: number[] = []
   if (v.persons != null) {
     if (!Array.isArray(v.persons) || v.persons.length < 1 || v.persons.length > 4) return null

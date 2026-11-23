@@ -279,10 +279,8 @@ for (const a of ['annotate', 'annotate_del']) {
 check('page text: a common text action is refused while seeing as', refusal('f', 'memo', pg.memo, { ...ownerDevice, rehearsal: true }) === 'not_in_rehearsal' &&
   !allowedActions('f', pg, { ...ownerDevice, rehearsal: true }).includes('memo') && refusal('f', 'memo', pg.memo, ownerDevice) === null)
 
-console.log(failures ? `\n${failures} FAILED` : '\nall ok')
-process.exit(failures ? 1 : 0)
 
-// persons: a reading for named people (page-only, admin, never a key, a screen or "see as")
+// persons: an action for named people (page-only, admin, never a key, a screen or "see as")
 {
   const pc = parseCatalog({
     fam: { level: 'admin', shortcut: false, persons: [1] },
@@ -303,4 +301,10 @@ process.exit(failures ? 1 : 0)
   check('persons: seeing as = refused', !allowedActions('t', pc, br({ person: 1, rehearsal: true })).includes('fam'))
   check('persons: a key never gets it', refusal('t', 'fam', pc.fam, { credential: 'shortcut', admin: true, strong: false, adminFresh: false, scope: ['t/fam'], person: 1 }) === 'not_for_shortcuts')
   check('persons: a screen never gets it', refusal('t', 'fam', pc.fam, { credential: 'screen', admin: false, strong: false, adminFresh: false, scope: null }) === 'not_for_screens')
+  check('persons: listed person runs it inside the Face ID window', refusal('t', 'fam', pc.fam, br({ person: 1, adminFresh: true })) === null)
+  check('persons: listed person, window closed = passkey_required', refusal('t', 'fam', pc.fam, br({ person: 1 })) === 'passkey_required')
+  check('persons: listed person seeing as = refused', refusal('t', 'fam', pc.fam, br({ person: 1, adminFresh: true, rehearsal: true })) === 'admin_only')
 }
+
+console.log(failures ? `\n${failures} FAILED` : '\nall ok')
+process.exit(failures ? 1 : 0)
