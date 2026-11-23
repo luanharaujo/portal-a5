@@ -2608,7 +2608,7 @@ async function watchTabs(env: Env) {
       const label = `${tab}:${code}:${new Date(Date.parse(since)).toISOString()}`
       const seen = await env.DB.prepare("SELECT 1 FROM device_alerts WHERE kind = 'tab_watch' AND label = ? LIMIT 1").bind(label).first()
       if (seen) continue
-      const admins = await env.DB.prepare('SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
+      const admins = await env.DB.prepare('SELECT DISTINCT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
       for (const p of admins.results)
         await env.DB.prepare("INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, '', ?, 'tab_watch')")
           .bind(p.person_id, label, now()).run()
