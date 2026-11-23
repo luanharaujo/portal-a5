@@ -34,6 +34,10 @@ class_name = "GithubHook"
 tag = "v1"
 new_sqlite_classes = ["GithubHook"]
 
+# Scheduled check of tabs with "watch": true (src/index.ts, watchTabs): warnings even with the house off.
+[triggers]
+crons = ["*/30 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "portal_a5"

@@ -282,6 +282,14 @@ window.T = {
   passkeyRemoved: 'Face ID removido.',
   passkeyAlert: 'Face ID novo cadastrado: ',
   residentLoginAlert: 'Morador entrou num aparelho novo: ',
+  // aviso da checagem agendada de uma aba (sem o Mac): código -> título
+  watchAlert: {
+    bridge_silent: 'O Mac está sem sinal há mais de 8 horas',
+    heartbeat_red: 'Batimento vermelho: os agentes podem estar travados',
+  },
+  watchAlertOther: 'Uma aba pede atenção',
+  watchSince: 'desde',
+  watchSeen: 'Visto',
   addFaceId: {
     title: 'Cadastrar Face ID',
     why: 'Uma vez neste aparelho. Depois os controles pedem só o Face ID.',

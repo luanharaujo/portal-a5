@@ -217,6 +217,15 @@ Every socket the tab accepts (page or bridge) stores `credential`, `session`, `p
 - at `entry_until`, for tabs with entry `passkey` (an alarm, or a check on every message);
 - one bridge per machine: a new one closes the old with code 4000.
 
+## 6c. Scheduled check (`watch`)
+
+For what must reach an admin even when the house machine is off (a bridge silent for hours, a red heartbeat). Opt-in per tab: `"watch": true` in the TABS configuration, and a `watch()` RPC on the tab.
+
+- The portal's cron (`*/30 * * * *`, wrangler.toml) calls `watch()` with no identity, 5 s at most, and expects `{"alerts": [{"code": "<^[a-z][a-z0-9_]{0,39}$>", "since": "<ISO>"}]}`, up to 4. Anything else is dropped.
+- Each new `(tab, code, since)` becomes one warning on every admin's account page (`device_alerts`, kind `tab_watch`, label `<tab>:<code>:<since>`); the same triple never warns twice, acknowledged or not. A new occurrence needs a new `since`.
+- Codes only, never data: the title comes from the portal locale (`T.watchAlert[code]`), so a tab cannot put text on the account page.
+- The tab decides what an occurrence is from what it already holds (for example, the last message from its bridge), so this works with the house machine off.
+
 ## 7. Audit from a tab
 
 The tab reports what a person did by adding one header to its answer (plain or 101):

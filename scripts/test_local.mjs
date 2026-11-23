@@ -1611,6 +1611,13 @@ let pl
 for (let i = 0; i < 10; i++) pl = await client().req('POST', '/api/pair/start', {})
 check('pair start 10/h per IP', pl.status === 429, pl.status)
 
+// scheduled check of tabs with "watch": true (one warning per tab/code/since, codes only, never twice)
+for (let i = 0; i < 2; i++) await fetch(`${BASE}/__scheduled?cron=*/30+*+*+*+*`)
+await new Promise((r) => setTimeout(r, 500))
+const watched = ((await owner.req('GET', '/api/me')).data.alerts || []).filter((a) => a.kind === 'tab_watch')
+check('watch: one warning for the good code, run twice', watched.length === 1 && watched[0].label === 'tab-a:bridge_silent:2026-01-01T00:00:00.000Z', JSON.stringify(watched))
+check('watch: residents get none', !((await resident.req('GET', '/api/me')).data.alerts || []).some((a) => a.kind === 'tab_watch'))
+
 // logout
 check('logout clears cookie', /Max-Age=0/.test((await resident.req('POST', '/api/logout', {})).setCookie || ''))
 check('after logout = 401', (await resident.req('GET', '/api/me')).status === 401)

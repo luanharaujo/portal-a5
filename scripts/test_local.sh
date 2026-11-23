@@ -25,7 +25,7 @@ TESTCFG=".wrangler.test.toml"
 cat > "$STATE/tabs.json" <<'EOF2'
 {
   "tab-a": {"service": "portal-a5-fake-tab", "entrypoint": "FakeTab", "label": "Tab A", "icon": "bolt",
-            "allow": ["screen-wake-lock"], "entry": "session", "credentials": ["browser", "screen", "machine"],
+            "allow": ["screen-wake-lock"], "entry": "session", "credentials": ["browser", "screen", "machine"], "watch": true,
             "commands": {
               "tv": {"level": "common", "params": {"mode": {"enum": ["on", "off", "globo"]}}, "perHour": 5, "screens": true, "returns": ["state"]},
               "ac": {"level": "common", "params": {"unit": {"enum": ["a", "b"]}}, "gap": {"seconds": 180, "by": "unit"}},
@@ -64,7 +64,7 @@ grep -q '^TABS_3 = ' "$TESTCFG" || { echo "FAIL the test config was not split"; 
 npx wrangler d1 migrations apply portal_a5 --local --persist-to "$STATE" >/dev/null
 # residents see the first test tab (a fresh database gives them none)
 npx wrangler d1 execute portal_a5 --local --persist-to "$STATE" --command "UPDATE groups SET tabs = '[\"tab-a\"]' WHERE id = 'residents'" >/dev/null
-npx wrangler dev -c "$TESTCFG" -c test/fake_tab/wrangler.toml --local --ip 127.0.0.1 --port "$PORT" --persist-to "$STATE" --env-file "$VARS" >"$LOG" 2>&1 &
+npx wrangler dev -c "$TESTCFG" -c test/fake_tab/wrangler.toml --local --test-scheduled --ip 127.0.0.1 --port "$PORT" --persist-to "$STATE" --env-file "$VARS" >"$LOG" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -rf "$STATE" "$TESTCFG"' EXIT
 for _ in $(seq 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.5; done

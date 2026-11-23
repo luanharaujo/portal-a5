@@ -2581,7 +2581,46 @@ async function handle(req: Request, env: Env): Promise<Response> {
   return new Response('not_found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...API_HEADERS } })
 }
 
+// ------------------------------------------------------------------ scheduled check (cron, wrangler.toml)
+// Tabs with "watch": true say what needs an admin's attention, as codes only: [{code, since}]. Each new
+// (tab, code, since) becomes one warning on every admin's account page (kind 'tab_watch'), never twice.
+// Runs in the cloud, so it works with the house machine off (the agents tab: bridge silent > 8 h).
+const WATCH_TIMEOUT_MS = 5_000
+const WATCH_CODE = /^[a-z][a-z0-9_]{0,39}$/
+
+async function watchTabs(env: Env) {
+  const cfg = tabsConfig(tabsText(env))
+  for (const [tab, c] of Object.entries(cfg)) {
+    if (!c.watch) continue
+    const service = tabService(env, tab)
+    if (!service?.watch) continue
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), WATCH_TIMEOUT_MS) })
+    let r: unknown = null
+    try { r = await Promise.race([service.watch(), late]) } catch { r = null }
+    if (timer !== undefined) clearTimeout(timer)
+    const alerts = (r as { alerts?: unknown } | null)?.alerts
+    if (!Array.isArray(alerts)) continue
+    for (const a of alerts.slice(0, 4)) {
+      const { code, since } = (a ?? {}) as Record<string, unknown>
+      if (typeof code !== 'string' || !WATCH_CODE.test(code)) continue
+      if (typeof since !== 'string' || since.length > 40 || Number.isNaN(Date.parse(since))) continue
+      const label = `${tab}:${code}:${new Date(Date.parse(since)).toISOString()}`
+      const seen = await env.DB.prepare("SELECT 1 FROM device_alerts WHERE kind = 'tab_watch' AND label = ? LIMIT 1").bind(label).first()
+      if (seen) continue
+      const admins = await env.DB.prepare('SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
+      for (const p of admins.results)
+        await env.DB.prepare("INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, '', ?, 'tab_watch')")
+          .bind(p.person_id, label, now()).run()
+    }
+  }
+}
+
 export default {
+  async scheduled(_c: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    tabsConfig(tabsText(env))
+    ctx.waitUntil(watchTabs(env).catch((e) => console.error('watch', e instanceof Error ? e.message : String(e))))
+  },
   async fetch(req: Request, env: Env): Promise<Response> {
     tabsConfig(tabsText(env)) // policyOf() reads what this loads
     try {

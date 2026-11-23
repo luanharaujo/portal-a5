@@ -44,6 +44,9 @@ export interface TabService {
   revoke?(ref: RevokeRef): Promise<void>
   badge?(who: PortalIdentity): Promise<{ count: number }>
   command?(cmd: Command, who: PortalIdentity): Promise<unknown>
+  // tabs with "watch": true: called by the portal's scheduled check (every 30 min), with no identity.
+  // Answers {alerts: [{code, since}]}; each new pair becomes one warning to every admin (docs/TABS.md 6c)
+  watch?(): Promise<unknown>
 }
 
 // Names a tab can never take: portal pages and routes living at /<name>/.
@@ -83,6 +86,8 @@ export interface TabConfig extends TabPolicy {
   commands: Catalog
   // GET paths a read key may fetch (docs/READ_KEYS.md); null = the tab takes no read keys
   readKey: ReadKeyPolicy | null
+  // the scheduled check asks this tab what needs an admin's attention (watch()); works with the house off
+  watch: boolean
 }
 
 export interface ReadKeyPolicy { paths: string[]; perHour: number; dayAlert: number }
@@ -115,7 +120,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(tab) || RESERVED_TABS.includes(tab)) return null
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null
   const o = v as Record<string, unknown>
-  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands', 'readKey', 'textParams']
+  const known = ['binding', 'label', 'hint', 'icon', 'allow', 'entry', 'entryHours', 'credentials', 'serviceWorker', 'commands', 'readKey', 'textParams', 'watch']
   if (Object.keys(o).some((k) => !known.includes(k))) return null
   if (typeof o.binding !== 'string' || !/^[A-Z][A-Z0-9_]{0,40}$/.test(o.binding)) return null
   if (o.label != null && (typeof o.label !== 'string' || !o.label.trim() || o.label.length > 40 || /[\u0000-\u001f<>]/.test(o.label))) return null
@@ -133,6 +138,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
   const commands = parseCatalogStrict(o.commands ?? {})
   if (!commands) return null
   if (o.textParams != null && typeof o.textParams !== 'boolean') return null
+  if (o.watch != null && typeof o.watch !== 'boolean') return null
   if (Object.values(commands).some(hasText) && o.textParams !== true) return null
   const readKey = o.readKey == null ? null : parseReadKey(o.readKey)
   if (o.readKey != null && !readKey) return null
@@ -146,6 +152,7 @@ function validTab(tab: string, v: unknown): TabConfig | null {
     serviceWorker: entry === 'passkey' ? false : ((o.serviceWorker as boolean | undefined) ?? true),
     commands,
     readKey,
+    watch: o.watch === true,
   }
 }
 

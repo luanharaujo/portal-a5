@@ -905,8 +905,20 @@ function summary(k) {
   return [null, null]
 }
 
+// a tab's scheduled check (kind tab_watch, label "<tab>:<code>:<since>"): codes only, text from the locale
+function watchAlert(a) {
+  const [tab, code, ...rest] = String(a.label || '').split(':')
+  const since = rest.join(':')
+  return el('div', { class: 'alert' }, icon('alert'),
+    el('div', {},
+      el('b', {}, T.watchAlert[code] || T.watchAlertOther),
+      `${tabLabels[tab] || tab}, ${T.watchSince} ${shortWhen(since || a.created_at)}.`,
+      el('div', { class: 'btn-row' },
+        btn(T.watchSeen, async () => { await api('POST', `/api/me/alerts/${a.id}/ack`, {}); await refresh() }, 'btn-sm'))))
+}
+
 function alerts() {
-  return (ME.alerts || []).map((a) => el('div', { class: 'alert' }, icon(a.kind === 'device' ? 'faceid' : 'alert'),
+  return (ME.alerts || []).map((a) => a.kind === 'tab_watch' ? watchAlert(a) : el('div', { class: 'alert' }, icon(a.kind === 'device' ? 'faceid' : 'alert'),
     el('div', {},
       el('b', {}, (a.kind === 'bridge' ? T.bridgeAlert : a.kind === 'bridge_ip' ? T.bridgeIpAlert : a.kind === 'shortcut_place' ? T.shortcutPlaceAlert : a.kind === 'read_key_place' ? T.readKeys.placeAlert : a.kind === 'read_key_day' ? T.readKeys.dayAlert : a.kind === 'read_key_ip' ? T.readKeys.ipAlert : a.kind === 'agent_ip' ? T.agentIpAlert : a.kind === 'passkey' ? T.passkeyAlert : a.kind === 'resident_login' ? T.residentLoginAlert : T.newDevice(ME.person.name)).replace(/:\s*$/, '')),
       `${a.label || T.device}, ${shortWhen(a.created_at)}${a.place ? ', ' + city(a.place) : ''}${a.current ? T.thisDevice : ''}.`,

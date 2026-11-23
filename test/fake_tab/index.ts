@@ -100,6 +100,12 @@ export class FakeTab extends WorkerEntrypoint {
     return { count: 3 }
   }
 
+  // The scheduled check (watch: true on tab-a only): one good code, then garbage the portal must drop.
+  async watch(): Promise<unknown> {
+    return { alerts: [{ code: 'bridge_silent', since: '2026-01-01T00:00:00Z' }, { code: 'Bad Code', since: '2026-01-01T00:00:00Z' },
+      { code: 'heartbeat_red', since: 'not a date' }] }
+  }
+
   // One checked command (docs/COMMANDS.md). Logs what arrived; 'slow' answers after the portal
   // stopped waiting, 'boom' throws. The result carries fields the portal must not pass on.
   async command(cmd: { id: string; action: string; params: unknown; expires_at: string }, identity: Identity): Promise<unknown> {
