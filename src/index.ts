@@ -356,14 +356,15 @@ function requireStrongAdmin(who: Who) {
 // tabs close its sockets. (Session ids are AUTOINCREMENT since migration 0004, so an id is never
 // reused; this is the second barrier.)
 async function dropSessions(env: Env, ids: number[]) {
-  for (const id of ids) {
-    await env.DB.batch([
-      env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(id),
-      env.DB.prepare('DELETE FROM tab_entries WHERE session_id = ?').bind(id),
-      env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id = ?').bind(id),
-    ])
-    await notifyTabs(env, { session: id })
-  }
+  if (!ids.length) return
+  // Three statements for the whole list (ids as JSON, read by json_each), not three per id.
+  const list = JSON.stringify(ids)
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM sessions WHERE id IN (SELECT value FROM json_each(?))').bind(list),
+    env.DB.prepare('DELETE FROM tab_entries WHERE session_id IN (SELECT value FROM json_each(?))').bind(list),
+    env.DB.prepare('DELETE FROM passkey_challenges WHERE session_id IN (SELECT value FROM json_each(?))').bind(list),
+  ])
+  for (const id of ids) await notifyTabs(env, { session: id }) // sockets, not the database
 }
 
 async function createSession(env: Env, req: Request, person: Person, label: string): Promise<string> {
@@ -389,10 +390,10 @@ async function createSession(env: Env, req: Request, person: Person, label: stri
       .bind(person.id, r!.id, label, place(req), t).run()
   else {
     // every new resident device warns the admins at once, with a way to sign it out (08/11)
-    const admins = await env.DB.prepare('SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
-    for (const a of admins.results)
-      await env.DB.prepare("INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, ?, ?, ?, ?, 'resident_login')")
-        .bind(a.person_id, r!.id, `${person.name} · ${label}`, place(req), t).run()
+    await env.DB.prepare(
+      `INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind)
+       SELECT pg.person_id, ?, ?, ?, ?, 'resident_login' FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1`,
+    ).bind(r!.id, `${person.name} · ${label}`, place(req), t).run()
   }
   return token
 }
@@ -615,6 +616,7 @@ async function loginStart(req: Request, env: Env) {
   ])
 
   let code = ''
+  // Collision retry, not a per-item query: one pass in practice, at most 8 (not N+1).
   for (let i = 0; i < 8; i++) {
     code = newCode()
     const busy = await env.DB.prepare('SELECT 1 FROM login_codes WHERE code_hash = ? AND expires_at > ?').bind(await sha256(code), now()).first()
@@ -1152,7 +1154,7 @@ async function setGroups(env: Env, personId: number, groups: unknown) {
   }
   await env.DB.batch([
     env.DB.prepare('DELETE FROM person_groups WHERE person_id = ?').bind(personId),
-    ...wanted.map((g) => env.DB.prepare('INSERT INTO person_groups (person_id, group_id) VALUES (?, ?)').bind(personId, g)),
+    env.DB.prepare('INSERT INTO person_groups (person_id, group_id) SELECT ?, value FROM json_each(?)').bind(personId, JSON.stringify(wanted)),
   ])
 }
 
@@ -1784,10 +1786,10 @@ function placeKey(req: Request): string {
 
 // A warning on every admin's account page (device_alerts, session 0 = not a session).
 async function alertAdmins(env: Env, req: Request, label: string, kind: string) {
-  const admins = await env.DB.prepare('SELECT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
-  for (const a of admins.results)
-    await env.DB.prepare('INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, ?, ?, ?)')
-      .bind(a.person_id, label, `${clientIp(req)}${place(req) ? ', ' + place(req) : ''}`, now(), kind).run()
+  await env.DB.prepare(
+    `INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind)
+     SELECT pg.person_id, 0, ?, ?, ?, ? FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1`,
+  ).bind(label, `${clientIp(req)}${place(req) ? ', ' + place(req) : ''}`, now(), kind).run()
 }
 
 // POST /_cmd/<tab>/<action> with Authorization: Bearer pa5_atl_... (Apple Shortcuts). No cookie,
@@ -2288,8 +2290,10 @@ async function revokeAgentKey(env: Env, req: Request, who: Who, id: number) {
   // what it left waiting dies with it, links included
   const open = await env.DB.prepare(`UPDATE agent_requests SET state = 'cancelled', decided_at = ? WHERE agent_id = ? AND state = 'waiting' RETURNING pairing_id`)
     .bind(now(), id).all<{ pairing_id: number | null }>()
-  for (const r of open.results)
-    if (r.pairing_id) await env.DB.prepare(`UPDATE screen_pairings SET state = 'refused' WHERE id = ? AND state = 'waiting'`).bind(r.pairing_id).run()
+  const pairings = open.results.map((r) => r.pairing_id).filter((p): p is number => !!p)
+  if (pairings.length)
+    await env.DB.prepare(`UPDATE screen_pairings SET state = 'refused' WHERE state = 'waiting' AND id IN (SELECT value FROM json_each(?))`)
+      .bind(JSON.stringify(pairings)).run()
   await audit(env, req, { who, action: 'agent_key_revoked', target: String(k.label) })
 }
 
@@ -2606,12 +2610,12 @@ async function watchTabs(env: Env) {
       if (typeof code !== 'string' || !WATCH_CODE.test(code)) continue
       if (typeof since !== 'string' || since.length > 40 || Number.isNaN(Date.parse(since))) continue
       const label = `${tab}:${code}:${new Date(Date.parse(since)).toISOString()}`
-      const seen = await env.DB.prepare("SELECT 1 FROM device_alerts WHERE kind = 'tab_watch' AND label = ? LIMIT 1").bind(label).first()
-      if (seen) continue
-      const admins = await env.DB.prepare('SELECT DISTINCT pg.person_id FROM person_groups pg JOIN groups g ON g.id = pg.group_id WHERE g.is_admin = 1').all<{ person_id: number }>()
-      for (const p of admins.results)
-        await env.DB.prepare("INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind) VALUES (?, 0, ?, '', ?, 'tab_watch')")
-          .bind(p.person_id, label, now()).run()
+      // one statement: nothing if this alert was already raised, else one warning per admin
+      await env.DB.prepare(
+        `INSERT INTO device_alerts (person_id, session_id, label, place, created_at, kind)
+         SELECT DISTINCT pg.person_id, 0, ?1, '', ?2, 'tab_watch' FROM person_groups pg JOIN groups g ON g.id = pg.group_id
+         WHERE g.is_admin = 1 AND NOT EXISTS (SELECT 1 FROM device_alerts WHERE kind = 'tab_watch' AND label = ?1)`,
+      ).bind(label, now()).run()
     }
   }
 }
