@@ -119,6 +119,7 @@ window.T = {
   shortcutPlaceAlert: 'Chave de atalho usada de um lugar novo (cidade ou rede nunca vistas por ela): ',
   bridgeIpAlert: 'Uma chave de ponte conectou de um endereço novo: ',
   pair: {
+    checking: 'Verificando…',
     isScreen: 'É uma TV ou monitor fixo? Parear',
     kicker: 'Tela fixa',
     title: 'Parear esta tela',
@@ -346,7 +347,9 @@ window.T = {
     view_as_admin_group: 'Esse grupo já é de dono.',
     bad_number: 'Número inválido.',
     too_many_attempts: 'Muitas tentativas. Espere uma hora.',
-    too_many_for_number: 'Muitas tentativas para esse número. Espere uma hora.',
+    too_fast: 'Muitas tentativas seguidas. Espere um minuto.',
+    challenge_failed: 'A verificação contra robôs não passou. Tente de novo.',
+    challenge_unavailable: 'A verificação contra robôs está fora do ar. Tente de novo em instantes.',
     too_many_polls: 'Muitas consultas. Espere um pouco.',
     code_not_found: 'Código não encontrado. Volte e peça outro.',
     challenge_expired: 'O Face ID demorou demais. Tente de novo.',

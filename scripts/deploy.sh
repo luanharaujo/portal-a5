@@ -7,8 +7,10 @@
 #   portal-a5-robot-key          ROBOT_LOGIN_KEY ("pa5_robo_" + 32 random bytes)
 #   portal-a5-owner-phone       OWNER_PHONE (digits, country code first)
 #   github-webhook-actions      GITHUB_WEBHOOK_SECRET (optional; GitHub App webhook)
+#   portal-a5-turnstile-secret   TURNSTILE_SECRET (scripts/turnstile_keys.sh stores it)
 # The account id (not a secret, but kept out of git) comes from CLOUDFLARE_ACCOUNT_ID or from
-# the git-ignored file .deploy.local (a line CLOUDFLARE_ACCOUNT_ID=<id>).
+# the git-ignored file .deploy.local (a line CLOUDFLARE_ACCOUNT_ID=<id>). The same file holds
+# TURNSTILE_SITEKEY=<site key> and AUTH_CHECK_KIT=<local clone of the kit with the login check>.
 # Secrets go to wrangler through stdin only: never arguments, never files.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -84,6 +86,26 @@ PY
   fi
 fi
 
+# Login policy (.quality/auth.json), static rules: the checker comes from the kit at a pinned
+# commit, never from its working tree. Any finding outside the baseline refuses the deploy.
+CHECKER_COMMIT=9ca1677bd7f2b5c90172c0db9d5038812b87e1d4
+local_value() { [ -f .deploy.local ] && sed -n "s/^$1=//p" .deploy.local | head -1 || true; }
+KIT="${AUTH_CHECK_KIT:-$(local_value AUTH_CHECK_KIT)}"
+[ -n "$KIT" ] || { echo "set AUTH_CHECK_KIT (env or .deploy.local)" >&2; exit 1; }
+CHECK_DIR="$(mktemp -d)"
+git -C "$KIT" show "$CHECKER_COMMIT:scripts/auth_check.py" > "$CHECK_DIR/auth_check.py" \
+  || { echo "login check: commit ${CHECKER_COMMIT:0:7} not found in the kit" >&2; exit 1; }
+python3 -I "$CHECK_DIR/auth_check.py" check --no-dynamic --repo luanharaujo/portal-a5 --root . > "$CHECK_DIR/auth.json" \
+  || { echo "login check did not run; nothing deployed" >&2; exit 1; }
+python3 -I - "$CHECK_DIR/auth.json" <<'PY' || { echo "refused: the login check failed" >&2; exit 1; }
+import json, sys
+r = json.load(open(sys.argv[1]))
+for e in r["errors"]: print("login check error:", e, file=sys.stderr)
+for f in r["findings"]: print("login check:", f["id"], f["where"], f["msg"], file=sys.stderr)
+sys.exit(0 if r["declared"] is True and r["login"] is True and not r["errors"] and not r["findings"] else 1)
+PY
+rm -r "$CHECK_DIR"
+
 kc() { security find-generic-password -s "$1" -w 2>/dev/null || { echo "missing Keychain item: $1" >&2; exit 1; }; }
 
 export CLOUDFLARE_API_TOKEN="$(kc portal-a5-cloudflare)"
@@ -92,6 +114,14 @@ if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -f .deploy.local ]; then
 fi
 [[ "${CLOUDFLARE_ACCOUNT_ID:-}" =~ ^[0-9a-f]{32}$ ]] || { echo "set CLOUDFLARE_ACCOUNT_ID (env or .deploy.local)" >&2; exit 1; }
 export CLOUDFLARE_ACCOUNT_ID
+TURNSTILE_SITEKEY="$(local_value TURNSTILE_SITEKEY)"
+# the public test keys accept anything: real keys start with 0x
+[[ "$TURNSTILE_SITEKEY" =~ ^0x[A-Za-z0-9_-]{16,100}$ ]] || { echo "set TURNSTILE_SITEKEY in .deploy.local (scripts/turnstile_keys.sh)" >&2; exit 1; }
+[[ "$(kc portal-a5-turnstile-secret)" =~ ^0x[A-Za-z0-9_-]{16,100}$ ]] || { echo "Keychain item portal-a5-turnstile-secret is not a real Turnstile secret" >&2; exit 1; }
+# asked with a made-up token: a good secret complains about the token only
+answer="$(kc portal-a5-turnstile-secret | tr -d '\n' | curl -sS --max-time 20 --data-urlencode secret@- --data-urlencode response=deploy-check https://challenges.cloudflare.com/turnstile/v0/siteverify)"
+grep -q 'invalid-input-response' <<<"$answer" && ! grep -q 'invalid-input-secret' <<<"$answer" \
+  || { echo "Turnstile does not accept the secret in the Keychain; nothing deployed" >&2; exit 1; }
 # keep wrangler away from any OAuth login stored in the user's global config
 export XDG_CONFIG_HOME="$(mktemp -d)"
 trap 'rm -rf "$XDG_CONFIG_HOME"' EXIT
@@ -117,6 +147,13 @@ python3 scripts/make_config.py .tabs.local.json "$DB_ID" "$CLOUDFLARE_ACCOUNT_ID
 
 npx tsc --noEmit
 
+# TURNSTILE_VERIFY_URL points the robot check at a stand-in and exists for local tests only:
+# refused as a var in the config and as a Worker secret (a list that cannot be read also refuses).
+! grep -q 'TURNSTILE_VERIFY_URL' "$CFG" || { echo "refused: TURNSTILE_VERIFY_URL in the deploy config" >&2; exit 1; }
+npx wrangler secret list -c "$CFG" --format json \
+  | python3 -I -c 'import json,sys; names=[s["name"] for s in json.load(sys.stdin)]; sys.exit(1 if not names or "TURNSTILE_VERIFY_URL" in names else 0)' \
+  || { echo "refused: the Worker has a secret named TURNSTILE_VERIFY_URL, or its secrets could not be listed" >&2; exit 1; }
+
 # 3b. pages: public/ copied to .deploy/public with a content version on every script and
 # stylesheet URL in index.html, so the iOS Home Screen app never runs an old file kept under the
 # same URL (scripts/build_assets.py). The list of versioned files is checked after the deploy.
@@ -139,6 +176,9 @@ echo "D1 backup: $BACKUP"
 ls -1t "$BACKUPS"/portal_a5_*.sql | tail -n +6 | while IFS= read -r old; do /usr/bin/trash "$old"; done
 
 npx wrangler d1 migrations apply portal_a5 --remote -c "$CFG"
+# before the code that needs them: without these two, sign-in and screen pairing answer 503
+kc portal-a5-turnstile-secret | npx wrangler secret put TURNSTILE_SECRET -c "$CFG" >/dev/null
+printf '%s' "$TURNSTILE_SITEKEY" | npx wrangler secret put TURNSTILE_SITEKEY -c "$CFG" >/dev/null
 npx wrangler deploy -c "$CFG" | tee .deploy/last_deploy.txt
 # the Worker changed: record what is live now, before anything else can fail
 ( umask 077; echo "$COMMIT" > "$LIVE_FILE"; cp .tabs.local.json "$LIVE_TABS" )

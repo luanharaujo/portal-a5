@@ -15,7 +15,7 @@ There is no password and no SMS. The sign-in is inverted: the page shows a ready
 
 ## Sign-in flow
 
-1. The page posts the typed number to `POST /api/login/start` and gets a one-time code (`A5-XXXX`, 10 minutes), a tab secret and a `wa.me` link with the exact phrase `Entrar no Portal A5: A5-XXXX`. Known and unknown numbers get the same answer.
+1. The page posts the typed number and a Turnstile token to `POST /api/login/start` and gets a one-time code (`A5-XXXX`, 10 minutes), a tab secret and a `wa.me` link with the exact phrase `Entrar no Portal A5: A5-XXXX`. Known and unknown numbers get the same answer. Asking again retires the code made by that same page (it sends the old secret as `previous`) and no other one.
 2. The person sends the phrase. The reader matches the whole text and calls `POST /robo/login`.
 3. The page polls `POST /api/login/status` with its secret. On `ok` the code is burned and the session cookie is set.
 
@@ -35,7 +35,19 @@ Content-Type: application/json
 
 `self_chat: true` means the owner's own "message yourself" chat and is accepted only with the owner's number. Answers are always 200 with `{"ok": true, "device", "requested_at"}` or `{"ok": false, "reason"}`, plus `"repeated": true` when the code was already handled. `reason` is one of `invalid_code`, `awaiting_owner`, `blocked`, `sender_limit`, `total_limit`, `admin_limit`, `too_many_pending`. `device` is the device that asked for the code. Bad key: 401. The key opens this route and nothing else.
 
-Limits in the Worker, on top of whatever the reader does: 3 accepted calls per sender per hour, 30 per hour in total, one sign-in every 10 minutes for admin numbers.
+Limits in the Worker, on top of whatever the reader does: 3 accepted calls per sender per hour and one sign-in every 10 minutes for admin numbers. A shared total of 30 per hour counts every other call; the one it never holds back is a live code sent from the number typed by a person who is already registered (or the owner) and not blocked. A number the portal does not know yet counts toward it.
+
+### Robot filter
+
+Anyone can type anyone's number, so the public sign-in routes never refuse by number.
+
+- A Workers `ratelimits` binding per address runs before any database work and is the only rate refusal of the starts (`429 too_fast` with `Retry-After: 60`): 60 starts, 300 polls and 30 ticket claims a minute. Polls and claims also keep an hourly ceiling per address.
+- `POST /api/login/start` and `POST /api/pair/start` need a Turnstile token, checked on the server (`success`, hostname, action; one use). Missing or refused: `403 challenge_failed`. No secret: `503 not_configured`. Cloudflare unreachable: `503 challenge_unavailable`.
+- Past 5 starts an hour for a number, 20 for an address (10 for pairing), the answer only takes longer: half a second more each time, at most 4 seconds.
+- Rate refusals, failed checks and attempts that reach an end (code or session issued, ticket claimed, code not found, used, refused, expired) log one `login_attempt` line with fixed words only (method, result, risk, reason). A poll still waiting or pending, a poll without a secret and a Worker without the owner number log nothing.
+- The widget loads on `/` alone, the one page whose policy allows `challenges.cloudflare.com`. That origin is there for the widget only: no other script or frame may use it. `GET /api/challenge` serves the public site key.
+
+The policy is declared in `.quality/auth.json`.
 
 ## Sessions: weak and strong
 
@@ -62,9 +74,13 @@ npm install
 npm test          # migrations on a throwaway D1, wrangler dev on 127.0.0.1:8941, full flow, index check
 ```
 
+Sign-in needs the robot check: `npm test` runs a stand-in siteverify on this machine (port 8951). With `npm run dev`, `.dev.vars` needs `TURNSTILE_SECRET`, `TURNSTILE_SITEKEY` and, for a stand-in, `TURNSTILE_VERIFY_URL` (accepted only for `127.0.0.1` or `localhost`); Cloudflare's public test keys answer another hostname and no action, so the portal refuses them.
+
 Every query on a hot path must use an index; the test runs `EXPLAIN QUERY PLAN` on them and fails on a full scan. The free D1 plan caps rows read per day, so a scan on a busy table takes the site down until midnight UTC.
 
 ## Deploying
+
+Create a Turnstile widget for the portal's hostname and store its keys once with `bash scripts/turnstile_keys.sh`. The deploy also needs `AUTH_CHECK_KIT=<path>` in `.deploy.local`: a local clone of the kit holding the login check, run at the commit pinned in `scripts/deploy.sh`. It refuses to publish when that check fails, when the keys are missing or look like test keys, or when `TURNSTILE_VERIFY_URL` (the local stand-in for tests) shows up in the config or among the Worker's secrets.
 
 `npm run deploy` refuses a dirty working tree, logs the published commit in the git-ignored `.deploy/deployed.log`, reads the token, the account id, the reader key and the owner's number from the Keychain, checks that the token sees only the portal account, creates the D1 database on first run, applies migrations, deploys and sets the secrets through stdin. Account and database ids go into a git-ignored config, never into this repository.
 

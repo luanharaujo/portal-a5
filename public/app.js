@@ -373,14 +373,104 @@ function nextPath() {
   return /^\/[a-z][a-z0-9-]*(\/|$)/.test(n) ? n : null
 }
 
+// ------------------------------------------------------------------ robot check (Turnstile)
+// Sign-in and screen pairing carry a single-use token. The widget loads only on those screens,
+// stays invisible unless it needs a tap, and starts working while the number is being typed.
+const TURNSTILE_JS = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+const TOKEN_WAIT_MS = 60e3
+let turnstileScript = null
+let siteKey = null
+
+function loadTurnstile() {
+  if (window.turnstile) return Promise.resolve()
+  if (!turnstileScript) turnstileScript = new Promise((resolve, reject) => {
+    const s = el('script', { src: TURNSTILE_JS })
+    s.onload = () => resolve()
+    s.onerror = () => { turnstileScript = null; s.remove(); reject(new Error(T.errors.challenge_unavailable)) }
+    document.head.append(s)
+  })
+  return turnstileScript
+}
+
+// One widget in `box` (put it on the page right away). take() waits for a token and hands it
+// out once; reset() asks the widget for a new one.
+function robotCheck(action) {
+  const box = el('div', { class: 'challenge' })
+  let id = null
+  let token = ''
+  let failure = null
+  let waiting = null
+  const settle = () => {
+    if (!waiting || (!token && !failure)) return
+    const { resolve, reject, timer } = waiting
+    waiting = null
+    clearTimeout(timer)
+    if (failure) reject(failure)
+    else { resolve(token); token = '' }
+  }
+  const fail = (code) => { failure = new Error(T.errors[code]); settle() }
+  const mount = async () => {
+    try {
+      const [key] = await Promise.all([siteKey || rawApi('GET', '/api/challenge').then((r) => r.sitekey), loadTurnstile()])
+      if (!key) return fail('not_configured')
+      siteKey = key
+      if (!box.isConnected) return
+      id = window.turnstile.render(box, {
+        sitekey: key, action, appearance: 'interaction-only', size: 'flexible',
+        callback: (t) => { token = t; failure = null; settle() },
+        'expired-callback': () => { token = '' },
+        'error-callback': () => { fail('challenge_failed'); return true },
+      })
+    } catch (e) { failure = e; settle() }
+  }
+  mount()
+  return {
+    box,
+    take: () => new Promise((resolve, reject) => {
+      if (waiting) clearTimeout(waiting.timer)
+      waiting = { resolve, reject, timer: setTimeout(() => { waiting = null; reject(new Error(T.errors.challenge_failed)) }, TOKEN_WAIT_MS) }
+      settle()
+    }),
+    reset: () => {
+      token = ''
+      failure = null
+      if (id === null) mount()
+      else window.turnstile.reset(id)
+    },
+  }
+}
+
+// The account page's policy does not load the widget: sign in on "/" and come back.
+function leftForSignInPage() {
+  if (location.pathname === '/') return false
+  location.replace('/?next=' + encodeURIComponent(location.pathname + location.search + location.hash))
+  return true
+}
+
 function loginView() {
   clearTimeout(pollTimer)
+  if (leftForSignInPage()) return
+  const check = robotCheck('login')
+  let busy = false
+  const send = async (phone) => {
+    if (busy) return
+    busy = true
+    try {
+      const token = await check.take()
+      if (check.box.isConnected) await askCode(phone, token, check.box)
+    } finally {
+      busy = false
+      // a token works once: a new one for the next try
+      if (check.box.isConnected) check.reset()
+    }
+  }
   const input = el('input', { type: 'tel', inputmode: 'tel', autocomplete: 'tel', placeholder: T.phonePlaceholder, required: true, id: 'phone' })
   cover([
-    el('form', { onsubmit: (ev) => { ev.preventDefault(); guarded(() => askCode(input.value)) } },
+    el('form', { onsubmit: (ev) => { ev.preventDefault(); guarded(() => send(input.value)) } },
       el('h1', {}, T.signInTitle),
       el('p', { class: 'sub' }, T.signInSub),
       el('label', { class: 'field' }, el('span', { class: 'caps' }, T.phoneLabel), el('div', { class: 'tel' }, el('span', { class: 'ddi' }, '+55'), input)),
+      check.box,
       el('button', { type: 'submit', class: 'btn btn-wa btn-block' }, icon('chat'), el('span', {}, T.signIn)),
       el('p', { class: 'hint' }, T.signInHint)),
     el('button', { type: 'button', class: 'screen-link', onclick: () => guarded(pairScreenView) }, icon('screen'), el('span', {}, T.pair.isScreen), icon('chev', 'ico chev')),
@@ -396,8 +486,13 @@ function bubble(message, code) {
 }
 
 let pollTimer
-async function askCode(phone) {
-  const r = await rawApi('POST', '/api/login/start', { phone, mode: MODE })
+// this page's last code: asking again retires it (and only it)
+let lastSecret = null
+async function askCode(phone, turnstile, from) {
+  const r = await rawApi('POST', '/api/login/start', { phone, mode: MODE, turnstile, previous: lastSecret || undefined })
+  lastSecret = r.secret
+  // the person left the sign-in screen while the answer was on its way
+  if (!from.isConnected) return
   const backToStart = () => { clearTimeout(pollTimer); loginView() }
   let st = status(T.status.waiting, true)
   cover([
@@ -668,19 +763,37 @@ function drawQr(text) {
 
 const howTo = () => T.pair.howTo.map((part, i) => i % 2 ? el('b', {}, part) : part)
 
+const PAIR_RETRY_MS = 30e3
+
 async function pairScreenView() {
   clearTimeout(pollTimer)
-  const r = await rawApi('POST', '/api/pair/start', {})
+  if (leftForSignInPage()) return
+  const check = robotCheck('pair')
+  const back = () => el('button', { type: 'button', class: 'btn btn-ghost pair-back', onclick: () => { clearTimeout(pollTimer); loginView() } }, icon('back'), el('span', {}, T.back))
+  let waiting = status(T.pair.checking, true)
+  cover([el('span', { class: 'caps' }, T.pair.kicker), el('h1', {}, T.pair.title), check.box, waiting, back()], true)
+  let r
+  try {
+    const turnstile = await check.take()
+    if (!check.box.isConnected) return
+    r = await rawApi('POST', '/api/pair/start', { turnstile })
+  } catch (e) {
+    // a screen is unattended: say what happened and try again by itself
+    if (!check.box.isConnected) return
+    waiting.replaceWith(status(e.message))
+    pollTimer = setTimeout(pairScreenView, PAIR_RETRY_MS)
+    return
+  }
+  if (!check.box.isConnected) return
   const chars = r.code.replace(/[^A-Z0-9]/gi, '').split('')
   let st = status(T.pair.waiting, true)
-  const voltar = el('button', { type: 'button', class: 'btn btn-ghost pair-back', onclick: () => { clearTimeout(pollTimer); loginView() } }, icon('back'), el('span', {}, T.back))
   cover([
     el('span', { class: 'caps' }, T.pair.kicker),
     el('h1', {}, T.pair.title),
     el('p', { class: 'sub' }, howTo()),
     el('div', { class: 'code-qr' }, el('div', { class: 'pair-code', 'aria-label': r.code }, chars.map((c) => el('span', {}, c))), drawQr(r.pair_url)),
     st,
-    voltar,
+    back(),
   ], true)
   const say = (text, live) => { const n = status(text, live); st.replaceWith(n); st = n }
   const poll = async () => {

@@ -25,6 +25,34 @@ PAIR_OTHER_IP = "refuse"
 # Missing or malformed: 5 minutes.
 ADMIN_COMMAND_PASSKEY = "12h"
 
+# Per address filters of the public sign-in routes, checked before any database work
+# (src/index.ts). Per Cloudflare location and approximate; the D1 counters stay behind them.
+[[ratelimits]]
+name = "RL_START"
+namespace_id = "41001"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "RL_POLL"
+namespace_id = "41002"
+simple = { limit = 300, period = 60 }
+
+[[ratelimits]]
+name = "RL_CLAIM"
+namespace_id = "41003"
+simple = { limit = 30, period = 60 }
+
+# keyed by phone number: never refuses, only adds a delay
+[[ratelimits]]
+name = "RL_TARGET"
+namespace_id = "41004"
+simple = { limit = 5, period = 60 }
+
+# the login_attempt events are kept in Workers Logs; no invocation log (it holds URLs and addresses)
+[observability.logs]
+enabled = true
+invocation_logs = false
+
 # Relay of the GitHub App webhook to the Mac (src/github_hook.ts); keeps nothing.
 [[durable_objects.bindings]]
 name = "GITHUB_HOOK"
@@ -54,4 +82,6 @@ migrations_dir = "migrations"
 #                     accepted only on POST /robo/login (header X-A5-Robot-Key)
 #   GITHUB_WEBHOOK_SECRET  GitHub App webhook secret (Keychain github-webhook-actions); POST /_hooks/github
 #   OWNER_PHONE       the owner's number: target of the wa.me link and the first admin
+#   TURNSTILE_SECRET  secret key of the Turnstile widget; without it sign-in and pairing answer 503
+#   TURNSTILE_SITEKEY its public site key (GET /api/challenge)
 # Local: .dev.vars (git-ignored). Remote: scripts/deploy.sh pipes them from the Keychain.
