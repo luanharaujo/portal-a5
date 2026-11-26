@@ -42,6 +42,20 @@ export async function launch() {
   return { send, listeners, close: () => { try { ws.close() } catch {} proc.kill() } }
 }
 
+// Stand-in for the Turnstile widget (never loaded from the network here): the same calls, tokens
+// that the stand-in siteverify of test_local.mjs accepts once.
+const FAKE_TURNSTILE = `(() => {
+  const widgets = []
+  window.turnstile = {
+    render(box, o) {
+      const give = () => setTimeout(() => o.callback('ok.' + location.hostname + '.' + o.action + '.' + crypto.randomUUID()), 50)
+      give()
+      return widgets.push(give) - 1
+    },
+    reset(id) { widgets[id]() },
+  }
+})()`
+
 // One isolated browser context (own cookies and storage) with one page.
 export async function page(b, base, cookie, { touch = false, scheme = null } = {}) {
   const { browserContextId } = await b.send('Target.createBrowserContext')
@@ -57,6 +71,7 @@ export async function page(b, base, cookie, { touch = false, scheme = null } = {
     if (m.method === 'Runtime.exceptionThrown') log.push('exception: ' + m.params.exceptionDetails.text)
   })
   await s('Page.enable'); await s('Runtime.enable'); await s('Log.enable'); await s('Network.enable')
+  await s('Page.addScriptToEvaluateOnNewDocument', { source: FAKE_TURNSTILE })
   if (touch) {
     await s('Emulation.setDeviceMetricsOverride', { width: 393, height: 852, deviceScaleFactor: 3, mobile: true })
     await s('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 })
@@ -342,7 +357,8 @@ export async function browserChecks({ base, check, owner, resident, screen, appr
     const rn = await v.evaluate(`({ name: document.querySelector('.index .profile b').textContent, band: document.querySelectorAll('.a5-rehearsal').length === 1 })`)
     check('browser: rehearsal shows the made-up resident and the band', rn.name === (await v.evaluate('A5_TEXT.rehearsal.name')) && rn.band, rn)
     await v.evaluate(`document.querySelector('.index .logout').click()`)
-    check('browser: rehearsal sign out draws the sign-in page with the band', await v.waitFor(`!!document.querySelector('#phone') && document.querySelector('.a5-rehearsal span')?.textContent === A5_TEXT.shell.band.out`, 5000))
+    check('browser: rehearsal sign out draws the sign-in page with the band', await v.waitFor(`!!document.querySelector('#phone') && document.querySelector('.a5-rehearsal span')?.textContent === A5_TEXT.shell.band.out`, 5000),
+      await v.evaluate(`({ at: location.pathname, h1: document.querySelector('h1')?.textContent, phone: !!document.querySelector('#phone'), band: document.querySelector('.a5-rehearsal span')?.textContent ?? null, body: document.body.className })`))
     if (SHOTS) await v.shot(SHOTS + '/rehearsal_signin.png')
     await v.go('/conta/')
     check('browser: rehearsal: signed out survives a reload', await v.waitFor(`!!document.querySelector('#phone') && !!document.querySelector('.a5-rehearsal')`, 5000))

@@ -18,11 +18,42 @@ function check(name, cond, extra) {
   if (!cond) failures++
 }
 
+// The d1 helpers below block the event loop for seconds on a busy machine: a kept-alive socket
+// the server closed meanwhile is only noticed when reused. Such a failure gets one more try.
+const send = globalThis.fetch
+globalThis.fetch = (url, options) => send(url, options).catch((e) => {
+  if (!['ECONNRESET', 'EPIPE'].includes(e?.cause?.code)) throw e
+  return send(url, options)
+})
+
+// --- stand-in siteverify: a token "ok.<hostname>.<action>.<anything>" passes once
+const spent = new Set()
+const verifier = http.createServer((req, res) => {
+  let raw = ''
+  req.on('data', (d) => { raw += d })
+  req.on('end', () => {
+    const f = new URLSearchParams(raw)
+    const token = f.get('response') ?? ''
+    const [kind, ...rest] = token.split('.')
+    const [action, nonce] = rest.splice(-2)
+    const good = f.get('secret') === 'test_secret' && kind === 'ok' && !!nonce && !spent.has(token)
+    spent.add(token)
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify(good ? { success: true, hostname: rest.join('.'), action } : { success: false }))
+  })
+})
+await new Promise((r) => verifier.listen(Number(process.env.VERIFY_PORT), '127.0.0.1', r))
+verifier.unref()
+const token = (action, hostname = RP_ID) => `ok.${hostname}.${action}.${wc.randomUUID()}`
+const CHALLENGED = { '/api/login/start': 'login', '/api/pair/start': 'pair' }
+
 // --- tiny client with its own cookie jar
 function client() {
   let cookie = ''
   return {
     async req(method, path, body, headers = {}) {
+      // starts pass the robot check unless the test writes its own token
+      if (CHALLENGED[path] && body && !('turnstile' in body)) body = { ...body, turnstile: token(CHALLENGED[path]) }
       const h = Object.fromEntries(Object.entries(headers).filter(([, v]) => v !== undefined))
       if (cookie) h.Cookie = cookie
       if (method !== 'GET' && !('Origin' in headers)) h.Origin = BASE
@@ -281,6 +312,8 @@ const CORS = { 'Sec-Fetch-Mode': 'cors', Accept: 'application/json' }
 const WS_BASE = BASE.replace(/^http/, 'ws')
 const residentId = (await owner.req('GET', '/api/admin/people')).data.find((p) => p.phone === RESIDENT).id
 const ownerCsp = home.headers.get('content-security-policy')
+// the account page never loads the robot check widget: the portal policy without it
+const accountCsp = ownerCsp.replace(' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com', '')
 
 function openWs(path, headers) {
   return new Promise((resolve) => {
@@ -623,7 +656,7 @@ check('/_shell/tabs.css served', (await fetch(BASE + '/_shell/tabs.css')).status
 check('locale exposes the selector texts under A5_TEXT', /window\.A5_TEXT = window\.T/.test(await (await fetch(BASE + '/locale/pt-BR.js')).text()))
 check('portal page loads the selector', /\/_shell\/tabs\.js/.test(home.data) && /\/_shell\/tabs\.css/.test(home.data))
 const acc = await navigate(owner, '/conta/')
-check('account page: the portal page with the portal CSP', acc.status === 200 && /id="toast"/.test(acc.data) && /\/visual\.css/.test(acc.data) && acc.headers.get('content-security-policy') === ownerCsp, [acc.status, acc.headers.get('content-security-policy')])
+check('account page: the portal page with the portal CSP', acc.status === 200 && /id="toast"/.test(acc.data) && /\/visual\.css/.test(acc.data) && acc.headers.get('content-security-policy') === accountCsp, [acc.status, acc.headers.get('content-security-policy')])
 check('account page answers signed out too (sign-in screen)', (await navigate(anon, '/conta/')).status === 200)
 check('/conta redirects to /conta/', (await navigate(owner, '/conta')).status === 301)
 check('reserved name: /conta/* never reaches a tab', (await navigate(owner, '/conta/echo')).status === 404)
@@ -1606,10 +1639,69 @@ check('L1 key of someone outside the owner group = 401', (await rk('/tab-b/echo'
 check('owner revokes the first read key; it stops at once', (await owner.req('DELETE', `/api/me/readkeys/${r1k.data.id}`)).status === 200 &&
   (await rk('/tab-b/echo', RK)).status === 401)
 
-// pairing start is capped per IP (last: it uses up the bucket)
-let pl
-for (let i = 0; i < 10; i++) pl = await client().req('POST', '/api/pair/start', {})
-check('pair start 10/h per IP', pl.status === 429, pl.status)
+// pairing past 10/h from one address only waits longer, it is never refused
+let pl, pairT0
+for (let i = 0; i < 10; i++) { pairT0 = Date.now(); pl = await client().req('POST', '/api/pair/start', {}) }
+check('pair start past 10/h per IP: slower, never refused', pl.status === 201 && Date.now() - pairT0 >= 450, [pl.status, Date.now() - pairT0])
+
+// ------------------------------------------------------------------ robot check on the public starts
+{
+  const bot = client()
+  const ip = (n) => ({ 'CF-Connecting-IP': `198.18.${n >> 8}.${n & 255}` })
+  for (const [path, action, other] of [['/api/login/start', 'login', 'pair'], ['/api/pair/start', 'pair', 'login']]) {
+    const body = (turnstile) => ({ phone: '5561900000031', turnstile })
+    const before = d1json('SELECT (SELECT COUNT(*) FROM login_codes) + (SELECT COUNT(*) FROM screen_pairings) AS n')[0].n
+    const bad = [['no token', ''], ['refused token', 'nope'], ['another hostname', token(action, 'evil.example')], ['another action', token(other)]]
+    for (const [name, t] of bad) {
+      const r = await bot.req('POST', path, body(t), ip(1))
+      check(`${path}: ${name} = 403`, r.status === 403 && r.data.error === 'challenge_failed', r)
+    }
+    check(`${path}: refusals write no code`, d1json('SELECT (SELECT COUNT(*) FROM login_codes) + (SELECT COUNT(*) FROM screen_pairings) AS n')[0].n === before)
+    const once = token(action)
+    check(`${path}: a good token = 201`, (await bot.req('POST', path, body(once), ip(2))).status === 201)
+    check(`${path}: the same token again = 403`, (await bot.req('POST', path, body(once), ip(2))).status === 403)
+  }
+  check('widget key served without a session', (await bot.req('GET', '/api/challenge')).data.sitekey === 'test_sitekey')
+  const csp = async (c, path) => (await c.req('GET', path)).headers.get('content-security-policy') || ''
+  const front = await csp(bot, '/')
+  check('sign-in page may load the widget, one policy only', front.includes("script-src 'self' https://challenges.cloudflare.com") &&
+    front.includes('frame-src https://challenges.cloudflare.com') && front.split('default-src').length === 2, front)
+  check('account page may not', !(await csp(owner, '/conta/')).includes('challenges.cloudflare.com'))
+
+  // one address flooding: refused by the binding, with Retry-After, before any database work
+  for (const [path, limit] of [['/api/login/start', 60], ['/api/login/status', 300], ['/api/pair/claim', 30]]) {
+    let r, n = 0
+    const from = ip(1000 + limit)
+    do { r = await bot.req('POST', path, { turnstile: '', secret: 'x', ticket: 'x' }, from); n++ } while (r.status !== 429 && n <= limit + 5)
+    check(`${path}: flood from one address = 429 + Retry-After`, r.status === 429 && r.data.error === 'too_fast' && r.headers.get('retry-after') === '60', [n, r.status, r.data])
+  }
+
+  // asking again retires only the page's own code
+  const NUM = '5561900000032'
+  d1(`INSERT INTO people (name, phone, status) VALUES ('Busy', '${NUM}', 'active')`)
+  d1(`INSERT INTO person_groups (person_id, group_id) SELECT id, 'residents' FROM people WHERE phone = '${NUM}'`)
+  const start = async (extra, n) => (await bot.req('POST', '/api/login/start', { phone: NUM, ...extra }, ip(n))).data
+  const state = async (s) => (await bot.req('POST', '/api/login/status', { secret: s.secret }, ip(3))).data.status
+  const first = await start({}, 10)
+  const second = await start({ previous: first.secret }, 10)
+  check('asking again retires the page\'s own code', (await state(first)) === 'expired' && (await state(second)) === 'waiting')
+
+  // forty strangers ask for the same number: nobody is refused and the owner's code stays good
+  const victim = await start({ previous: second.secret }, 11)
+  const crowd = await Promise.all(Array.from({ length: 40 }, (_, i) => bot.req('POST', '/api/login/start', { phone: NUM }, ip(100 + i))))
+  check('40 starts on one number from 40 addresses: all answered', crowd.every((r) => r.status === 201), crowd.map((r) => r.status))
+  const again = await bot.req('POST', '/api/login/start', { phone: NUM }, ip(12))
+  check('and the number still gets a new code', again.status === 201, again)
+  check('the first code is still waiting', (await state(victim)) === 'waiting')
+
+  // wrong codes from many senders fill the shared total; a matching sign-in is not held back
+  let total
+  for (let i = 0; i < 35; i++) total = await robot({ code: 'A5-ZZZZ', phone: `55119111100${String(i).padStart(2, '0')}` })
+  check('wrong codes stop at the hourly total', total.data.reason === 'total_limit', total.data)
+  const ok = await robot({ code: /A5-[A-Z0-9]{4}/.exec(victim.message)[0], phone: NUM })
+  check('a live code from its own number confirms past the full total', ok.data.ok === true, ok.data)
+  check('and signs in', (await state(victim)) === 'ok')
+}
 
 // scheduled check of tabs with "watch": true (one warning per tab/code/since, codes only, never twice)
 for (let i = 0; i < 2; i++) await fetch(`${BASE}/__scheduled?cron=*/30+*+*+*+*`)

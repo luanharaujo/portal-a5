@@ -8,6 +8,7 @@
 
 export { GithubHook } from './github_hook'
 import { WebAuthnError, b64url, verifyAssertion, verifyRegistration } from './webauthn'
+import { type ChallengeFailure, type RateLimiter, type TurnstileEnv, attemptLog, slowDown, verifyTurnstile } from './login_guard'
 import {
   type PortalIdentity, type RevokeRef, type TabPolicy, type TabService, isNavigation, isUpgrade, permissionsPolicy,
   policyOf, readTabAudit, sanitizeTabHeaders, stripRequestHeaders, tabsConfig, tabsText,
@@ -19,8 +20,14 @@ import {
 
 export type { PortalIdentity } from './tabs'
 
-export interface Env {
+export interface Env extends TurnstileEnv {
   DB: D1Database
+  // per address filters of the public sign-in routes, ahead of any database work (wrangler.toml)
+  RL_START: RateLimiter
+  RL_POLL: RateLimiter
+  RL_CLAIM: RateLimiter
+  // per phone number: never refuses, only marks the number as busy
+  RL_TARGET: RateLimiter
   ASSETS: Fetcher
   ROBOT_LOGIN_KEY: string
   OWNER_PHONE: string
@@ -73,9 +80,11 @@ const MAX_DEVICES = 3 // non-admin; admins have no cap
 const PENDING_MAX = 20
 const PENDING_DAYS = 7
 const LIMITS = {
-  startPerIp: 20, startPerNumber: 5, statusPerIp: 900,
+  // starts: past these a request waits longer and longer, it is never refused
+  startPerIp: 20, startPerNumber: 5, pairPerIp: 10,
+  statusPerIp: 900,
   robotPerSender: 3, robotTotal: 30, // per hour
-  pairPerIp: 10, bridgeFailPerIp: 30,
+  bridgeFailPerIp: 30,
   agentFailPerIp: 30, agentPerHour: 600, agentPairPerHour: 20, claimPerIp: 30,
 }
 const COOKIE = '__Host-a5s'
@@ -240,12 +249,26 @@ async function audit(env: Env, req: Request | null, a: { who?: Who | null; perso
     .run()
 }
 
-// Fixed-window counter keyed by `window` (default: the hour). False once over `max`.
-async function underLimit(env: Env, bucket: string, max: number, window = now().slice(0, 13)): Promise<boolean> {
+// Fixed-window counter keyed by `window` (default: the hour). Returns the count with this one.
+async function countHit(env: Env, bucket: string, window = now().slice(0, 13)): Promise<number> {
   const r = await env.DB.prepare(
     'INSERT INTO rate_limits (bucket, hour, n) VALUES (?, ?, 1) ON CONFLICT (bucket, hour) DO UPDATE SET n = n + 1 RETURNING n',
   ).bind(bucket, window).first<{ n: number }>()
-  return (r?.n ?? 0) <= max
+  return r?.n ?? 0
+}
+
+// False once over `max`.
+async function underLimit(env: Env, bucket: string, max: number, window?: string): Promise<boolean> {
+  return (await countHit(env, bucket, window)) <= max
+}
+
+// the answer of a `ratelimits` binding that said no (its window is one minute)
+const tooFast = () => json({ error: 'too_fast', retry_after: 60 }, 429, { 'Retry-After': '60' })
+
+function challengeError(why: ChallengeFailure): HttpError {
+  if (why === 'not_configured') return new HttpError(503, 'not_configured')
+  if (why === 'unreachable') return new HttpError(503, 'challenge_unavailable')
+  return new HttpError(403, 'challenge_failed')
 }
 
 // Every non-GET request must come from this exact origin and carry X-Portal: 1
@@ -408,35 +431,51 @@ function newPairCode(): string {
 const normPairCode = (v: unknown) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12)
 
 async function pairStart(req: Request, env: Env, url: URL) {
-  if (!(await underLimit(env, `pair-ip:${clientIp(req)}`, LIMITS.pairPerIp))) throw new HttpError(429, 'too_many_attempts')
+  // a screen is signed in by an admin's Face ID, hence the method
+  const log = attemptLog('login_attempt', 'passkey')
+  const ip = clientIp(req)
+  if (!(await env.RL_START.limit({ key: ip })).success) { log('limited', 'high', 'ip_rate'); return tooFast() }
+  const b = await body(req)
+  const failed = await verifyTurnstile(env, { token: b.turnstile, hostname: url.hostname, action: 'pair', ip })
+  if (failed) { log('turnstile_failed', 'medium', failed); throw challengeError(failed) }
+  const over = (await countHit(env, `pair-ip:${ip}`)) - LIMITS.pairPerIp
+  await slowDown(over)
   await env.DB.prepare('DELETE FROM screen_pairings WHERE expires_at < ?').bind(inMs(-864e5)).run()
   const code = newPairCode()
   const secret = randomToken(24)
   const expires = inMs(PAIR_MINUTES * 60e3)
   await env.DB.prepare('INSERT INTO screen_pairings (code_hash, secret_hash, label, ip, place, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .bind(await sha256(code), await sha256(secret), deviceLabel(req.headers.get('User-Agent'), null), clientIp(req), place(req), now(), expires).run()
+  log('ok', over > 0 ? 'medium' : 'low', 'pair_code_issued')
   return json({ code: `${code.slice(0, 3)}-${code.slice(3)}`, secret, expires_at: expires, pair_url: `${url.origin}/?pair=${code}` }, 201)
 }
 
+// polls: only the answer that ends the wait is logged, not each "still waiting"
 async function pairStatus(req: Request, env: Env) {
-  if (!(await underLimit(env, `status-ip:${clientIp(req)}`, LIMITS.statusPerIp))) throw new HttpError(429, 'too_many_polls')
+  const log = attemptLog('login_attempt', 'passkey')
+  if (!(await env.RL_POLL.limit({ key: clientIp(req) })).success) { log('limited', 'high', 'ip_rate'); return tooFast() }
+  if (!(await underLimit(env, `status-ip:${clientIp(req)}`, LIMITS.statusPerIp))) {
+    log('limited', 'high', 'ip_hourly')
+    throw new HttpError(429, 'too_many_polls')
+  }
+  const done = (status: 'used' | 'refused' | 'expired') => { log('fail', 'low', status); return json({ status }) }
   const b = await body(req)
   const secret = String(b.secret ?? '')
   if (secret.length < 30) throw new HttpError(400, 'missing_secret')
   const p = await env.DB.prepare('SELECT * FROM screen_pairings WHERE secret_hash = ?').bind(await sha256(secret)).first<Row>()
-  if (!p) throw new HttpError(404, 'code_not_found')
+  if (!p) { log('fail', 'medium', 'code_not_found'); throw new HttpError(404, 'code_not_found') }
   const state = String(p.state)
-  if (state === 'used' || state === 'refused') return json({ status: state })
-  if (state === 'waiting') return json(String(p.expires_at) < now() ? { status: 'expired' } : { status: 'waiting', expires_at: p.expires_at })
+  if (state === 'used' || state === 'refused') return done(state)
+  if (state === 'waiting') return String(p.expires_at) < now() ? done('expired') : json({ status: 'waiting', expires_at: p.expires_at })
   // approved: burn it and hand out the session exactly once, if picked up in time
   if (Date.parse(String(p.expires_at)) + PAIR_PICKUP_GRACE_MS < Date.now()) {
     await env.DB.prepare(`UPDATE screen_pairings SET state = 'refused' WHERE id = ? AND state = 'approved'`).bind(p.id).run()
-    return json({ status: 'expired' })
+    return done('expired')
   }
   const r = await env.DB.prepare(`UPDATE screen_pairings SET state = 'used' WHERE id = ? AND state = 'approved'`).bind(p.id).run()
-  if (!r.meta.changes) return json({ status: 'used' })
+  if (!r.meta.changes) return done('used')
   const screen = await env.DB.prepare(`SELECT * FROM people WHERE id = ? AND kind = 'screen' AND status = 'active'`).bind(p.person_id).first<Person>()
-  if (!screen) return json({ status: 'refused' })
+  if (!screen) return done('refused')
   const old = await env.DB.prepare('SELECT id FROM sessions WHERE person_id = ?').bind(screen.id).all<{ id: number }>()
   const token = randomToken(32)
   const t = now()
@@ -447,6 +486,7 @@ async function pairStatus(req: Request, env: Env) {
   await dropSessions(env, old.results.map((o) => o.id))
   await env.DB.prepare('INSERT INTO audit (at, person_id, session_id, strength, action, target, ip, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .bind(t, screen.id, s!.id, 'screen', 'screen_signed_in', String(p.label ?? ''), clientIp(req), place(req)).run()
+  log('ok', 'low', 'screen_session')
   return json({ status: 'ok', name: screen.name }, 200, { 'Set-Cookie': sessionCookie(token, 'screen') })
 }
 
@@ -599,13 +639,27 @@ async function githubHook(req: Request, env: Env): Promise<Response> {
 // ------------------------------------------------------------------ login (browser side)
 // Same answer for known, unknown and blocked numbers: nothing here tells who is registered.
 async function loginStart(req: Request, env: Env) {
+  const log = attemptLog('login_attempt', 'whatsapp_code')
+  const ip = clientIp(req)
+  // the cheap filter, ahead of the database: the only rate refusal of this route
+  if (!(await env.RL_START.limit({ key: ip })).success) { log('limited', 'high', 'ip_rate'); return tooFast() }
   const b = await body(req)
   const phone = normalizePhone(b.phone)
-  if (!phone) throw new HttpError(400, 'bad_number')
-  if (!(await underLimit(env, `start-ip:${clientIp(req)}`, LIMITS.startPerIp))) throw new HttpError(429, 'too_many_attempts')
-  if (!(await underLimit(env, `start-num:${phone}`, LIMITS.startPerNumber))) throw new HttpError(429, 'too_many_for_number')
+  if (!phone) { log('fail', 'low', 'bad_number'); throw new HttpError(400, 'bad_number') }
+  const failed = await verifyTurnstile(env, { token: b.turnstile, hostname: new URL(req.url).hostname, action: 'login', ip })
+  if (failed) { log('turnstile_failed', 'medium', failed); throw challengeError(failed) }
   const owner = normalizePhone(env.OWNER_PHONE)
   if (!owner) throw new HttpError(503, 'not_configured')
+  // after the check, so a request without a solved challenge never spends someone else's number
+  const busyNumber = !(await env.RL_TARGET.limit({ key: await sha256(phone) })).success
+  // Anyone may type anyone's number, so a number is never refused: whoever passes the check
+  // gets a code, only later the further past the threshold the address or the number is.
+  const over = Math.max(
+    (await countHit(env, `start-ip:${ip}`)) - LIMITS.startPerIp,
+    (await countHit(env, `start-num:${phone}`)) - LIMITS.startPerNumber,
+    busyNumber ? 1 : 0,
+  )
+  await slowDown(over)
 
   // housekeeping, all on indexed columns
   await env.DB.batch([
@@ -622,26 +676,35 @@ async function loginStart(req: Request, env: Env) {
   }
   const secret = randomToken(24)
   const expires = inMs(CODE_MINUTES * 60e3)
+  const previous = typeof b.previous === 'string' && b.previous.length >= 30 && b.previous.length <= 64 ? await sha256(b.previous) : null
   await env.DB.batch([
-    // one live code per number: the previous one dies now
-    env.DB.prepare(`UPDATE login_codes SET expires_at = ? WHERE typed_phone = ? AND state = 'waiting' AND expires_at > ?`).bind(now(), phone, now()),
+    // only the page that made a code can retire it (by its secret); other codes of the same
+    // number live on until they expire, so nobody cancels someone else's sign-in
+    ...(previous ? [env.DB.prepare(`UPDATE login_codes SET expires_at = ? WHERE secret_hash = ? AND state = 'waiting' AND expires_at > ?`).bind(now(), previous, now())] : []),
     env.DB.prepare('INSERT INTO login_codes (code_hash, secret_hash, typed_phone, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
       .bind(await sha256(code), await sha256(secret), phone, deviceLabel(req.headers.get('User-Agent'), b.mode), now(), expires),
   ])
   const message = LOGIN_PHRASE + code
+  log('ok', over > 0 ? 'medium' : 'low', 'code_issued')
   return json({ code, secret, expires_at: expires, message, wa_link: `https://wa.me/${owner}?text=${encodeURIComponent(message)}` }, 201)
 }
 
 async function loginStatus(req: Request, env: Env) {
-  if (!(await underLimit(env, `status-ip:${clientIp(req)}`, LIMITS.statusPerIp))) throw new HttpError(429, 'too_many_polls')
+  const log = attemptLog('login_attempt', 'whatsapp_code')
+  if (!(await env.RL_POLL.limit({ key: clientIp(req) })).success) { log('limited', 'high', 'ip_rate'); return tooFast() }
+  if (!(await underLimit(env, `status-ip:${clientIp(req)}`, LIMITS.statusPerIp))) {
+    log('limited', 'high', 'ip_hourly')
+    throw new HttpError(429, 'too_many_polls')
+  }
+  const done = (status: 'used' | 'refused' | 'expired') => { log('fail', 'low', status); return json({ status }) }
   const b = await body(req)
   const secret = String(b.secret ?? '')
   if (secret.length < 30) throw new HttpError(400, 'missing_secret')
   const c = await env.DB.prepare('SELECT * FROM login_codes WHERE secret_hash = ?').bind(await sha256(secret)).first<Row>()
-  if (!c) throw new HttpError(404, 'code_not_found')
+  if (!c) { log('fail', 'medium', 'code_not_found'); throw new HttpError(404, 'code_not_found') }
   const state = String(c.state)
-  if (state === 'used' || state === 'refused') return json({ status: state })
-  if (String(c.expires_at) < now()) return json({ status: 'expired' })
+  if (state === 'used' || state === 'refused') return done(state)
+  if (String(c.expires_at) < now()) return done('expired')
   if (state === 'waiting') return json({ status: state, expires_at: c.expires_at })
   if (state === 'pending') {
     // why the owner must decide, said only from what this visitor already knows (the number typed
@@ -651,10 +714,11 @@ async function loginStatus(req: Request, env: Env) {
   }
   // confirmed: burn the code and hand out the session exactly once
   const r = await env.DB.prepare(`UPDATE login_codes SET state = 'used' WHERE id = ? AND state = 'confirmed'`).bind(c.id).run()
-  if (!r.meta.changes) return json({ status: 'used' })
+  if (!r.meta.changes) return done('used')
   const p = await env.DB.prepare('SELECT * FROM people WHERE id = ?').bind(c.confirmed_person_id).first<Person>()
-  if (!p || p.status !== 'active') return json({ status: 'refused' })
+  if (!p || p.status !== 'active') return done('refused')
   const token = await createSession(env, req, p, deviceLabel(req.headers.get('User-Agent'), b.mode))
+  log('ok', 'low', 'session')
   return json({ status: 'ok', name: p.name }, 200, { 'Set-Cookie': sessionCookie(token) })
 }
 
@@ -677,11 +741,16 @@ async function robotLogin(req: Request, env: Env) {
   if (self && sender !== owner) throw new HttpError(400, 'self_chat_not_owner')
   const msgId = text(b.msg_id, 80)
 
-  if (!(await underLimit(env, 'robot-total', LIMITS.robotTotal))) return json({ ok: false, reason: 'total_limit' })
   if (!(await underLimit(env, `robot:${sender}`, LIMITS.robotPerSender))) return json({ ok: false, reason: 'sender_limit' })
 
   const c = await env.DB.prepare(`SELECT * FROM login_codes WHERE code_hash = ? AND expires_at > ? AND state IN ('waiting', 'confirmed', 'pending') ORDER BY id DESC`)
     .bind(await sha256(code), now()).first<Row>()
+  let person = c ? await personByPhone(env, sender) : null
+  if (c && !person) person = await ensureOwner(env, sender)
+  // The hourly total is shared by every sender. It skips one case only, so others cannot hold it
+  // back: a live code sent from the number typed by a registered (or owner), unblocked person.
+  const matches = !!c && !!person && person.status !== 'blocked' && sender === c.typed_phone
+  if (!matches && !(await underLimit(env, 'robot-total', LIMITS.robotTotal))) return json({ ok: false, reason: 'total_limit' })
   const reqInfo = { msg_id: msgId, self_chat: self }
   if (!c) {
     await audit(env, req, { strength: 'robot', action: 'robot_invalid_code', detail: reqInfo })
@@ -690,9 +759,6 @@ async function robotLogin(req: Request, env: Env) {
   const device = { device: c.label, requested_at: c.created_at }
   if (c.state === 'confirmed') return json({ ok: true, repeated: true, ...device })
   if (c.state === 'pending') return json({ ok: false, reason: 'awaiting_owner', repeated: true, ...device })
-
-  let person = await personByPhone(env, sender)
-  if (!person) person = await ensureOwner(env, sender)
 
   if (person && person.status === 'blocked') {
     await env.DB.prepare(`UPDATE login_codes SET state = 'refused' WHERE id = ?`).bind(c.id).run()
@@ -2133,25 +2199,33 @@ async function refuseAgentRequest(env: Env, req: Request, who: Who | null, id: n
 
 // POST /api/pair/claim from the screen: the one-use ticket from the agent's link becomes the poll
 // secret. Only from the address the agent called from (the house), and only once.
+// no Turnstile: the ticket is 192 random bits, works once and only from the house
 async function pairClaim(req: Request, env: Env) {
-  if (!(await underLimit(env, `claim-ip:${clientIp(req)}`, LIMITS.claimPerIp))) throw new HttpError(429, 'too_many_attempts')
+  const log = attemptLog('login_attempt', 'passkey')
+  if (!(await env.RL_CLAIM.limit({ key: clientIp(req) })).success) { log('limited', 'high', 'ip_rate'); return tooFast() }
+  if (!(await underLimit(env, `claim-ip:${clientIp(req)}`, LIMITS.claimPerIp))) {
+    log('limited', 'high', 'ip_hourly')
+    throw new HttpError(429, 'too_many_attempts')
+  }
+  const refuse = (status: number, reason: string) => { log('fail', 'medium', reason); return new HttpError(status, reason) }
   const ticket = String((await body(req)).ticket ?? '')
-  if (ticket.length < 30 || ticket.length > 64) throw new HttpError(400, 'missing_secret')
+  if (ticket.length < 30 || ticket.length > 64) throw refuse(400, 'missing_secret')
   const p = await env.DB.prepare(
     `SELECT p.id, p.claimed_at, p.state, p.expires_at, r.id AS rid, r.agent_ip, r.next_path, r.screen_name, s.name AS screen_current_name
        FROM screen_pairings p JOIN agent_requests r ON r.id = p.request_id LEFT JOIN people s ON s.id = r.screen_id
       WHERE p.ticket_hash = ?`,
   ).bind(await sha256(ticket)).first<Row>()
-  if (!p || p.claimed_at || p.state !== 'waiting') throw new HttpError(404, 'ticket_used')
-  if (String(p.expires_at) < now()) throw new HttpError(410, 'pair_expired')
+  if (!p || p.claimed_at || p.state !== 'waiting') throw refuse(404, 'ticket_used')
+  if (String(p.expires_at) < now()) throw refuse(410, 'pair_expired')
   if (!sameNetwork(p.agent_ip, clientIp(req)) && !(await atHome(env, clientIp(req)))) {
     await audit(env, req, { strength: 'screen', action: 'agent_pair_claim_other_ip', detail: { request: p.rid, agent_ip: p.agent_ip } })
-    if (agentPairOtherIpRefused(env)) throw new HttpError(409, 'claim_other_network')
+    if (agentPairOtherIpRefused(env)) throw refuse(409, 'claim_other_network')
   }
   const secret = randomToken(24)
   const r = await env.DB.prepare(`UPDATE screen_pairings SET secret_hash = ?, claimed_at = ?, label = ?, ip = ?, place = ? WHERE id = ? AND claimed_at IS NULL AND state = 'waiting'`)
     .bind(await sha256(secret), now(), deviceLabel(req.headers.get('User-Agent'), null), clientIp(req), place(req), p.id).run()
-  if (!r.meta.changes) throw new HttpError(404, 'ticket_used')
+  if (!r.meta.changes) throw refuse(404, 'ticket_used')
+  log('ok', 'low', 'ticket_claimed')
   await audit(env, req, { strength: 'screen', action: 'agent_pair_claimed', target: String(p.screen_current_name ?? p.screen_name), detail: { request: p.rid } })
   return json({ secret, name: p.screen_current_name ?? p.screen_name, expires_at: p.expires_at, next: p.next_path ?? null })
 }
@@ -2440,6 +2514,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
 
   if (path.startsWith('/api/')) {
     requireSameOrigin(req, url)
+    // the public key of the Turnstile widget, for the sign-in and pairing screens
+    if (path === '/api/challenge' && m === 'GET') return json({ sitekey: env.TURNSTILE_SITEKEY ?? null })
     if (path === '/api/login/start' && m === 'POST') return loginStart(req, env)
     if (path === '/api/login/status' && m === 'POST') return loginStatus(req, env)
     if (path === '/api/pair/start' && m === 'POST') return pairStart(req, env, url)

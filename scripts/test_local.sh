@@ -4,6 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PORT="${PORT:-8941}"
+VERIFY_PORT="${VERIFY_PORT:-$((PORT + 10))}"
 STATE="$(mktemp -d)"
 LOG="$STATE/wrangler.log"
 VARS="$STATE/test.vars"
@@ -12,6 +13,8 @@ VARS="$STATE/test.vars"
 printf 'ROBOT_LOGIN_KEY=pa5_robo_test_%s\nOWNER_PHONE=5561900000001\nGITHUB_WEBHOOK_SECRET=test_hook_%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 16)" > "$VARS"
 HOOK_SECRET="$(sed -n 's/^GITHUB_WEBHOOK_SECRET=//p' "$VARS")"
 export HOOK_SECRET
+# the robot check asks a stand-in siteverify run by test_local.mjs on this machine
+printf 'TURNSTILE_SECRET=test_secret\nTURNSTILE_SITEKEY=test_sitekey\nTURNSTILE_VERIFY_URL=http://127.0.0.1:%s/siteverify\n' "$VERIFY_PORT" >> "$VARS"
 KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 
 # The portal plus a fake tab worker bound as several tabs (test/fake_tab), written through the
@@ -21,6 +24,8 @@ KEY="$(sed -n 's/^ROBOT_LOGIN_KEY=//p' "$VARS")"
 # (one malformed command). tab-a carries the commands of the stage 3 tests.
 node scripts/test_commands.mjs >/dev/null || { node scripts/test_commands.mjs | grep -v "^ok"; exit 1; }
 echo "ok   unit checks of src/commands.ts"
+node scripts/test_login_guard.mjs >/dev/null || { node scripts/test_login_guard.mjs | grep -v "^ok"; exit 1; }
+echo "ok   unit checks of src/login_guard.ts"
 TESTCFG=".wrangler.test.toml"
 cat > "$STATE/tabs.json" <<'EOF2'
 {
@@ -69,7 +74,19 @@ PID=$!
 trap 'kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; rm -rf "$STATE" "$TESTCFG"' EXIT
 for _ in $(seq 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.5; done
 
-STATE="$STATE" BASE="http://127.0.0.1:$PORT" ROBO_KEY="$KEY" OWNER=5561900000001 node scripts/test_local.mjs
+STATE="$STATE" BASE="http://127.0.0.1:$PORT" ROBO_KEY="$KEY" OWNER=5561900000001 VERIFY_PORT="$VERIFY_PORT" node scripts/test_local.mjs
+
+# sign-in events: present, and only fixed words (no number, address, code or secret)
+python3 - "$LOG" <<'PY'
+import re, sys
+lines = re.findall(r'\{"event":"login_attempt".*?\}', open(sys.argv[1]).read())
+shape = re.compile(r'^\{"event":"login_attempt","auth_method":"(whatsapp_code|passkey)","result":"(ok|fail|limited|turnstile_failed)","risk":"(low|medium|high)","reason":"[a-z_]{1,30}"\}$')
+bad = [x for x in lines if not shape.match(x)]
+seen = {re.search(r'"result":"(\w+)"', x).group(1) for x in lines}
+if bad or seen != {"ok", "fail", "limited", "turnstile_failed"}:
+    sys.exit(f"FAIL login_attempt events: {len(lines)} lines, results {sorted(seen)}, bad {bad[:3]}")
+print("ok   login_attempt events: every result seen, fixed words only")
+PY
 
 # an admin new-device warning survives the revocation of that session
 left="$(npx wrangler d1 execute portal_a5 --local --persist-to "$STATE" --json --command \
@@ -91,7 +108,7 @@ seq="$(npx wrangler d1 execute portal_a5 --local --persist-to "$STATE" --json --
 for q in \
   "SELECT * FROM login_codes WHERE code_hash = 'x' AND expires_at > 'y'" \
   "SELECT * FROM login_codes WHERE secret_hash = 'x'" \
-  "UPDATE login_codes SET expires_at = 'x' WHERE typed_phone = 'p' AND state = 'waiting' AND expires_at > 'y'" \
+  "UPDATE login_codes SET expires_at = 'x' WHERE secret_hash = 's' AND state = 'waiting' AND expires_at > 'y'" \
   "DELETE FROM login_codes WHERE expires_at < 'x'" \
   "SELECT s.id FROM sessions s JOIN people p ON p.id = s.person_id WHERE s.token_hash = 'x' AND s.expires_at > 'y'" \
   "SELECT id FROM sessions WHERE person_id = 1 ORDER BY last_used_at DESC" \
